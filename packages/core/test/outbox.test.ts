@@ -169,7 +169,7 @@ describe("the sender (T6h)", () => {
   });
 
   it("STALE_APPEND is recorded as acceptance unknown with a request for a fresh location, and never re-creates a check-in", async () => {
-    const { host, alice, clock } = await pair();
+    const { alice, clock } = await pair();
     const events: string[] = [];
     const deps = { ...alice.outbox, events: { needsLocation: (r: string) => events.push("needsLocation:" + r), cancelled: (_: Uint8Array, r: string) => events.push("cancelled:" + r) } };
     await enqueue(deps, 0, sample(clock));

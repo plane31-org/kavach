@@ -167,6 +167,7 @@ export class FakeHost {
   // Transport per caller ---------------------------------------------------------------------------
 
   asDevice(accountName: string, certificateHash: Uint8Array): Transport {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- the transport closures outlive this call
     const host = this;
     const callerCert = toHex(certificateHash);
     const caller = (): Account => {
