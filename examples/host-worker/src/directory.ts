@@ -106,7 +106,9 @@ export class Directory {
   async register(certificateHex: string, vaultHex: string): Promise<Outcome> {
     const certificate = unhex(certificateHex, "certificate");
     const doc = expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice);
-    if (await this.account(doc.accountName)) return { status: "CONFLICT" };
+    const taken = await this.account(doc.accountName);
+    // The same certificate again is an enrollment resuming after a lost response, not a conflict.
+    if (taken) return taken.certificate === certificateHex ? { status: "ALREADY_COMMITTED" } : { status: "CONFLICT" };
     const vh = parseVaultHeader(unhex(vaultHex, "vault"));
     const iid = hex(identityId(doc.accountName, doc.accountKey));
     const certHash = hex(doc.bodyHash);

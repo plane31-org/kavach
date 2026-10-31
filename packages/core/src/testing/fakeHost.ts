@@ -204,7 +204,8 @@ export class FakeHost {
       },
       async registerAccount({ certificate, vault }): Promise<MutationOutcome> {
         const doc = expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice);
-        if (host.accounts.has(doc.accountName)) return { status: "CONFLICT" };
+        const taken = host.accounts.get(doc.accountName);
+        if (taken) return equalBytes(taken.certificate, certificate) ? { status: "ALREADY_COMMITTED" } : { status: "CONFLICT" };
         const vh = parseVaultHeader(vault);
         const iid = toHex(identityId(doc.accountName, doc.accountKey));
         host.accounts.set(doc.accountName, {
