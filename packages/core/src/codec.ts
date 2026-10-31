@@ -537,6 +537,20 @@ export function sealVault(header: VaultHeader, contents: VaultContents, recovery
   return concat(h, nonce, u32(ciphertext.length), ciphertext);
 }
 
+/** Read a vault's public header without opening it (the host's compare-and-swap uses it). */
+export function parseVaultHeader(wire: Uint8Array): VaultHeader & { readonly hash: Uint8Array } {
+  const stage = "vaultHeader";
+  if (wire.length > MAX_DOCUMENT_BYTES) throw new KavachError("SIZE_LIMIT", stage);
+  const r = new Reader(wire, stage);
+  if (r.u8() !== WIRE_VERSION) throw new KavachError("UNSUPPORTED_VERSION", stage);
+  if (r.u8() !== DocumentType.AccountVault) throw new KavachError("UNSUPPORTED_TYPE", stage);
+  const accountName = r.name();
+  const accountKey = r.take(PUBLIC_KEY_BYTES);
+  const vaultRevision = r.u64();
+  if (vaultRevision === 0n) throw malformed(stage, "revision zero");
+  return { accountName, accountKey, vaultRevision, hash: bodyHash(wire) };
+}
+
 export interface OpenedVault extends VaultContents {
   readonly header: VaultHeader;
 }

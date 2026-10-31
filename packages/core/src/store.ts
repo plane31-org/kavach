@@ -149,6 +149,8 @@ export interface HistoryRow {
   plaintext: string;
   superseded: boolean;
   own: boolean;
+  /** Body hash of the wire, for duplicate and equivocation detection. */
+  bodyHash?: string;
 }
 
 export interface LivePinRow {
