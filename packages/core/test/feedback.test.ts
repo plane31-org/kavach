@@ -425,6 +425,44 @@ describe("feedback findings", () => {
     await w.sync(b);
     expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(before);
   });
+
+  it("21: the sender's own pin and status are kept under the reader's rules, with the same events and expiry", async () => {
+    const w = world();
+    const { a, aliceId } = await pair(w);
+    const at = (lat: number, capturedAt: bigint) => locationFromDegrees(lat, -122.4194, 5, capturedAt);
+    const own = await a.client.latest(aliceId);
+    expect(own).toBeDefined(); // the pair's location already pinned itself
+    const fresh = await a.client.enqueueLocation(at(10, w.clock.now()));
+    expect(toHex((await a.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
+    await a.client.enqueueLocation(at(11, w.clock.now() - 60_000n)); // measured earlier, sent later: history only
+    expect(toHex((await a.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
+    expect(await a.client.latestStatus(aliceId)).toBeUndefined();
+    await a.client.enqueueStatus(Uint8Array.of(1, 80, 0, 3));
+    expect(Array.from((await a.client.latestStatus(aliceId))?.payload ?? [])).toEqual([1, 80, 0, 3]);
+    await a.client.enqueueStatus(Uint8Array.of(1, 79, 0, 3));
+    expect(Array.from((await a.client.latestStatus(aliceId))?.payload ?? [])).toEqual([1, 79, 0, 3]);
+    const self = (e: { kind: string; identityId?: Uint8Array }) => e.identityId !== undefined && toHex(e.identityId) === toHex(aliceId);
+    expect(a.events.filter((e) => e.kind === "latestUpdated" && self(e)).length).toBe(2); // the pair's location and the fresh one
+    expect(a.events.filter((e) => e.kind === "statusUpdated" && self(e)).length).toBe(2);
+    // The same key answered twice moves nothing twice.
+    const before = a.events.length;
+    await a.client.enqueueLocation(at(12, w.clock.now()), { idempotencyKey: "k" });
+    await a.client.enqueueLocation(at(12, w.clock.now()), { idempotencyKey: "k" });
+    expect(a.events.slice(before).filter((e) => e.kind === "latestUpdated").length).toBe(1);
+    // Expiry treats the own row like any author's.
+    w.clock.advance(testPolicy.locationHistoryMs + 1n);
+    await w.sync(a);
+    expect(await a.client.latest(aliceId)).toBeUndefined();
+    expect(await a.client.latestStatus(aliceId)).toBeUndefined();
+  });
+
+  it("22: the public entry points carry the location codec and the key-list builder", async () => {
+    const pub = await import("../src/index.js");
+    const adapters = await import("../src/adapters/index.js");
+    const loc = locationFromDegrees(1, 2, 3, 4n);
+    expect(pub.decodeLocation(pub.encodeLocation(loc))).toEqual(loc);
+    expect(typeof adapters.buildResetKeyList).toBe("function");
+  });
 });
 
 /** Carol: a third author who shares with Bob through a circle of her own. */

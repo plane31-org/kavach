@@ -633,17 +633,25 @@ class ClientImpl implements Client {
     const deps = this.outboxDeps();
     await this.ensureEpoch();
     try {
-      const r = await enqueue(deps, kind, payload, options);
-      return { recordId: r.recordId, duplicate: r.duplicate };
+      return this.enqueued(kind, await enqueue(deps, kind, payload, options));
     } catch (e) {
       if (isKavachError(e, "ROTATION_REQUIRED") || isKavachError(e, "COUNTER_EXHAUSTED")) {
         await this.ensureEpoch();
         const r = await enqueue(deps, kind, payload, options);
         this.emit({ kind: "needsLocation", reason: "rotation" });
-        return { recordId: r.recordId, duplicate: r.duplicate };
+        return this.enqueued(kind, r);
       }
       throw e;
     }
+  }
+
+  /** After commit: the own pin or status moved, so the same events fire for self as for any author. */
+  private enqueued(kind: RecordKind, r: { recordId: Uint8Array; duplicate: boolean; own: boolean }): EnqueueResult {
+    if (r.own && this.selfPin) {
+      if (kind === 0) this.emit({ kind: "latestUpdated", identityId: this.selfPin.identityId });
+      if (kind === 2) this.emit({ kind: "statusUpdated", identityId: this.selfPin.identityId });
+    }
+    return { recordId: r.recordId, duplicate: r.duplicate };
   }
 
   // Epochs ----------------------------------------------------------------------------------------

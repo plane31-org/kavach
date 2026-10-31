@@ -20,6 +20,7 @@ export { KavachError, isKavachError, type ErrorCode } from "../errors.js";
 // Signed documents, as a host or transport sees them ----------------------------------------------
 export {
   DocumentType,
+  buildResetKeyList,
   buildResetReceipt,
   expectType,
   parseDocument,

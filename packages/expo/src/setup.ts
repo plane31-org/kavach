@@ -40,6 +40,26 @@ export interface KavachSetupOptions {
   readonly now?: () => bigint;
   /** Forwarded to `open()`: called when a subscriber throws, which is otherwise silent. */
   readonly onListenerError?: (error: unknown, event: ClientEvent) => void;
+  /**
+   * The secure random source for Hermes, which has no `crypto.getRandomValues`: pass
+   * `expo-crypto`'s `getRandomValues`. Installed on the global once when none exists, left alone
+   * when one does. Without it, and with no global, opening fails with `INVALID_KEY` before any
+   * key is made; nothing ever falls back to a weaker source.
+   */
+  readonly getRandomValues?: GetRandomValues;
+}
+
+export type GetRandomValues = <T extends ArrayBufferView>(array: T) => T;
+
+/**
+ * Install `getRandomValues` as the Web Crypto global when the runtime has none (Hermes), and
+ * leave an existing one untouched. `scope` is the global object; tests pass their own.
+ */
+export function installWebCrypto(getRandomValues: GetRandomValues | undefined, scope: { crypto?: { getRandomValues?: unknown } } = globalThis as { crypto?: { getRandomValues?: unknown } }): void {
+  if (typeof scope.crypto?.getRandomValues === "function") return;
+  if (!getRandomValues) throw new KavachError("INVALID_KEY", "openKavach", "no crypto.getRandomValues: pass expo-crypto's getRandomValues");
+  if (scope.crypto) scope.crypto.getRandomValues = getRandomValues;
+  else scope.crypto = { getRandomValues };
 }
 
 export interface KavachSetup {
@@ -91,6 +111,7 @@ export function databaseFileName(accountName: string, namespace = "kavach"): str
  * the file and restores the account from its recovery provider.
  */
 export async function openKavach(options: KavachSetupOptions): Promise<KavachSetup> {
+  installWebCrypto(options.getRandomValues);
   const namespace = options.namespace ?? "kavach";
   const fileName = databaseFileName(options.accountName, namespace);
   const secretStore =

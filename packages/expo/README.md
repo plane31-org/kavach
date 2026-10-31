@@ -16,6 +16,7 @@ The adapters an Expo app supplies to `@kavach/core`, as the Moyo implementation 
 One call per account opens everything: the secret store namespaced by account, the storage key (read, or created and stored before the database is opened), the SQLCipher database under `kavach-<account>.db`, and the client.
 
 ```ts
+import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
 import * as SQLite from "expo-sqlite";
 import { openKavach, BlockStoreRecoveryProvider, AppleKeychainRecoveryProvider } from "@kavach/expo";
@@ -29,9 +30,14 @@ const { client, databaseFileName } = await openKavach({
   secrets: { secureStore: SecureStore, thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, keychainService: "app.getmoyo" },
   database: SQLite,
   context: "foreground", // "background" in the location task
+  getRandomValues: Crypto.getRandomValues, // Hermes has no Web Crypto; installed once, never a weaker fallback
   onListenerError: (e, event) => log(event.kind, e) // a throwing subscriber never reaches the protocol
 });
 ```
+
+Hermes has no `crypto.getRandomValues`, which the SDK's portable cipher suite draws its randomness from. `openKavach` installs the one you pass on the global when none exists and leaves an existing one alone; without either, opening fails with `INVALID_KEY` before any key is made. An app wiring the adapters by hand calls `installWebCrypto(Crypto.getRandomValues)` first.
+
+`client.latest(identityId)` and `client.latestStatus(identityId)` answer for the phone's own identity too: an enqueued location or status takes the own pin or status slot under the same rules a reader applies, and `latestUpdated` and `statusUpdated` fire for self. History plaintext is the 22-byte location codec, decoded with `decodeLocation` from `@kavach/core`.
 
 `client.sync()` returns a report whose `errors` list every step it worked around, each with the operation, the protocol code, the stage and whether a retry may succeed; `NETWORK` means the host was unreachable. Reading is bounded (500 records or 5 seconds by default, `sync({ catchUp: { maxRecords, maxMs } })` to change it) and `report.inbox.hasMore` says the relay still holds records: sync again at once. A keyed enqueue (`enqueueLocation(location, { idempotencyKey })`) that returns has committed its record; the same key from a retry or the other runtime returns that record with `duplicate: true` for the delivery window. Read history with `client.historyPage({ authorIdentityId, order: "desc", limit })` and pass its `cursor` back for the next page; `client.newest()` and `client.latest(identityId)` give the newest entry and the live pin.
 
@@ -45,11 +51,13 @@ When the database file survives but its key is gone (the secret store was cleare
 
 ```ts
 import { open } from "@kavach/core";
-import { ExpoSecretStore, SqliteStore, expoSqliteDriver } from "@kavach/expo";
+import { randomBytes } from "@kavach/core/adapters";
+import { ExpoSecretStore, SqliteStore, expoSqliteDriver, installWebCrypto } from "@kavach/expo";
 
+installWebCrypto(Crypto.getRandomValues);
 const secretStore = new ExpoSecretStore(SecureStore, { thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, namespace: `kavach.${accountName}`, keychainService: "app.getmoyo" });
 let storageKey = await secretStore.get("storageKey");
-if (!storageKey) { storageKey = crypto.getRandomValues(new Uint8Array(32)); await secretStore.set("storageKey", storageKey); }
+if (!storageKey) { storageKey = randomBytes(32); await secretStore.set("storageKey", storageKey); }
 const db = SQLite.openDatabaseSync(`kavach-${accountName}.db`, { useNewConnection: true });
 const store = SqliteStore.open({ driver: expoSqliteDriver(db), storageKey, busyTimeoutMs: 5000 });
 const client = await open({ accountName, retentionPolicy, recoveryProvider, resetTrust, secretStore, store, transport });

@@ -48,7 +48,13 @@ export type Label =
 
 /** Select a backend if none is set (the portable one) and resolve. Idempotent. */
 export async function ready(): Promise<void> {
-  if (!currentBackend()) setCryptoBackend(nobleBackend);
+  if (!currentBackend()) {
+    // The portable backend draws randomness from the Web Crypto global; Hermes has none until the
+    // app installs one (the Expo helper does, from expo-crypto). Say so, rather than fail later.
+    const g = globalThis as { crypto?: { getRandomValues?: unknown } };
+    if (typeof g.crypto?.getRandomValues !== "function") throw new KavachError("INVALID_KEY", "ready", "no crypto.getRandomValues: install a secure random source before opening Kavach");
+    setCryptoBackend(nobleBackend);
+  }
 }
 
 /** The portable backend needs no loading, so it is selected on first use when nothing else was. */

@@ -3,15 +3,16 @@
  * (protocol section 10, receiving; transaction T7).
  */
 import { equalBytes, fromHex, toHex } from "./bytes.js";
-import { DocumentType, decodeLocation, expectType, parseDocument, type EncryptedRecord, type RecordKind } from "./codec.js";
+import { DocumentType, expectType, parseDocument, type EncryptedRecord, type RecordKind } from "./codec.js";
 import { bodyHash } from "./crypto.js";
 import { openEpoch, type AuthorView, type SelfView } from "./epoch.js";
 import { KavachError, isKavachError } from "./errors.js";
 import type { RetentionPolicy } from "./policy.js";
 import { HISTORY_KINDS, authorPrefix, indexHistory, padTime, timelinePrefix, unindexHistory } from "./historyIndex.js";
+import { advancePin, measuredAt } from "./pins.js";
 import { compareSlots, openRecordWire } from "./record.js";
 import { big, unbig } from "./rows.js";
-import type { HistoryRow, KeyRange, LivePinRow, Store, SubscriptionRow, Tx, StatusRow } from "./store.js";
+import type { HistoryRow, KeyRange, Store, SubscriptionRow, Tx, StatusRow } from "./store.js";
 import type { ReadRecordsResult, Relay } from "./transport.js";
 
 export const MAX_FUTURE_SKEW_MS = 300_000n;
@@ -158,57 +159,12 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   indexHistory(tx, row);
   let moved = false;
   if (parsed.kind === 0 && !row.superseded) {
-    const pinKey = toHex(author.identityId);
-    const pin = tx.get("livePins", pinKey);
-    const candidate: PinOrder = { generation, capturedAt: measuredAt(opened.plaintext, parsed.sentAt), epoch: parsed.epoch, counter: parsed.counter };
-    if (!pin || comparePins(candidate, pinOrder(tx, pin)) > 0) {
-      const next: LivePinRow = { recordId: id, generation: big(generation), epoch: parsed.epoch, counter: parsed.counter, sentAt: big(parsed.sentAt), capturedAt: big(candidate.capturedAt) };
-      tx.put("livePins", pinKey, next);
-      moved = true;
-    }
+    moved = advancePin(tx, toHex(author.identityId), { generation, capturedAt: measuredAt(opened.plaintext, parsed.sentAt), epoch: parsed.epoch, counter: parsed.counter, recordId: id, sentAt: parsed.sentAt });
   }
   return moved || parsed.kind === 1 ? { result: "updated", ...base } : { result: "history", ...base };
 }
 
 /** A record pushed by the host outside `sync`: stored, but it never advances a relay cursor. */
-/**
- * The order of live pins (protocol section 10): a newer device generation first; within one
- * generation the later measurement, the decoded `capturedAt` clamped to the record's `sentAt`
- * so a phone clock set ahead cannot pin a stale fix; equal measurements by (epoch, counter).
- */
-interface PinOrder {
-  readonly generation: bigint;
-  readonly capturedAt: bigint;
-  readonly epoch: number;
-  readonly counter: number;
-}
-
-function comparePins(a: PinOrder, b: PinOrder): number {
-  if (a.generation !== b.generation) return a.generation < b.generation ? -1 : 1;
-  if (a.capturedAt !== b.capturedAt) return a.capturedAt < b.capturedAt ? -1 : 1;
-  return compareSlots(a, b);
-}
-
-/** The measurement time of a kind 0 payload: its `capturedAt`, never later than `sentAt`; `sentAt` for a payload that is not the location codec. */
-export function measuredAt(plaintext: Uint8Array, sentAt: bigint): bigint {
-  try {
-    const captured = decodeLocation(plaintext).capturedAt;
-    return captured < sentAt ? captured : sentAt;
-  } catch {
-    return sentAt;
-  }
-}
-
-/** A pin's order, deriving the measurement time from its record for a row written before revision 7. */
-function pinOrder(tx: Pick<Tx, "get">, pin: LivePinRow): PinOrder {
-  let capturedAt = pin.capturedAt === undefined ? undefined : unbig(pin.capturedAt);
-  if (capturedAt === undefined) {
-    const row = tx.get("history", pin.recordId);
-    capturedAt = row ? measuredAt(fromHex(row.plaintext), unbig(row.sentAt)) : unbig(pin.sentAt);
-  }
-  return { generation: unbig(pin.generation), capturedAt, epoch: pin.epoch, counter: pin.counter };
-}
-
 export async function receive(deps: InboxDeps, wire: Uint8Array): Promise<ReceiveResult> {
   const now = deps.now();
   let r = await deps.store.transaction((tx) => storeRecord(tx, deps, wire, now));

@@ -7,7 +7,7 @@ import { toHex, type ProviderLoadResult, type ProviderSaveResult, type ProviderS
 import { MemorySecretStore, ready } from "@kavach/core/adapters";
 import { FakeHost, TestClock, testPolicy, testResetKeyList, testResetKeys } from "@kavach/core/testing";
 import { nodeSqliteDriver, type SqlDriver, type SqlValue } from "../src/sqliteStore.js";
-import { databaseFileName, openKavach } from "../src/setup.js";
+import { databaseFileName, installWebCrypto, openKavach } from "../src/setup.js";
 import type { SecureStoreLike } from "../src/secretStore.js";
 import { openNodeDatabase } from "./sqlite.js";
 
@@ -217,5 +217,20 @@ describe("openKavach", () => {
     expect(databaseFileName("alice")).toBe("kavach-alice.db");
     expect(databaseFileName("alice", "moyo")).toBe("moyo-alice.db");
     expect(() => databaseFileName("../etc")).toThrow(expect.objectContaining({ code: "MALFORMED" }));
+  });
+
+  it("installs a random source on a runtime without Web Crypto, keeps an existing one, and refuses to open with neither", () => {
+    const mine = <T extends ArrayBufferView>(a: T): T => a;
+    const bare: { crypto?: { getRandomValues?: unknown } } = {};
+    installWebCrypto(mine, bare);
+    expect(bare.crypto?.getRandomValues).toBe(mine);
+    const theirs = <T extends ArrayBufferView>(a: T): T => a;
+    const has = { crypto: { getRandomValues: theirs } };
+    installWebCrypto(mine, has);
+    expect(has.crypto.getRandomValues).toBe(theirs);
+    const partial: { crypto?: { getRandomValues?: unknown } } = { crypto: {} };
+    installWebCrypto(mine, partial);
+    expect(partial.crypto?.getRandomValues).toBe(mine);
+    expect(() => installWebCrypto(undefined, {})).toThrow(expect.objectContaining({ code: "INVALID_KEY" }));
   });
 });
