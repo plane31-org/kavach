@@ -6,19 +6,27 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "build": "tsc -b",
+    "typecheck": "tsc -b",
+    "test": "vitest run"
   },
-  "dependencies": { "@kavach/core": "workspace:*" },
+  "dependencies": {
+    "@kavach/core": "workspace:*"
+  },
   "peerDependencies": {
     "expo-secure-store": "*",
     "expo-sqlite": "*"
   },
   "peerDependenciesMeta": {
-    "expo-secure-store": { "optional": true },
-    "expo-sqlite": { "optional": true }
+    "expo-secure-store": {
+      "optional": true
+    },
+    "expo-sqlite": {
+      "optional": true
+    }
   }
 }

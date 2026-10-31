@@ -126,11 +126,13 @@ Test: on a development build, foreground and background tasks write concurrently
 
 Next: the reference host.
 
-## Step 15: reference host (not published)
+## Step 15: reference host (an SDK example, not published)
 
-Write: `examples/host-worker`: directory tables with compare-and-swap on certificate hash, snapshot revision and vault revision; the current reset-key list and a receipt signer using an operational key from the environment; a per-author relay object holding retained records by `deliverySeq` with acceptance times, one subscription row per reader device with its `ackCursor`, the `expiredThrough` watermark, the per-stream high-water pair and last-append outcome, subscription-filtered reads, the epoch material of every epoch that is current or referenced by a retained record, deletion in the same transaction as a cursor advance and an alarm that advances the expiry prefix; a notification hook that emits a visible notification for a join request (to the owner) and a check-in append (to each recipient) and a silent wake-up otherwise; an activation hint to every circle of the account.
+Why it is in the SDK repository: the SDK ships no server, but its cursor, deletion, checkpoint and fence rules are only promises until a relay executes them. The reference host makes the directory and relay contract of protocol section 13 executable, so the SDK repository can run its own end-to-end tests, and it is the template the Moyo Worker is built from in step 18. It is a test fixture and a pattern, never a product; Moyo's production Worker lives in the Moyo repository.
 
-Test (workerd): the relay scenarios from the protocol appendix and the profile's gate table: the last required reader's cursor deletes the record; the window deletes unacknowledged records as a prefix and never a newer one; an equal or older cursor writes nothing; a cursor above the tail is rejected; a retried append inside the window returns the original outcome after deletion; a stale append is refused without reinsertion; members get subscriptions when an author opens a new stream; a replacement device's subscription starts at activation; epoch blobs go only when nothing references them and the epoch is not current; a check-in survives a later location; a join request and a check-in each produce exactly one visible notification with no coordinate. Fences reject a superseded device and an older epoch.
+Write: `examples/host-worker`: directory tables with compare-and-swap on certificate hash, snapshot revision and vault revision; the current reset-key list and a receipt signer using an operational key from the environment; a per-author relay object holding retained records by `deliverySeq` with acceptance times, one subscription row per reader device with its `ackCursor`, the `expiredThrough` watermark, the per-stream high-water pair and last-append outcome, subscription-filtered reads, the epoch material of every epoch that is current or referenced by a retained record, deletion in the same transaction as a cursor advance and an alarm that advances the expiry prefix; a notification hook that emits a visible notification for a join request (to the owner) and a check-in append (to each recipient) and a silent wake-up otherwise; an activation hint to every circle of the account. The in-memory host in `packages/core/src/testing` is the behavioural reference it must match.
+
+Test (workerd): the relay scenarios from the protocol appendix and the profile's gate table: the last required reader's cursor deletes the record; the window deletes unacknowledged records as a prefix and never a newer one; an equal or older cursor writes nothing; a cursor above the tail is rejected; a retried append inside the window returns the original outcome after deletion; a stale append is refused without reinsertion; members get subscriptions when an author opens a new stream; a replacement device's subscription starts at activation; epoch blobs go only when nothing references them and the epoch is not current; a check-in survives a later location; a join request and a check-in each produce exactly one visible notification with no coordinate. Fences reject a superseded device and an older epoch. The core's scenario suite runs unchanged against it.
 
 Next: faults.
 
@@ -142,11 +144,13 @@ Test: every crash outcome in protocol section 11 holds against the real SQLCiphe
 
 Next: measurement.
 
-## Step 17: benchmarks
+## Step 17: SDK benchmarks
 
-Write: a benchmark screen that runs full 100-account rotation, 100-person receiving load, cold start, activation and time to a full map with five authors online, and storage growth on a device and records p50, p95, memory and battery.
+What belongs here is what the SDK claims for itself: the cost of a full 100-account rotation (key, wraps, manifest, signature), a 100-person receiving load (verify, open the epoch, decrypt, store), storage growth at one record a minute per author for a day, and the time of one `enqueue` and one `receive`. Cold start, activation, time to a full map, memory and battery depend on the app's screens and scheduling and are measured by Moyo in step 18.
 
-Test: numbers exist for one mid-range iOS and one mid-range Android device before any speed claim is written down.
+Write: `packages/core/bench`: the four measurements above on Node against the in-memory store and the SQLite store, printing p50 and p95; and a small screen in the Expo example app that runs the same four on a device.
+
+Test: numbers exist on Node and on one mid-range iOS and one mid-range Android device before any speed claim is written down. None of them appears in the specification or the README without the device, OS and date next to it.
 
 Next: Moyo.
 
@@ -154,6 +158,6 @@ Next: Moyo.
 
 Write: in the Moyo repository, replace `packages/sealed` with `@kavach/core` and `@kavach/expo`; implement the directory, relay, notification, key-list and reset endpoints in the Worker on the pattern of the reference host (`UserDO` becomes the per-author relay, `CircleDO` keeps presence and wake-ups only); send the join-request and check-in notifications as visible pushes with the app's generic wording; remove the server-side trail, R2 history, device lists, pending devices, key requests, archives and circle log tables; generate the management key offline and two operational keys, pin the management public key and minimum list version in `app.config.ts`, hold the active operational key as a Worker secret, and schedule the 14-day list signing; wire the recovery providers and the retention policy from the profile; add the Account settings entries for recovery status and the recovery code.
 
-Test: `pnpm typecheck`, `pnpm test`, the Maestro flows for create, join with the owner's notification, approve, phone replacement on a second emulator with per-person waiting pins that fill in, removal and a check-in notification.
+Test: `pnpm typecheck`, `pnpm test`, the Maestro flows for create, join with the owner's notification, approve, phone replacement on a second emulator with per-person waiting pins that fill in, removal and a check-in notification. The app-level measurements of the profile's performance gate (cold start, activation, time to a full map with five authors online, memory and battery) are taken here, on one mid-range iOS and one mid-range Android device.
 
 Next: the external review named in protocol section 16.

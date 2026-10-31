@@ -7,7 +7,7 @@ import { drain, enqueue, outboxCount } from "../src/outbox.js";
 import { encodeLocation } from "../src/codec.js";
 import { locationFromDegrees } from "../src/record.js";
 import { t3ApplyChange } from "../src/transactions.js";
-import { FakeHost } from "./fakeHost.js";
+import { FakeHost } from "../src/testing/fakeHost.js";
 import { Clock, setupDevice, type Device } from "./harness.js";
 
 beforeAll(() => ready());

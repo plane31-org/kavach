@@ -1,9 +1,10 @@
 /**
  * An in-memory host: the directory and the cumulative-cursor relay of protocol sections 6, 10
- * and 13, bound per caller device. It is the pattern for the reference Worker (step 15) and the
- * test double for the client. Not a production server.
+ * and 13, bound per caller device. It is the behavioural reference for the Worker in
+ * examples/host-worker and the test double for the client. Not a production server, and
+ * exported under `@kavach/core/testing` only.
  */
-import { equalBytes, fromHex, toHex } from "../src/bytes.js";
+import { equalBytes, fromHex, toHex } from "../bytes.js";
 import {
   DocumentType,
   buildResetReceipt,
@@ -15,8 +16,8 @@ import {
   type CircleSnapshot,
   type EncryptedRecord,
   type EpochManifest
-} from "../src/codec.js";
-import { bodyHash, identityId, streamId as deriveStreamId, type SigningKeypair } from "../src/crypto.js";
+} from "../codec.js";
+import { bodyHash, identityId, streamId as deriveStreamId, type SigningKeypair } from "../crypto.js";
 import type {
   AppendOutcome,
   Directory,
@@ -28,7 +29,7 @@ import type {
   ResolvedAccount,
   Transport,
   TransportHint
-} from "../src/transport.js";
+} from "../transport.js";
 
 interface Account {
   accountName: string;

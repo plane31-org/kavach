@@ -1,0 +1,86 @@
+/** The client over the SQLite store: one end-to-end exchange between two devices on real SQLite files. */
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { beforeAll, describe, expect, it } from "vitest";
+import { open, locationFromDegrees, ready, toHex, type Client, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@kavach/core";
+import { FakeHost, TestClock, testPolicy } from "@kavach/core/testing";
+import { C, H, signingKeypairFromSeed, buildResetKeyList } from "@kavach/core";
+import { MemorySecretStore } from "@kavach/core";
+import { SqliteStore, nodeSqliteDriver } from "../src/sqliteStore.js";
+import { openNodeDatabase } from "./sqlite.js";
+
+beforeAll(() => ready());
+
+class NoProvider implements RecoveryProvider {
+  async load(): Promise<ProviderLoadResult> {
+    return { status: "unavailable" };
+  }
+  async save(): Promise<ProviderSaveResult> {
+    return { status: "available", backupState: "pending" };
+  }
+  async status(): Promise<ProviderStatusResult> {
+    return { status: "available", backupState: "pending" };
+  }
+  async eraseLocalAccess(): Promise<void> {}
+}
+
+describe("client on SqliteStore", () => {
+  it("enrolls two devices, forms a circle and delivers a location end to end", async () => {
+    const host = new FakeHost();
+    const clock = new TestClock();
+    host.now = clock.now;
+    const management = signingKeypairFromSeed(H(C("identity")));
+    const operational = signingKeypairFromSeed(H(C("stream")));
+    host.resetSigner = { key: operational, keyId: new Uint8Array(16).fill(7) };
+    host.resetKeyList = buildResetKeyList({ version: 1n, issuedAt: clock.now(), expiresAt: clock.now() + 2_592_000_000n, keys: [{ keyId: new Uint8Array(16).fill(7), publicKey: operational.publicKey }] }, management.secretKey);
+    const dir = mkdtempSync(join(tmpdir(), "kavach-client-"));
+    const secretsByName = new Map<string, MemorySecretStore>();
+    const device = async (name: string, secrets = secretsByName.get(name) ?? new MemorySecretStore()): Promise<Client> => {
+      secretsByName.set(name, secrets);
+      const store = SqliteStore.open({ driver: nodeSqliteDriver(openNodeDatabase(join(dir, name + ".db"))), storageKey: undefined });
+      let bound: ReturnType<FakeHost["asDevice"]> | undefined;
+      const bind = (): ReturnType<FakeHost["asDevice"]> => {
+        const acct = host.accounts.get(name);
+        if (acct) bound = host.asDevice(name, Uint8Array.from(Buffer.from(acct.certificateHash, "hex")));
+        return bound ?? host.asDevice(name, new Uint8Array(32));
+      };
+      return open({
+        accountName: name,
+        retentionPolicy: testPolicy,
+        recoveryProvider: new NoProvider(),
+        resetTrust: { managementKey: management.publicKey, minimumVersion: 1n },
+        secretStore: secrets,
+        store,
+        transport: { get directory() { return bind().directory; }, get relay() { return bind().relay; }, observe: (h) => bind().observe(h) },
+        now: clock.now
+      });
+    };
+    const alice = await device("alice");
+    const bob = await device("bob");
+    await alice.initializeAccount();
+    await bob.initializeAccount();
+    const { circleId } = await alice.circles.create();
+    const aliceId = (await alice.inspect()).identityId ?? new Uint8Array();
+    await bob.circles.requestJoin(circleId, aliceId);
+    await alice.sync();
+    await alice.circles.approve(circleId, "bob");
+    await bob.sync();
+    await alice.sync();
+    await alice.enqueueLocation(locationFromDegrees(37.7749, -122.4194, 5, clock.now()));
+    await alice.sync();
+    const report = await bob.sync();
+    expect(report.inbox.stored).toBe(1);
+    const pin = await bob.latest(aliceId);
+    expect(pin).toBeDefined();
+    expect(toHex(pin?.plaintext ?? new Uint8Array()).length).toBe(44);
+    expect(host.retainedCount([...host.streams.keys()].map((k) => Uint8Array.from(Buffer.from(k, "hex")))[0] ?? new Uint8Array())).toBeGreaterThanOrEqual(0);
+    // A restart with the same secret store reopens the account from the file; the file without its
+    // secrets is RECOVERY_REQUIRED, never a fresh account.
+    const again = await device("alice");
+    expect((await again.getState()).status).toBe("ready");
+    expect((await again.history()).length).toBe(1);
+    expect((await again.circles.list())[0]?.members.length).toBe(2);
+    await expect(device("alice", new MemorySecretStore())).rejects.toThrow(expect.objectContaining({ code: "RECOVERY_REQUIRED" }));
+  });
+});

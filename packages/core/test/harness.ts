@@ -8,32 +8,15 @@ import { prepareEpoch, resolvePublish } from "../src/epoch.js";
 import { acceptCertificate, certify, deviceFromSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "../src/identity.js";
 import type { InboxDeps } from "../src/inbox.js";
 import type { OutboxDeps } from "../src/outbox.js";
-import type { RetentionPolicy } from "../src/policy.js";
 import { circleToRow, pinToRow } from "../src/rows.js";
 import { MemorySecretStore, MemoryStore } from "../src/store.js";
 import { t1Activate, t1Header, t1Secrets, t3ApplyChange, t4PersistPrepared, t5Committed } from "../src/transactions.js";
 import type { Transport } from "../src/transport.js";
 import { buildVault } from "../src/vault.js";
-import type { FakeHost } from "./fakeHost.js";
+import type { FakeHost } from "../src/testing/fakeHost.js";
 
-export const policy: RetentionPolicy = {
-  version: 1,
-  deliveryWindowMs: 86_400_000n,
-  appendRetryWindowMs: 604_800_000n,
-  locationHistoryMs: 86_400_000n,
-  checkInHistoryMs: 2_592_000_000n,
-  hygieneRotationMs: 2_592_000_000n,
-  maxOutboxRecords: 2000,
-  maxOutboxBytes: 4 << 20
-};
-
-export class Clock {
-  t = 1_700_000_000_000n;
-  now = (): bigint => this.t;
-  advance(ms: bigint): void {
-    this.t += ms;
-  }
-}
+export { testPolicy as policy, TestClock as Clock } from "../src/testing/clock.js";
+import { testPolicy as policy, TestClock as Clock } from "../src/testing/clock.js";
 
 export interface Device {
   name: string;

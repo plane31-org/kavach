@@ -6,7 +6,7 @@ import { randomBytes, ready } from "../src/crypto.js";
 import { history, latest, purgeHistory, receive, syncStream } from "../src/inbox.js";
 import { drain, enqueue } from "../src/outbox.js";
 import { locationFromDegrees } from "../src/record.js";
-import { FakeHost } from "./fakeHost.js";
+import { FakeHost } from "../src/testing/fakeHost.js";
 import { Clock, setupDevice, type Device } from "./harness.js";
 
 beforeAll(() => ready());

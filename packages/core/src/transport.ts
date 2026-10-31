@@ -8,8 +8,8 @@ export type MutationStatus = "COMMITTED" | "ALREADY_COMMITTED" | "CONFLICT" | "I
 export interface MutationOutcome {
   readonly status: MutationStatus;
   /** On CONFLICT: the bytes the host currently holds, when it can return them. */
-  readonly current?: Uint8Array;
-  readonly currentRevision?: bigint;
+  readonly current?: Uint8Array | undefined;
+  readonly currentRevision?: bigint | undefined;
 }
 
 export interface ResolvedAccount {
@@ -18,7 +18,7 @@ export interface ResolvedAccount {
   /** The current certificate wire. */
   readonly certificate: Uint8Array;
   /** When the account's key changed through a reset: the receipt that proves it. */
-  readonly resetReceipt?: Uint8Array;
+  readonly resetReceipt?: Uint8Array | undefined;
 }
 
 export interface JoinRequest {
@@ -58,7 +58,7 @@ export interface Directory {
     newVault: Uint8Array;
     resetId: Uint8Array;
     reauthProof: Uint8Array;
-  }): Promise<MutationOutcome & { receipt?: Uint8Array }>;
+  }): Promise<MutationOutcome & { receipt?: Uint8Array | undefined }>;
 }
 
 export interface EpochBundle {
@@ -91,7 +91,7 @@ export interface Relay {
     expectedHash: Uint8Array | undefined;
     manifest: Uint8Array;
     wraps: ReadonlyMap<string, Uint8Array>;
-  }): Promise<MutationOutcome & { currentEpoch?: number; currentManifest?: Uint8Array }>;
+  }): Promise<MutationOutcome & { currentEpoch?: number | undefined; currentManifest?: Uint8Array | undefined }>;
   /** MUST be callable from inside T6h without awaiting: it queues the bytes synchronously and returns a promise. */
   appendRecord(recordId: Uint8Array, wire: Uint8Array): Promise<AppendOutcome>;
   readRecords(streamId: Uint8Array, afterSeq: bigint, limit: number): Promise<ReadRecordsResult>;

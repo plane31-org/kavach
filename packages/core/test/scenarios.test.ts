@@ -11,7 +11,7 @@ import { KavachError } from "../src/errors.js";
 import { locationFromDegrees } from "../src/record.js";
 import { MemorySecretStore, MemoryStore } from "../src/store.js";
 import type { ProviderLoadResult, ProviderSaveResult, ProviderStatus, ProviderStatusResult, RecoveryProvider } from "../src/vault.js";
-import { FakeHost } from "./fakeHost.js";
+import { FakeHost } from "../src/testing/fakeHost.js";
 import { Clock, policy } from "./harness.js";
 
 beforeAll(() => ready());

@@ -1,0 +1,33 @@
+# @kavach/expo
+
+The adapters an Expo app supplies to `@kavach/core`, as the Moyo implementation profile (Part II of `spec/Kavach-v1.md`, section 3) describes them. Each adapter is written against a small structural interface so it can be tested in Node with a fake, and driven on a device by the real module.
+
+| Adapter | Over | Status |
+| --- | --- | --- |
+| `ExpoSecretStore` | `expo-secure-store`, `WHEN_UNLOCKED_THIS_DEVICE_ONLY`, no authentication prompt | complete |
+| `SqliteStore` | `expo-sqlite` with SQLCipher (`PRAGMA key`, WAL, `synchronous = FULL`, finite `busy_timeout`, `BEGIN IMMEDIATE`) | complete; tested on Node's SQLite, SQLCipher keying tested by recorded statements |
+| `BlockStoreRecoveryProvider` | Android Block Store through a native module implementing `BlockStoreLike` | logic complete; native module is a dev-build task |
+| `AppleKeychainRecoveryProvider` | a synchronizable Keychain item through a native module implementing `SyncedKeychainLike` | logic complete; native module and config plugin are a dev-build task |
+| `TrustedClock` | the platform clock with a durable high-water mark | complete |
+| `handleBackgroundLocations`, `defineLocationTask` | `expo-location` and `expo-task-manager` | complete |
+
+## Wiring on a device
+
+```ts
+import * as SecureStore from "expo-secure-store";
+import * as SQLite from "expo-sqlite";
+import { open } from "@kavach/core";
+import { ExpoSecretStore, SqliteStore, expoSqliteDriver, BlockStoreRecoveryProvider, AppleKeychainRecoveryProvider } from "@kavach/expo";
+
+const secretStore = new ExpoSecretStore(SecureStore, { thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, keychainService: "app.getmoyo" });
+let storageKey = await secretStore.get("storageKey");
+if (!storageKey) { storageKey = crypto.getRandomValues(new Uint8Array(32)); await secretStore.set("storageKey", storageKey); }
+const db = SQLite.openDatabaseSync("kavach.db", { useNewConnection: true });
+const store = SqliteStore.open({ driver: expoSqliteDriver(db), storageKey, busyTimeoutMs: 5000 });
+```
+
+Enable SQLCipher through the `expo-sqlite` config plugin (`useSQLCipher: true`), exclude `kavach.db` and its WAL files from iCloud backup and Android auto-backup, and pass one `SqliteStore` per JavaScript context: the foreground app and the background task each open their own connection, and SQLite's file lock serialises them.
+
+## What the device tests must show (step 14 of the build sequence)
+
+Foreground and background tasks write concurrently without a shared counter and the handoff race does not reproduce; the database refuses to open without the key; the recovery providers report the five statuses with sync off, locked and unavailable services; enrollment completes with the provider unavailable; a clock rollback yields `RESET_CLOCK_UNTRUSTED` without pausing sharing. The Android cloud-restore test to a second device is a release gate; record its device and Play services versions.
