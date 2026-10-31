@@ -1,0 +1,23 @@
+{
+  "name": "@kavach/core",
+  "version": "0.0.0",
+  "description": "Kavach v1 protocol: documents, cryptography, state machine. Pure TypeScript, no platform imports.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "libsodium-wrappers-sumo": "^0.7.15"
+  },
+  "devDependencies": {
+    "@types/libsodium-wrappers-sumo": "^0.7.8"
+  }
+}

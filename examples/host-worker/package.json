@@ -1,0 +1,14 @@
+{
+  "name": "@kavach/host-worker-example",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Reference host for Kavach v1 on Cloudflare Workers: directory, per-author relay, notifications. Not published.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": { "@kavach/core": "workspace:*" },
+  "devDependencies": { "@cloudflare/workers-types": "^4.20241022.0" }
+}
