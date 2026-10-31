@@ -398,14 +398,14 @@ export class FakeHost {
           if (!s || s.authorIdentityId !== a.identityId) return { status: "UNAUTHORIZED" };
           if (!current()) return { status: "SUPERSEDED_DEVICE" };
           const id = toHex(recordId);
-          const hash = toHex(bodyHash(rec.body));
+          const hash = toHex(bodyHash(wire)); // exact bytes, signature included
           // Checkpoint first, then the epoch fence.
           if (s.lastAppend && s.lastAppend.recordId === id) {
             if (s.lastAppend.hash !== hash) return { status: "EQUIVOCATION" };
             if (s.lastAppend.at + host.appendRetryWindowMs > host.now()) return { status: "ALREADY_ACCEPTED", deliverySeq: s.lastAppend.seq };
           }
           const retained = [...s.records.values()].find((r) => r.recordId === id);
-          if (retained) return hash === toHex(bodyHash(parseDocument(retained.wire).body)) ? { status: "ALREADY_ACCEPTED" } : { status: "EQUIVOCATION" };
+          if (retained) return hash === toHex(bodyHash(retained.wire)) ? { status: "ALREADY_ACCEPTED" } : { status: "EQUIVOCATION" };
           if (s.highWater && (rec.epoch < s.highWater.epoch || (rec.epoch === s.highWater.epoch && rec.counter <= s.highWater.counter))) return { status: "STALE_APPEND" };
           if (rec.epoch !== s.currentEpoch) return rec.epoch < s.currentEpoch ? { status: "EPOCH_FENCED" } : { status: "UNAUTHORIZED" };
           const epoch = s.epochs.get(rec.epoch);

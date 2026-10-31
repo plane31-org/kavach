@@ -9,6 +9,6 @@ describe("workerd smoke", () => {
     expect(rows.results.length).toBe(1);
     const id = env.STREAMS.idFromName("x");
     const stub = env.STREAMS.get(id);
-    expect(await (await stub.fetch("https://do/")).json()).toEqual({ ok: true });
+    expect(await (await stub.fetch("https://do/debug", { method: "POST", body: "{}" })).json()).toMatchObject({ currentEpoch: 0 });
   });
 });

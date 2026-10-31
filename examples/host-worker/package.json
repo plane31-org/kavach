@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -b ../../packages/core && tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "dev": "wrangler dev"
   },

@@ -28,6 +28,7 @@ export interface ClientState {
   readonly status: ClientStatus;
   readonly paused: PauseReason | undefined;
   readonly identityId: Uint8Array | undefined;
+  readonly certificateHash: Uint8Array | undefined;
   readonly generation: bigint | undefined;
   readonly outbox: number;
   /** Authors whose current epoch has not yet reached this device. */
@@ -252,7 +253,7 @@ class ClientImpl implements Client {
 
   async getState(): Promise<ClientState> {
     const meta = await this.store.read((tx) => tx.get("meta", META));
-    const base = { identityId: this.selfPin?.identityId, generation: this.selfPin?.generation, outbox: 0, waitingFor: [] as Uint8Array[], circles: [] as CircleSummary[] };
+    const base = { identityId: this.selfPin?.identityId, certificateHash: this.selfPin?.certificateHash, generation: this.selfPin?.generation, outbox: 0, waitingFor: [] as Uint8Array[], circles: [] as CircleSummary[] };
     if (!meta || !this.account) return { status: "fresh", paused: undefined, ...base };
     const circles = await this.listCircles();
     const outbox = await outboxCount(this.store);
