@@ -17,6 +17,8 @@ export interface ResolvedAccount {
   readonly accountKey: Uint8Array;
   /** The current certificate wire. */
   readonly certificate: Uint8Array;
+  /** When the account's key changed through a reset: the receipt that proves it. */
+  readonly resetReceipt?: Uint8Array;
 }
 
 export interface JoinRequest {
@@ -28,6 +30,8 @@ export interface JoinRequest {
 
 export interface Directory {
   resolveAccounts(names: readonly string[]): Promise<readonly ResolvedAccount[]>;
+  /** Snapshots name identities; the directory maps them back to accounts (host-trusted, like first contact). */
+  resolveIdentities(identityIds: readonly Uint8Array[]): Promise<readonly ResolvedAccount[]>;
   getCertificate(hash: Uint8Array): Promise<Uint8Array | undefined>;
   activateDevice(input: {
     accountName: string;

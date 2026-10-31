@@ -41,6 +41,8 @@ interface Account {
   retiredCertificates: Set<string>;
   vault: { wire: Uint8Array; revision: bigint; hash: string } | undefined;
   retiredIdentity: boolean;
+  previousIdentities: Set<string>;
+  resetReceipt: Uint8Array | undefined;
 }
 
 interface StoredRecord {
@@ -181,7 +183,17 @@ export class FakeHost {
       async resolveAccounts(names): Promise<ResolvedAccount[]> {
         return names.flatMap((n) => {
           const a = host.accounts.get(n);
-          return a ? [{ accountName: n, accountKey: a.accountKey, certificate: a.certificate }] : [];
+          if (!a) return [];
+          const r: ResolvedAccount = { accountName: n, accountKey: a.accountKey, certificate: a.certificate };
+          return [a.resetReceipt ? { ...r, resetReceipt: a.resetReceipt } : r];
+        });
+      },
+      async resolveIdentities(identityIds): Promise<ResolvedAccount[]> {
+        return identityIds.flatMap((iid) => {
+          const a = host.accountByIdentity(toHex(iid)) ?? [...host.accounts.values()].find((x) => x.previousIdentities.has(toHex(iid)));
+          if (!a) return [];
+          const r: ResolvedAccount = { accountName: a.accountName, accountKey: a.accountKey, certificate: a.certificate };
+          return [a.resetReceipt ? { ...r, resetReceipt: a.resetReceipt } : r];
         });
       },
       async getCertificate(hash) {
@@ -202,7 +214,9 @@ export class FakeHost {
           deviceIds: new Set([toHex(doc.deviceId)]),
           retiredCertificates: new Set(),
           vault: { wire: vault, revision: vh.vaultRevision, hash: toHex(vh.hash) },
-          retiredIdentity: false
+          retiredIdentity: false,
+          previousIdentities: new Set(),
+          resetReceipt: undefined
         });
         host.certificates.set(toHex(doc.bodyHash), certificate);
         host.stream(toHex(deriveStreamId(fromHex(iid), doc.deviceId)), iid, doc.accountName);
@@ -319,7 +333,8 @@ export class FakeHost {
         host.receipts.set(toHex(input.resetId), receipt);
         for (const c of host.circles.values()) if (c.ownerIdentityId === a.identityId) c.closed = true;
         const vh = parseVaultHeader(input.newVault);
-        a.retiredIdentity = true;
+        a.previousIdentities.add(a.identityId);
+        a.resetReceipt = receipt;
         a.retiredCertificates.add(a.certificateHash);
         a.accountKey = doc.accountKey;
         a.identityId = toHex(newIid);
@@ -328,7 +343,6 @@ export class FakeHost {
         a.generation = doc.generation;
         a.deviceIds.add(toHex(doc.deviceId));
         a.vault = { wire: input.newVault, revision: vh.vaultRevision, hash: toHex(vh.hash) };
-        a.retiredIdentity = false;
         host.certificates.set(a.certificateHash, input.newCertificate);
         host.stream(toHex(deriveStreamId(newIid, doc.deviceId)), a.identityId, a.accountName);
         host.hint("metadataChanged");

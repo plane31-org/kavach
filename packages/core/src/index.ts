@@ -24,3 +24,4 @@ export * from "./transactions.js";
 export * from "./outbox.js";
 export * from "./inbox.js";
 export * from "./reset.js";
+export * from "./client.js";

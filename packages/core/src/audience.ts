@@ -37,13 +37,14 @@ export function isEligible(circle: CircleState, selfIdentityId: Uint8Array): boo
  * missing is `METADATA_REQUIRED`; more than 100 distinct accounts is `RECIPIENT_LIMIT`. The
  * author never guesses, omits a recipient or reuses an obsolete key.
  */
-export function resolveAudience(self: AccountPin, circles: readonly CircleState[], pins: ReadonlyMap<string, AccountPin>): ResolvedAudience {
+export function resolveAudience(self: AccountPin, circles: readonly CircleState[], pins: ReadonlyMap<string, AccountPin>, retired: ReadonlySet<string> = new Set()): ResolvedAudience {
   const stage = "resolveAudience";
   const wanted = new Map<string, Uint8Array>();
   wanted.set(toHex(self.identityId), self.identityId);
   for (const c of circles) {
     if (!isEligible(c, self.identityId)) continue;
-    for (const m of c.members) wanted.set(toHex(m), m);
+    // An identity retired by a validated reset receipt is no longer a recipient.
+    for (const m of c.members) if (!retired.has(toHex(m))) wanted.set(toHex(m), m);
   }
   if (wanted.size > MAX_AUDIENCE) throw new KavachError("RECIPIENT_LIMIT", stage, `${wanted.size} accounts`);
   const rows: AudienceEntry[] = [];
