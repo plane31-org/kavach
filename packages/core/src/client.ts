@@ -16,7 +16,7 @@ import { drain, enqueue, outboxCount } from "./outbox.js";
 import { validatePolicy, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
-import type { SecretStore, Store } from "./store.js";
+import type { CircleRow, SecretStore, Store } from "./store.js";
 import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9Vault } from "./transactions.js";
 import type { Transport, TransportHint } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
@@ -595,14 +595,29 @@ class ClientImpl implements Client {
         prepared = rowToPrepared(row);
       } else {
         const revision = revisionRow ? unbig(revisionRow.desiredRevision) : 1n;
-        prepared = prepareEpoch({
+        const fresh = prepareEpoch({
           author: { identityId: pin.identityId, certificateHash: pin.certificateHash, streamId: pin.streamId, signingSecretKey: device.signing.secretKey },
           epoch: stream.highestCommittedEpoch + 1,
           createdAt: this.now(),
           audience,
           desiredRevision: revision
         });
-        await this.store.transaction((tx) => t4PersistPrepared(tx, prepared));
+        // Under the lock, another context may have prepared or even promoted first. One unresolved
+        // epoch per stream: adopt theirs, or start over if the stream moved on.
+        const adopted = await this.store.transaction((tx): PreparedEpoch | undefined => {
+          const st = tx.get("stream", STREAM);
+          if (!st) throw new KavachError("RECOVERY_REQUIRED", "epoch");
+          if (st.pendingEpoch !== undefined) {
+            const row = tx.get("epochs", String(st.pendingEpoch));
+            if (!row) throw new KavachError("STORAGE_FAILURE", "epoch", "pending epoch row missing");
+            return rowToPrepared(row);
+          }
+          if (st.highestCommittedEpoch !== stream.highestCommittedEpoch || st.activeEpoch !== undefined) return undefined;
+          t4PersistPrepared(tx, fresh);
+          return fresh;
+        });
+        if (!adopted) continue;
+        prepared = adopted;
       }
       const outcome = await this.transport.relay.publishEpoch({ streamId: pin.streamId, expectedEpoch: prepared.epoch - 1, expectedHash: undefined, manifest: prepared.manifest, wraps: prepared.wraps });
       const resolution = resolvePublish(
@@ -719,6 +734,22 @@ class ClientImpl implements Client {
           report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
         }
       }
+    }
+    // Unconfirmed writes of our own first: a successor snapshot the host never took, a vault update
+    // it never saw. Until they land, peers read stale membership and a replacement phone a stale
+    // preference.
+    const pendingOwned = await this.store.read((tx) => tx.list("circles").filter(([, r]) => r.pending && r.ownerIdentityId === toHex(pin.identityId)).map(([, r]) => fromHex(r.circleId)));
+    for (const circleId of pendingOwned) {
+      try {
+        if ((await this.publishPendingSnapshot(circleId)) === "COMMITTED") report.metadata.snapshots++;
+      } catch (e) {
+        report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+      }
+    }
+    try {
+      await this.republishPendingVault();
+    } catch (e) {
+      report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
     }
     // Circles: owners we have not pinned yet, then snapshots, then members' certificates.
     const circles = await this.store.read((tx) => tx.list("circles").map(([, c]) => rowToCircle(c)));
@@ -980,13 +1011,9 @@ class ClientImpl implements Client {
     const state = acceptSnapshot(pinCircle(circleId, pin.identityId, true, "member"), genesis, pin.accountKey, pin.identityId, this.now());
     if (state.outcome !== "ACCEPTED") throw new KavachError("STORAGE_FAILURE", "createCircle");
     await this.store.transaction((tx) => tx.put("circles", toHex(circleId), { ...circleToRow(state.state), pending: { snapshot: toHex(genesis), revision: "1" } }));
-    const outcome = await this.transport.directory.publishOwnedCircle({ circleId, expectedRevision: 0n, expectedHash: undefined, newSnapshot: genesis });
-    if (outcome.status !== "COMMITTED" && outcome.status !== "ALREADY_COMMITTED") throw new KavachError("STORAGE_FAILURE", "createCircle", outcome.status);
-    await this.store.transaction((tx) => {
-      const row = tx.get("circles", toHex(circleId));
-      if (row) tx.put("circles", toHex(circleId), { ...row, pending: undefined });
-      t3ApplyChange(tx, { kind: "join", circleId });
-    });
+    const published = await this.publishPendingSnapshot(circleId);
+    if (published !== "COMMITTED") throw new KavachError("STORAGE_FAILURE", "createCircle", published);
+    await this.store.transaction((tx) => t3ApplyChange(tx, { kind: "join", circleId }));
     await this.vaultUpdate((entries) => upsertEntry(entries, { circleId, ownerIdentityId: pin.identityId, sharingEnabled: true }));
     this.emit({ kind: "circleChanged", circleId, revision: 1n, status: "member" });
     return { circleId };
@@ -1020,34 +1047,85 @@ class ClientImpl implements Client {
     for (let attempt = 0; attempt < 3; attempt++) {
       const row = await this.store.read((tx) => tx.get("circles", toHex(circleId)));
       if (!row) throw new KavachError("NOT_AUTHORIZED", "changeMembership", "unknown circle");
+      if (row.pending) {
+        // An earlier change the host never confirmed goes first; this one is built on its result.
+        await this.publishPendingSnapshot(circleId);
+        continue;
+      }
       const state = rowToCircle(row);
       const successor = successorSnapshot(state, change, { identityId: pin.identityId, accountSecretKey: account.account.secretKey });
       if (!successor) return { revision: state.revision };
-      await this.store.transaction((tx) => t8OwnerSnapshot(tx, circleId, successor, state.revision + 1n));
-      const outcome = await this.transport.directory.publishOwnedCircle({ circleId, expectedRevision: state.revision, expectedHash: state.bodyHash, newSnapshot: successor });
-      if (outcome.status === "COMMITTED" || outcome.status === "ALREADY_COMMITTED") {
-        const accepted = acceptSnapshot(state, successor, pin.accountKey, pin.identityId, this.now());
-        if (accepted.outcome !== "ACCEPTED") throw new KavachError("STORAGE_FAILURE", "changeMembership");
-        const next = "close" in change ? { ...accepted.state, status: "closed" as const } : accepted.state;
-        await this.store.transaction((tx) => {
-          tx.put("circles", toHex(circleId), { ...circleToRow(next), pending: undefined });
-          t3ApplyChange(tx, { kind: "snapshot", circleId, revision: next.revision });
-        });
-        if ("remove" in change) {
-          const stillElsewhere = await this.store.read((tx) => tx.list("circles").some(([, c]) => c.circleId !== toHex(circleId) && c.status === "member" && c.members.includes(toHex(change.remove))));
-          if (!stillElsewhere) await forgetAuthor(this.store, change.remove);
-        }
-        this.emit({ kind: "circleChanged", circleId, revision: next.revision, status: next.status });
-        return { revision: next.revision };
-      }
-      if (outcome.status === "CONFLICT" && outcome.current) {
-        const accepted = acceptSnapshot(state, outcome.current, pin.accountKey, pin.identityId, this.now());
-        if (accepted.outcome === "ACCEPTED") await this.store.transaction((tx) => tx.put("circles", toHex(circleId), { ...circleToRow(accepted.state), pending: undefined }));
-        continue;
-      }
-      throw new KavachError("STORAGE_FAILURE", "changeMembership", outcome.status);
+      await this.store.transaction((tx) => t8OwnerSnapshot(tx, circleId, successor, state.revision + 1n, "close" in change));
+      const published = await this.publishPendingSnapshot(circleId);
+      if (published === "COMMITTED") return { revision: await this.store.read((tx) => unbig(tx.get("circles", toHex(circleId))?.revision ?? "0")) };
     }
     throw new KavachError("STORAGE_FAILURE", "changeMembership", "conflict persisted");
+  }
+
+  /**
+   * Publish a circle's pending successor (T8) and, once the host holds it, accept it locally with
+   * the revision bump, the live-pin cleanup of anyone it removed and the change event. Called by
+   * the change itself and again by every sync while a successor is pending, so a change whose
+   * publication failed is never left admitted-but-sharing. On CONFLICT the host's snapshot is
+   * accepted and the pending successor dropped; the caller rebuilds its change on top.
+   */
+  private async publishPendingSnapshot(circleId: Uint8Array): Promise<"COMMITTED" | "CONFLICT" | "NONE"> {
+    const stage = "publishSnapshot";
+    const { pin } = this.requireAccount(stage);
+    const row = await this.store.read((tx) => tx.get("circles", toHex(circleId)));
+    if (!row?.pending) return "NONE";
+    const pending = row.pending;
+    const state = rowToCircle(row);
+    const successor = fromHex(pending.snapshot);
+    const expectedRevision = unbig(pending.revision) - 1n;
+    const outcome = await this.transport.directory.publishOwnedCircle({ circleId, expectedRevision, expectedHash: expectedRevision === state.revision ? state.bodyHash : undefined, newSnapshot: successor });
+    if (outcome.status === "COMMITTED" || outcome.status === "ALREADY_COMMITTED") {
+      const accepted = acceptSnapshot(state, successor, pin.accountKey, pin.identityId, this.now());
+      if (accepted.outcome !== "ACCEPTED" && accepted.outcome !== "DUPLICATE") throw new KavachError("STORAGE_FAILURE", stage, "the successor was refused locally");
+      const next = pending.close ? { ...accepted.state, status: "closed" as const } : accepted.state;
+      await this.store.transaction((tx) => {
+        tx.put("circles", toHex(circleId), { ...circleToRow(next), pending: undefined });
+        t3ApplyChange(tx, { kind: "snapshot", circleId, revision: next.revision });
+      });
+      const after = new Set(next.members.map(toHex));
+      for (const m of state.members) {
+        if (after.has(toHex(m)) || equalBytes(m, pin.identityId)) continue;
+        const stillElsewhere = await this.store.read((tx) => tx.list("circles").some(([, c]) => c.circleId !== toHex(circleId) && c.status === "member" && c.members.includes(toHex(m))));
+        if (!stillElsewhere) await forgetAuthor(this.store, m);
+      }
+      this.emit({ kind: "circleChanged", circleId, revision: next.revision, status: next.status });
+      return "COMMITTED";
+    }
+    if (outcome.status === "CONFLICT" && outcome.current) {
+      const accepted = acceptSnapshot(state, outcome.current, pin.accountKey, pin.identityId, this.now());
+      await this.store.transaction((tx) => tx.put("circles", toHex(circleId), { ...circleToRow(accepted.outcome === "ACCEPTED" ? accepted.state : state), pending: undefined }));
+      return "CONFLICT";
+    }
+    throw new KavachError("STORAGE_FAILURE", stage, outcome.status);
+  }
+
+  /** The vault's entries as the local circle rows say they should be: the source of truth after a failed vault write. */
+  private reconcileEntries(entries: readonly VaultEntry[], rows: readonly CircleRow[]): VaultEntry[] {
+    let out: VaultEntry[] = [...entries];
+    for (const r of rows) {
+      const circleId = fromHex(r.circleId);
+      if (r.status === "left" || r.status === "closed") out = removeEntry(out, circleId);
+      else if (r.status === "member" || r.status === "requested") out = upsertEntry(out, { circleId, ownerIdentityId: fromHex(r.ownerIdentityId), sharingEnabled: r.enabled });
+    }
+    return out;
+  }
+
+  /** A vault update the host never confirmed is published again: the exact bytes first, else rebuilt from local state. */
+  private async republishPendingVault(): Promise<void> {
+    const row = await this.store.read((tx) => tx.get("vault", VAULT));
+    if (!row?.pending) return;
+    const outcome = await this.transport.directory.publishVault({ expectedRevision: unbig(row.revision) - 1n, expectedHash: undefined, newVault: fromHex(row.wire) });
+    if (outcome.status === "COMMITTED" || outcome.status === "ALREADY_COMMITTED") {
+      await this.store.transaction((tx) => t9Vault(tx, { ...row, pending: false }));
+      return;
+    }
+    const rows = await this.store.read((tx) => tx.list("circles").map(([, r]) => r));
+    await this.vaultUpdate((entries) => this.reconcileEntries(entries, rows));
   }
 
   private async leave(circleId: Uint8Array): Promise<void> {
@@ -1069,7 +1147,10 @@ class ClientImpl implements Client {
   private async setEnabled(circleId: Uint8Array, enabled: boolean): Promise<void> {
     const row = await this.store.read((tx) => tx.get("circles", toHex(circleId)));
     if (!row) throw new KavachError("NOT_AUTHORIZED", "setEnabled", "unknown circle");
-    if (row.enabled === enabled) return;
+    if (row.enabled === enabled) {
+      await this.republishPendingVault();
+      return;
+    }
     await this.store.transaction((tx) => {
       tx.put("circles", toHex(circleId), { ...row, enabled });
       t3ApplyChange(tx, { kind: enabled ? "enable" : "disable", circleId });

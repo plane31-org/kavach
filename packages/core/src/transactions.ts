@@ -154,9 +154,9 @@ export function currentRevision(tx: Pick<Tx, "get">): bigint {
 /** T4: the exact manifest, wraps, key and audience checkpoint of a prepared epoch. One unresolved epoch per stream. */
 export function t4PersistPrepared(tx: Tx, prepared: PreparedEpoch): void {
   const stream = tx.get("stream", STREAM) ?? { highestCommittedEpoch: 0, activeEpoch: undefined, pendingEpoch: undefined };
-  if (stream.pendingEpoch !== undefined && stream.pendingEpoch !== prepared.epoch) {
-    throw new KavachError("ROTATION_REQUIRED", "t4", "an epoch is already unresolved");
-  }
+  // Never overwrite an unresolved epoch, even at the same number: a second preparation carries a
+  // different key, and publishing both is an equivocation against ourselves.
+  if (stream.pendingEpoch !== undefined) throw new KavachError("ROTATION_REQUIRED", "t4", "an epoch is already unresolved");
   if (prepared.epoch !== stream.highestCommittedEpoch + 1) throw new KavachError("MALFORMED", "t4", "epoch must be highestCommitted + 1");
   tx.put("epochs", String(prepared.epoch), preparedToRow(prepared));
   tx.put("stream", STREAM, { ...stream, pendingEpoch: prepared.epoch });
@@ -169,12 +169,18 @@ export function t5Committed(tx: Tx, epoch: number, currentAudienceKey: string): 
   const stream = tx.get("stream", STREAM);
   const row = tx.get("epochs", String(epoch));
   if (!stream || !row) throw new KavachError("STORAGE_FAILURE", "t5", "unknown epoch");
+  // Idempotent: two contexts can both learn of one publication. The second must not reset a
+  // counter the first already started allocating from.
+  if (row.status === "active") return "PROMOTED";
+  if (row.status === "obsolete" || row.status === "retired") return "OBSOLETE";
   const outcome = promote(rowToPrepared(row), currentRevision(tx), currentAudienceKey);
   const revision = tx.get("revision", REVISION);
   if (outcome === "PROMOTED") {
     tx.put("epochs", String(epoch), { ...row, status: "active", nextCounter: 0 });
     tx.put("stream", STREAM, { highestCommittedEpoch: Math.max(stream.highestCommittedEpoch, epoch), activeEpoch: epoch, pendingEpoch: undefined });
-    if (revision?.paused === "rotation") tx.put("revision", REVISION, { ...revision, paused: undefined });
+    // A promoted epoch resolved whatever paused sending: the rotation, the missing certificate,
+    // or the audience limit. The sync pause belongs to the host and stays.
+    if (revision?.paused && revision.paused !== "sync") tx.put("revision", REVISION, { ...revision, paused: undefined });
   } else {
     tx.put("epochs", String(epoch), { ...row, status: "obsolete" });
     tx.put("stream", STREAM, { ...stream, highestCommittedEpoch: Math.max(stream.highestCommittedEpoch, epoch), pendingEpoch: undefined });
@@ -185,11 +191,11 @@ export function t5Committed(tx: Tx, epoch: number, currentAudienceKey: string): 
 // T8 and T9 ---------------------------------------------------------------------------------------
 
 /** T8: the owner's successor snapshot, kept until the host confirms it. */
-export function t8OwnerSnapshot(tx: Tx, circleId: Uint8Array, snapshot: Uint8Array, revision: bigint): void {
+export function t8OwnerSnapshot(tx: Tx, circleId: Uint8Array, snapshot: Uint8Array, revision: bigint, close = false): void {
   const key = toHex(circleId);
   const row = tx.get("circles", key);
   if (!row) throw new KavachError("STORAGE_FAILURE", "t8", "unknown circle");
-  tx.put("circles", key, { ...row, pending: { snapshot: toHex(snapshot), revision: big(revision) } });
+  tx.put("circles", key, { ...row, pending: { snapshot: toHex(snapshot), revision: big(revision), ...(close ? { close: true } : {}) } });
 }
 
 /** T9: a vault update prepared for publication (or confirmed). */

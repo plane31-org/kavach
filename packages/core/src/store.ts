@@ -81,7 +81,7 @@ export interface CircleRow {
   status: "requested" | "member" | "left" | "quarantined" | "closed";
   verifiedAt: string;
   /** An owner's successor snapshot awaiting host confirmation (T8). */
-  pending?: { snapshot: string; revision: string } | undefined;
+  pending?: { snapshot: string; revision: string; close?: boolean } | undefined;
 }
 
 export interface RevisionRow {

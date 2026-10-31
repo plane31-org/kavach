@@ -106,8 +106,10 @@ export type ServedKind = "certificate" | "snapshot" | "vault" | "manifest" | "wr
 export interface MaliciousKnobs {
   /** Mutations whose next response is lost after the host committed it (each name is consumed once). */
   readonly loseResponseOf: Set<MutationName>;
+  /** Mutations whose next call fails before reaching the host (each name is consumed once). */
+  readonly refuse: Set<MutationName>;
   /** Reads that answer "nothing" while present. */
-  readonly withhold: Set<"snapshots" | "epochs" | "records" | "requests" | "currentEpoch" | "keyList">;
+  readonly withhold: Set<"snapshots" | "epochs" | "records" | "requests" | "currentEpoch" | "keyList" | "certificates">;
   /** Older documents served instead of the current ones. */
   readonly replay: {
     vault?: Uint8Array;
@@ -133,6 +135,7 @@ export interface MaliciousKnobs {
 export function emptyKnobs(): MaliciousKnobs {
   return {
     loseResponseOf: new Set(),
+    refuse: new Set(),
     withhold: new Set(),
     replay: { snapshots: new Map() },
     fork: { snapshots: new Map(), manifests: new Map(), records: new Map(), certificates: new Map() },
@@ -177,6 +180,10 @@ export class MaliciousTransport implements Transport {
 
   private async mutate<O extends MutationOutcome | AppendOutcome | { status: string }>(name: MutationName, call: () => Promise<O>): Promise<O> {
     this.calls.push(name);
+    if (this.knobs.refuse.has(name)) {
+      this.knobs.refuse.delete(name);
+      throw new Error("network unreachable");
+    }
     const result = await call();
     if (this.knobs.loseResponseOf.has(name)) {
       this.knobs.loseResponseOf.delete(name);
@@ -194,11 +201,13 @@ export class MaliciousTransport implements Transport {
     return {
       resolveAccounts: async (names) => {
         this.calls.push("resolveAccounts");
+        if (k.withhold.has("certificates")) return [];
         const rs = await d().resolveAccounts(names);
         return rs.map((r) => ({ ...r, certificate: k.fork.certificates.get(r.accountName) ?? this.serve("certificate", r.certificate) ?? r.certificate }));
       },
       resolveIdentities: async (ids) => {
         this.calls.push("resolveIdentities");
+        if (k.withhold.has("certificates")) return [];
         const rs = await d().resolveIdentities(ids);
         return rs.map((r) => ({ ...r, certificate: k.fork.certificates.get(r.accountName) ?? this.serve("certificate", r.certificate) ?? r.certificate }));
       },
