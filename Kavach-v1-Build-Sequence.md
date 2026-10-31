@@ -1,6 +1,6 @@
 # Kavach v1: build sequence for a new repository
 
-One module at a time: write it, test it against the frozen vectors or a scenario, then move on. Nothing in the existing Moyo repository changes until step 18. The protocol is Part I of `Kavach v1.md` (protocol revision 4, wire version 5, formerly SealedStream SS5); Moyo's choices are Part II. The vectors are the SS5 revision 2 package regenerated once: K19 at 30 days, type 5 retired, the 49-byte vault entry. The wire labels keep the `SealedStream/5/` prefix on purpose.
+One module at a time: write it, test it against the frozen vectors or a scenario, then move on. Nothing in the existing Moyo repository changes until step 18. The protocol is Part I of `Kavach v1.md` (protocol revision 4, wire version 5, formerly SealedStream SS5); Moyo's choices are Part II. The vectors are `spec/vectors.json` with `spec/verify_vectors.py`: the SS5 revision 2 package (kept unchanged in `spec/vectors-rev2/`) regenerated once for revision 4: K19 at 30 days, the maximum-size record re-derived with flag bit 0 reserved, type 5 retired, the 49-byte vault entry. The wire labels keep the `SealedStream/5/` prefix on purpose.
 
 Packages: `@kavach/core` (protocol, pure TypeScript, no platform imports) and `@kavach/expo` (SecureStore, SQLite with SQLCipher, Keychain and Block Store recovery providers, clock, background task glue). A reference host lives in `examples/host-worker` and is not published.
 
@@ -8,9 +8,9 @@ Estimated size: core about 3,200 lines, expo about 800, host example about 650, 
 
 ## Step 0: repository and tooling
 
-Write: pnpm workspace, TypeScript strict, vitest, eslint, `packages/core`, `packages/expo`, `examples/host-worker`, `spec/` holding both PDFs, `vectors.json` and `verify_vectors.py` regenerated once for revision 4 (the revision 3 layouts, unchanged since): K19 at 30 days, type 5 retired, the 49-byte vault entry. A `scripts/vectors.sh` that runs the Python checker in a venv.
+Write: pnpm workspace, TypeScript strict, vitest, eslint, `packages/core`, `packages/expo`, `examples/host-worker`, `spec/` holding the specification, `vectors.json` and `verify_vectors.py` regenerated once for revision 4 from the revision 2 package: K19 at 30 days, the maximum-size record with flag bit 0 reserved, type 5 retired, the 49-byte vault entry. A `scripts/vectors.sh` that runs the Python checker in a venv with pinned dependencies.
 
-Test: the Python checker passes on a clean checkout and the diff against the revision 2 fixture touches only K19, the type 5 cases, the vault cases and the file hash. CI runs typecheck, lint, unit tests and the checker.
+Test: the Python checker passes on a clean checkout, the unchanged revision 2 package still passes its own checker, and the section diff between the two fixtures touches only the profile string, the type 5 document, the two added negative vectors, the maximum-size record, the recovery vault and the K19 wire. CI runs typecheck, lint, unit tests and the checker.
 
 Next: primitives.
 
@@ -26,7 +26,7 @@ Next: the codec.
 
 Write: `core/src/codec.ts`: parse and build for AccountDevice, CircleSnapshot, EpochManifest, EncryptedRecord (flag bit 0 reserved, bit 1 kind), AccountVault, AccountResetReceipt and ResetKeyList. Each parser enforces the ranges, sort orders, counts, nonzero rules and the 16,384-byte limit before any signature check; the key-list lifetime limit is 30 days. `verify(wire, key)` applies the label by type. `bodyHash`, `recordId`.
 
-Test: Vector B, C, D and E wires rebuild byte for byte; all 19 negative vectors return the expected error; the 100-account boundary fixture parses with sizes 3,324, 9,808, 8,000 and 4,255; the three key lists are 187, 139 and 91 bytes. The location codec round-trips and rejects N14 and N15.
+Test: Vector B, C, D and E wires rebuild byte for byte; all 21 negative vectors return the expected error; the 100-account boundary fixture parses with sizes 3,324, 9,808, 8,000 and 4,255; the three key lists are 187, 139 and 91 bytes. The location codec round-trips and rejects N14 and N15.
 
 Next: identity.
 

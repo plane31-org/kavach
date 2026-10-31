@@ -7,9 +7,9 @@ End-to-end encrypted location sharing and check-ins for circles of up to 100 acc
 - `packages/core`: the protocol in pure TypeScript.
 - `packages/expo`: Expo adapters.
 - `examples/host-worker`: a reference host on Cloudflare Workers, not published.
-- `spec/vectors.json`, `spec/verify_vectors.py`: the conformance fixture and its checker (to be added once regenerated for revision 4).
+- `spec/vectors.json`, `spec/verify_vectors.py`: the revision 4 conformance fixture and its checker; `spec/vectors-rev2/` is the unchanged SS5 revision 2 package it was regenerated from.
 
-Status: step 0 of the build sequence. Nothing here is audited or production-ready.
+Status: step 0 of the build sequence is complete; step 1 (primitives and labels) is next. Nothing here is audited or production-ready.
 
 ```
 pnpm install

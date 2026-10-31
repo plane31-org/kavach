@@ -23,5 +23,4 @@ jobs:
         with:
           python-version: "3.12"
       - name: vectors
-        run: |
-          if [ -f spec/vectors.json ]; then scripts/vectors.sh; else echo "fixture not yet committed; skipping checker"; fi
+        run: scripts/vectors.sh
