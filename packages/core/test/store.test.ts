@@ -63,9 +63,8 @@ describe("the in-memory store", () => {
     const b = a.fork();
     const order: string[] = [];
     let sent = false;
-    const first = a.transaction(async (tx) => {
+    const first = a.transaction((tx) => {
       order.push("A:check");
-      await new Promise((r) => setTimeout(r, 20));
       tx.put("clock", "c", { highWater: "A" });
       order.push("A:send");
       void tx.handoff(async () => {
@@ -80,20 +79,22 @@ describe("the in-memory store", () => {
       return "b";
     });
     expect(await Promise.all([first, second])).toEqual(["a", "b"]);
-    expect(order.slice(0, 3)).toEqual(["A:check", "A:send", "A:network"]);
-    expect(order.indexOf("B:T3")).toBeGreaterThan(order.indexOf("A:send"));
+    expect(order).toEqual(["A:check", "A:send", "A:network", "B:T3"]);
     expect(sent).toBe(true);
     expect(await a.read((tx) => tx.get("clock", "c"))).toEqual({ highWater: "B" });
   });
 
-  it("reads see committed state only", async () => {
+  it("refuses a callback that returns a promise, writes nothing, and releases the lock", async () => {
     const store = new MemoryStore();
-    const tx = store.transaction(async (tx) => {
+    const refused = store.transaction((tx) => {
       tx.put("clock", "c", { highWater: "x" });
-      expect(await store.read((r) => r.get("clock", "c"))).toBeUndefined();
+      return Promise.resolve("never committed") as unknown as string;
     });
-    await tx;
-    expect(await store.read((r) => r.get("clock", "c"))).toEqual({ highWater: "x" });
+    await expect(refused).rejects.toThrow(expect.objectContaining({ code: "STORAGE_FAILURE", message: expect.stringContaining("transaction callbacks are synchronous") }));
+    expect(await store.read((r) => r.get("clock", "c"))).toBeUndefined();
+    expect(store.isHeld).toBe(false);
+    await store.transaction((tx) => tx.put("clock", "c", { highWater: "y" }));
+    expect(await store.read((r) => r.get("clock", "c"))).toEqual({ highWater: "y" });
   });
 });
 

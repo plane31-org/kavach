@@ -60,7 +60,7 @@ describe("SqliteStore over a real SQLite engine", () => {
       })
     ).rejects.toThrow("boom");
     expect(await store.read((tx) => tx.get("clock", "c"))).toBeUndefined();
-    await store.transaction(async (tx) => {
+    await store.transaction((tx) => {
       tx.put("clock", "c", { highWater: "2" });
       tx.put("clock", "d", { highWater: "3" });
       tx.delete("clock", "d");
@@ -71,42 +71,36 @@ describe("SqliteStore over a real SQLite engine", () => {
     await expect(store.read((tx) => (tx as unknown as { put: (a: string, b: string, c: unknown) => void }).put("clock", "x", {}))).rejects.toThrow(expect.objectContaining({ code: "STORAGE_FAILURE" }));
   });
 
-  it("a read during a transaction in flight waits for it and never sees what rolls back", async () => {
+  it("refuses a callback that returns a promise, rolls back, and leaves the connection usable", async () => {
     const store = memoryStore();
-    let release: () => void = () => undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const writing = store.transaction(async (tx) => {
+    const refused = store.transaction((tx) => {
       tx.put("clock", "c", { highWater: "1" });
-      await gate;
-      throw new Error("boom");
+      return Promise.resolve("never committed") as unknown as string;
     });
-    const reading = store.read((tx) => tx.get("clock", "c"));
-    let settled = false;
-    void reading.then(() => {
-      settled = true;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(settled).toBe(false);
-    release();
-    await expect(writing).rejects.toThrow("boom");
-    expect(await reading).toBeUndefined();
+    await expect(refused).rejects.toThrow(expect.objectContaining({ code: "STORAGE_FAILURE", message: expect.stringContaining("transaction callbacks are synchronous") }));
+    expect(await store.read((tx) => tx.get("clock", "c"))).toBeUndefined();
+    // The transaction was rolled back, so the next one can BEGIN and commit.
+    await store.transaction((tx) => tx.put("clock", "c", { highWater: "2" }));
+    expect(await store.read((tx) => tx.get("clock", "c"))).toEqual({ highWater: "2" });
   });
 
   it("serialises another process with BEGIN IMMEDIATE: a worker's write lands only after the handoff and commit", async () => {
     // Two JavaScript contexts, as the foreground app and the background task are on a phone. A second
     // connection in the same thread cannot be used for this: SQLite's busy wait blocks the thread.
+    // The callback is synchronous, so the hold on the lock is stretched with a blocking wait, not an
+    // await; the worker is told to begin while the lock is held and must wait for the commit.
     const dir = mkdtempSync(join(tmpdir(), "kavach-"));
     const path = join(dir, "store.db");
     const a = fileStore(path, 5000);
     await a.transaction((tx) => tx.put("clock", "c", { highWater: "init" }));
     const { Worker } = await import("node:worker_threads");
+    const flags = new Int32Array(new SharedArrayBuffer(8)); // [0]: go, [1]: unused
     const workerCode = `
       const { parentPort, workerData } = require("node:worker_threads");
       const { DatabaseSync } = require("node:sqlite");
       const db = new DatabaseSync(workerData.path);
       db.exec("PRAGMA busy_timeout = 5000");
+      Atomics.wait(workerData.flags, 0, 0); // until the main thread holds the lock
       const t0 = Date.now();
       db.exec("BEGIN IMMEDIATE");
       const waited = Date.now() - t0;
@@ -114,29 +108,33 @@ describe("SqliteStore over a real SQLite engine", () => {
       db.exec("COMMIT");
       parentPort.postMessage({ waited, committedAt: Date.now() });
     `;
+    const worker = new Worker(workerCode, { eval: true, workerData: { path, flags } });
+    const result = new Promise<{ waited: number; committedAt: number }>((resolve, reject) => {
+      worker.once("message", resolve);
+      worker.once("error", reject);
+    });
+    await new Promise((r) => setTimeout(r, 100)); // the worker has opened its connection and is parked on the flag
     const order: string[] = [];
     let commitAt = 0;
-    const first = a.transaction(async (tx) => {
+    const outcome = await a.transaction((tx) => {
       order.push("A:check");
-      const worker = new Worker(workerCode, { eval: true, workerData: { path } });
-      const result = new Promise<{ waited: number; committedAt: number }>((resolve, reject) => {
-        worker.once("message", resolve);
-        worker.once("error", reject);
-      });
-      await new Promise((r) => setTimeout(r, 150)); // the worker is now waiting on our lock
+      Atomics.store(flags, 0, 1);
+      Atomics.notify(flags, 0); // the worker now runs into our BEGIN IMMEDIATE and waits
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150); // hold the lock, synchronously
       tx.put("clock", "c", { highWater: "A" });
-      void tx.handoff(async () => {
+      const sent = tx.handoff(async () => {
         order.push("A:send");
+        return result; // the awaited part: resolved by the worker, which needs our lock to finish
       });
       order.push("A:commit");
       commitAt = Date.now();
-      return { result }; // not awaited inside: the worker needs our lock to finish
+      return { sent }; // carried out inside a value: a bare promise return is refused by the contract
     });
-    const b = await (await first).result;
+    const b = await outcome.sent;
     expect(order).toEqual(["A:check", "A:send", "A:commit"]);
     // The worker's BEGIN IMMEDIATE blocked until A committed: it cannot have committed earlier, and
-    // its wait covers whatever was left of A's hold once the thread had started.
-    expect(b.waited).toBeGreaterThanOrEqual(0);
+    // its wait covers most of the 150 ms hold.
+    expect(b.waited).toBeGreaterThanOrEqual(50);
     expect(b.committedAt).toBeGreaterThanOrEqual(commitAt);
     expect(await a.read((tx) => tx.get("clock", "c"))).toEqual({ highWater: "B" });
   }, 20_000);
@@ -144,18 +142,13 @@ describe("SqliteStore over a real SQLite engine", () => {
   it("a writer that cannot take the lock within the busy timeout gets LOCKED, with nothing written", async () => {
     const dir = mkdtempSync(join(tmpdir(), "kavach-"));
     const path = join(dir, "store.db");
-    const a = fileStore(path, 5000);
+    // Another context holds the file lock: a raw connection with an open BEGIN IMMEDIATE.
+    const holder = openNodeDatabase(path);
     const b = fileStore(path, 100);
-    let releaseA: () => void = () => undefined;
-    const held = new Promise<void>((r) => (releaseA = r));
-    const first = a.transaction(async (tx) => {
-      tx.put("clock", "c", { highWater: "A" });
-      await held;
-    });
-    await new Promise((r) => setTimeout(r, 5));
+    holder.exec("BEGIN IMMEDIATE");
+    holder.prepare("INSERT INTO kv (tbl, key, value) VALUES ('clock', 'c', ?)").run(JSON.stringify({ highWater: "A" }));
     expect(await code(() => b.transaction((tx) => tx.put("clock", "c", { highWater: "B" })))).toBe("LOCKED");
-    releaseA();
-    await first;
+    holder.exec("COMMIT");
     expect(await b.read((tx) => tx.get("clock", "c"))).toEqual({ highWater: "A" });
   });
 

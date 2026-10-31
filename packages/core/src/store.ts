@@ -4,8 +4,9 @@
  * for Node tests.
  *
  * Rules the interface carries: one writer across every execution context; a transaction is
- * atomic; the callback may initiate a transport send before commit through `tx.handoff`, and
- * must not await it inside; a writer that cannot acquire the lock gets `LOCKED`.
+ * atomic; the callback finishes synchronously, so the lock is never held across a suspension
+ * of the caller; the callback may initiate a transport send before commit through `tx.handoff`,
+ * and must not await it inside; a writer that cannot acquire the lock gets `LOCKED`.
  */
 import { KavachError } from "./errors.js";
 
@@ -270,13 +271,32 @@ export interface Tx {
 }
 
 export interface Store {
-  /** BEGIN IMMEDIATE semantics: exclusive, atomic, serialised across every context. */
-  transaction<R>(fn: (tx: Tx) => R | Promise<R>): Promise<R>;
+  /**
+   * BEGIN IMMEDIATE semantics: exclusive, atomic, serialised across every context. The callback
+   * runs to completion synchronously between begin and commit; a callback that returns a promise
+   * is refused with `STORAGE_FAILURE` and nothing is written. The one asynchronous thing a
+   * callback may do is start a network operation through `tx.handoff`.
+   */
+  transaction<R>(fn: (tx: Tx) => R): Promise<R>;
   /** A consistent read without taking the writer lock. */
   read<R>(fn: (tx: Omit<Tx, "put" | "delete" | "handoff">) => R): Promise<R>;
 }
 
 // In-memory implementation -----------------------------------------------------------------------
+
+/**
+ * Run a transaction callback and refuse one that returns a promise. Shared by every `Store`
+ * implementation so the refusal is the same error everywhere.
+ */
+export function invokeSync<R>(fn: (tx: Tx) => R, tx: Tx): R {
+  const result = fn(tx);
+  if (isThenable(result)) throw new KavachError("STORAGE_FAILURE", "store", "transaction callbacks are synchronous");
+  return result;
+}
+
+function isThenable(value: unknown): boolean {
+  return (typeof value === "object" || typeof value === "function") && value !== null && typeof (value as { then?: unknown }).then === "function";
+}
 
 type TableMap = Map<TableName, Map<string, unknown>>;
 
@@ -385,11 +405,11 @@ export class MemoryStore implements Store {
     this.shared = shared ?? { tables: new Map(), chain: Promise.resolve(), held: false, commits: 0 };
   }
 
-  async transaction<R>(fn: (tx: Tx) => R | Promise<R>): Promise<R> {
+  async transaction<R>(fn: (tx: Tx) => R): Promise<R> {
     const release = await this.acquire();
     try {
       const tx = new MemoryTx(this.shared.tables, false);
-      const result = await fn(tx);
+      const result = invokeSync(fn, tx);
       this.options.beforeCommit?.(this.shared.commits + 1);
       tx.commitInto(this.shared.tables);
       this.shared.commits++;
