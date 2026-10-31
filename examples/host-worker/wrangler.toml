@@ -1,0 +1,23 @@
+name = "kavach-reference-host"
+main = "src/index.ts"
+compatibility_date = "2024-10-22"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DIRECTORY"
+database_name = "kavach-directory"
+database_id = "local"
+migrations_dir = "migrations"
+
+[[durable_objects.bindings]]
+name = "STREAMS"
+class_name = "StreamDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["StreamDO"]
+
+[vars]
+DELIVERY_WINDOW_MS = "86400000"
+APPEND_RETRY_WINDOW_MS = "604800000"
+REQUEST_TTL_MS = "604800000"

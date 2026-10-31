@@ -1,5 +1,6 @@
 {
   "extends": "../../tsconfig.base.json",
-  "compilerOptions": { "rootDir": "src", "noEmit": true, "types": ["@cloudflare/workers-types"] },
-  "include": ["src"]
+  "compilerOptions": { "rootDir": ".", "noEmit": true, "types": ["@cloudflare/workers-types/experimental", "@cloudflare/vitest-pool-workers"], "composite": false },
+  "include": ["src", "test"],
+  "references": [{ "path": "../../packages/core" }]
 }

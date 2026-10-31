@@ -1,6 +1,7 @@
-/** Reference host arrives at step 15 of the build sequence. */
+export { StreamDO } from "./streamDo.js";
 export default {
-  fetch(): Response {
-    return new Response("kavach reference host: not built yet", { status: 501 });
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const { handle } = await import("./router.js");
+    return handle(request, env);
   }
 };

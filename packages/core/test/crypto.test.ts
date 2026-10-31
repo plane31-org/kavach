@@ -1,4 +1,3 @@
-import sodium from "libsodium-wrappers-sumo";
 import { beforeAll, describe, expect, it } from "vitest";
 import { concat, equalBytes, toHex, u32 } from "../src/bytes.js";
 import {
@@ -10,7 +9,9 @@ import {
   aeadOpen,
   aeadSeal,
   assertValidBoxKey,
+  backendName,
   bodyHash,
+  boxKeypairFromSeed,
   deviceBoxKeypair,
   deviceSigningKeypair,
   identityId,
@@ -20,6 +21,8 @@ import {
   ready,
   recordId,
   sealBox,
+  sealBoxWith,
+  sealedBoxNonce,
   sign,
   streamId,
   verify,
@@ -43,6 +46,12 @@ const LABEL_BY_TYPE: Record<number, Label> = {
 function split(wire: Uint8Array): { type: number; body: Uint8Array; sig: Uint8Array } {
   return { type: wire[1] ?? 0, body: wire.subarray(0, wire.length - 64), sig: wire.subarray(wire.length - 64) };
 }
+
+describe("backend", () => {
+  it("reports which backend is under test", () => {
+    expect(["noble", "sodium"]).toContain(backendName());
+  });
+});
 
 describe("labels and hashes", () => {
   it("builds C(label) with the fixed prefix and a trailing zero byte", () => {
@@ -79,8 +88,8 @@ describe("Vector A: derived keys, identity ids and stream ids", () => {
       const iid = identityId(who.account, ak.publicKey);
       expect(toHex(iid)).toBe(who.identity_id);
       expect(toHex(streamId(iid, hex(who.device_id)))).toBe(who.stream_id);
-      // X25519 public key equals the scalar-mult base of the secret, as the fixture's OpenSSL cross-check did.
-      expect(toHex(sodium.crypto_scalarmult_base(dek.secretKey))).toBe(who.device_box_public);
+      // The secret is SHA-512(seed)[0..32] and the public key its X25519 base multiple, as the fixture's OpenSSL cross-check did.
+      expect(toHex(boxKeypairFromSeed(hex(who.device_box_seed)).publicKey)).toBe(who.device_box_public);
     });
   }
 
@@ -206,11 +215,10 @@ describe("sealed boxes and the key commitment", () => {
       const who = fixture.identities[i];
       if (!who) throw new Error("fixture");
       expect(w.recipient_identity).toBe(who.identity_id);
-      const eph = sodium.crypto_box_seed_keypair(hex(w.ephemeral_seed));
+      const eph = boxKeypairFromSeed(hex(w.ephemeral_seed));
       expect(toHex(eph.publicKey)).toBe(w.ephemeral_public);
-      const nonce = sodium.crypto_generichash(24, concat(eph.publicKey, hex(who.device_box_public)));
-      expect(toHex(nonce)).toBe(w.nonce);
-      const box = concat(eph.publicKey, sodium.crypto_box_easy(key, nonce, hex(who.device_box_public), eph.privateKey));
+      expect(toHex(sealedBoxNonce(eph.publicKey, hex(who.device_box_public)))).toBe(w.nonce);
+      const box = sealBoxWith(key, hex(who.device_box_public), eph);
       expect(toHex(box)).toBe(w.sealed_box);
       expect(toHex(wrapHash(box))).toBe(w.wrap_hash);
       const opened = openSealedBox(box, { publicKey: hex(who.device_box_public), secretKey: hex(who.device_box_secret) });

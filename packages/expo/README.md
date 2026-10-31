@@ -31,3 +31,7 @@ Enable SQLCipher through the `expo-sqlite` config plugin (`useSQLCipher: true`),
 ## What the device tests must show (step 14 of the build sequence)
 
 Foreground and background tasks write concurrently without a shared counter and the handoff race does not reproduce; the database refuses to open without the key; the recovery providers report the five statuses with sync off, locked and unavailable services; enrollment completes with the provider unavailable; a clock rollback yields `RESET_CLOCK_UNTRUSTED` without pausing sharing. The Android cloud-restore test to a second device is a release gate; record its device and Play services versions.
+
+## Cipher suite backend
+
+`@kavach/core` runs on the portable backend (the noble libraries, pure JavaScript) unless told otherwise, which is what Hermes needs: it has no WebAssembly. On Node, `import { loadSodiumBackend } from "@kavach/core/sodium"` and `setCryptoBackend(await loadSodiumBackend())` before `open()` selects libsodium. Both backends pass the same vectors.
