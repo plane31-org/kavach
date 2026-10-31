@@ -5,3 +5,4 @@ export * from "./recovery/android.js";
 export * from "./recovery/apple.js";
 export * from "./clock.js";
 export * from "./background.js";
+export * from "./setup.js";

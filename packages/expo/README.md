@@ -13,20 +13,43 @@ The adapters an Expo app supplies to `@kavach/core`, as the Moyo implementation 
 
 ## Wiring on a device
 
+One call per account opens everything: the secret store namespaced by account, the storage key (read, or created and stored before the database is opened), the SQLCipher database under `kavach-<account>.db`, and the client.
+
 ```ts
 import * as SecureStore from "expo-secure-store";
 import * as SQLite from "expo-sqlite";
-import { open } from "@kavach/core";
-import { ExpoSecretStore, SqliteStore, expoSqliteDriver, BlockStoreRecoveryProvider, AppleKeychainRecoveryProvider } from "@kavach/expo";
+import { openKavach, BlockStoreRecoveryProvider, AppleKeychainRecoveryProvider } from "@kavach/expo";
 
-const secretStore = new ExpoSecretStore(SecureStore, { thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, keychainService: "app.getmoyo" });
-let storageKey = await secretStore.get("storageKey");
-if (!storageKey) { storageKey = crypto.getRandomValues(new Uint8Array(32)); await secretStore.set("storageKey", storageKey); }
-const db = SQLite.openDatabaseSync("kavach.db", { useNewConnection: true });
-const store = SqliteStore.open({ driver: expoSqliteDriver(db), storageKey, busyTimeoutMs: 5000 });
+const { client, databaseFileName } = await openKavach({
+  accountName,
+  transport,          // the app's authenticated fetch and sockets, a `Transport` from "@kavach/core/adapters"
+  recoveryProvider,   // BlockStoreRecoveryProvider on Android, AppleKeychainRecoveryProvider on iOS
+  retentionPolicy,
+  resetTrust,
+  secrets: { secureStore: SecureStore, thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, keychainService: "app.getmoyo" },
+  database: SQLite
+});
 ```
 
-Enable SQLCipher through the `expo-sqlite` config plugin (`useSQLCipher: true`), exclude `kavach.db` and its WAL files from iCloud backup and Android auto-backup, and pass one `SqliteStore` per JavaScript context: the foreground app and the background task each open their own connection, and SQLite's file lock serialises them.
+Two accounts on one device never share a database or a secret. Enable SQLCipher through the `expo-sqlite` config plugin (`useSQLCipher: true`), and exclude `databaseFileName` with its `-wal` and `-shm` companions from iCloud backup and Android auto-backup. Call `openKavach` once per JavaScript context: the foreground app and the background task each get their own connection, and SQLite's file lock serialises them.
+
+When the database file survives but its key is gone (the secret store was cleared), SQLCipher refuses the new key and `openKavach` throws `RECOVERY_REQUIRED`: delete the file and restore the account through `client.restoreAccount()` on a fresh open.
+
+### Advanced: the adapters one by one
+
+`openKavach` is these steps; an app with a different arrangement (a shared database, its own key management) uses the adapters directly:
+
+```ts
+import { open } from "@kavach/core";
+import { ExpoSecretStore, SqliteStore, expoSqliteDriver } from "@kavach/expo";
+
+const secretStore = new ExpoSecretStore(SecureStore, { thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, namespace: `kavach.${accountName}`, keychainService: "app.getmoyo" });
+let storageKey = await secretStore.get("storageKey");
+if (!storageKey) { storageKey = crypto.getRandomValues(new Uint8Array(32)); await secretStore.set("storageKey", storageKey); }
+const db = SQLite.openDatabaseSync(`kavach-${accountName}.db`, { useNewConnection: true });
+const store = SqliteStore.open({ driver: expoSqliteDriver(db), storageKey, busyTimeoutMs: 5000 });
+const client = await open({ accountName, retentionPolicy, recoveryProvider, resetTrust, secretStore, store, transport });
+```
 
 ## What the device tests must show (step 14 of the build sequence)
 
