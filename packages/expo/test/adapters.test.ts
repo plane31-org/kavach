@@ -187,9 +187,9 @@ describe("background location glue", () => {
     const calls: string[] = [];
     return {
       calls,
-      enqueueLocation: async (l) => {
-        calls.push(`enqueue:${l.status}:${l.latitudeE7}`);
-        return { recordId: new Uint8Array(32) };
+      enqueueLocation: async (l, options) => {
+        calls.push(`enqueue:${l.status}:${l.latitudeE7}:${options?.idempotencyKey ?? "-"}`);
+        return { recordId: new Uint8Array(32), duplicate: false };
       },
       sync: async () => {
         calls.push("sync");
@@ -208,7 +208,7 @@ describe("background location glue", () => {
     ];
     const r = await handleBackgroundLocations(client, batch, last);
     expect(r).toEqual({ enqueued: 3, skipped: 0, synced: true, error: undefined });
-    expect(client.calls).toEqual(["enqueue:0:10000000", "enqueue:0:20000000", "enqueue:2:0", "sync"]);
+    expect(client.calls).toEqual(["enqueue:0:10000000:bg:1000", "enqueue:0:20000000:bg:2000", "enqueue:2:0:bg:3000", "sync"]);
     const again = await handleBackgroundLocations(client, batch, last);
     expect(again).toMatchObject({ enqueued: 0, skipped: 3, synced: true });
   });
@@ -224,6 +224,6 @@ describe("background location glue", () => {
     await run({ data: { locations: [] }, error: null });
     expect(client.calls).toEqual([]);
     await run({ data: { locations: [{ coords: { latitude: 1, longitude: 1, accuracy: 1 }, timestamp: 5 }] }, error: null });
-    expect(client.calls).toEqual(["enqueue:0:10000000", "sync"]);
+    expect(client.calls).toEqual(["enqueue:0:10000000:bg:5", "sync"]);
   });
 });

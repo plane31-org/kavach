@@ -9,7 +9,7 @@ The adapters an Expo app supplies to `@kavach/core`, as the Moyo implementation 
 | `BlockStoreRecoveryProvider` | Android Block Store through a native module implementing `BlockStoreLike` | logic complete; native module is a dev-build task |
 | `AppleKeychainRecoveryProvider` | a synchronizable Keychain item through a native module implementing `SyncedKeychainLike` | logic complete; native module and config plugin are a dev-build task |
 | `TrustedClock` | the platform clock with a durable high-water mark | complete |
-| `handleBackgroundLocations`, `defineLocationTask` | `expo-location` and `expo-task-manager` | complete |
+| `handleBackgroundLocations`, `defineLocationTask` | `expo-location` and `expo-task-manager`; each sample is enqueued under an idempotency key from its timestamp, so a batch redelivered to a fresh process makes no second record | complete |
 
 ## Wiring on a device
 
@@ -28,9 +28,12 @@ const { client, databaseFileName } = await openKavach({
   resetTrust,
   secrets: { secureStore: SecureStore, thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, keychainService: "app.getmoyo" },
   database: SQLite,
-  context: "foreground" // "background" in the location task
+  context: "foreground", // "background" in the location task
+  onListenerError: (e, event) => log(event.kind, e) // a throwing subscriber never reaches the protocol
 });
 ```
+
+`client.sync()` returns a report whose `errors` list every step it worked around, each with the operation, the protocol code, the stage and whether a retry may succeed; `NETWORK` means the host was unreachable. Read history with `client.historyPage({ authorIdentityId, order: "desc", limit })` and pass its `cursor` back for the next page; `client.newest()` and `client.latest(identityId)` give the newest entry and the live pin.
 
 Two accounts on one device never share a database or a secret. Only the foreground app creates the storage key on first run; a background task that finds none stops with `LOCKED` and tries again on its next wake, so two contexts can never provision one database under two different keys. Enable SQLCipher through the `expo-sqlite` config plugin (`useSQLCipher: true`), and exclude `databaseFileName` with its `-wal` and `-shm` companions from iCloud backup and Android auto-backup. Call `openKavach` once per JavaScript context: the foreground app and the background task each get their own connection, and SQLite's file lock serialises them.
 

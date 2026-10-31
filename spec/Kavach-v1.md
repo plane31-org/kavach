@@ -26,7 +26,7 @@ Protocol specification. End-to-end encrypted location sharing and check-ins for 
 - 6. Circle membership and owner approval
 - 7. Audience and reconciliation
 - 8. Epoch manifest and addressed wraps
-- 9. Records: locations and check-ins
+- 9. Records: locations, check-ins and statuses
 - 10. Delivery and deletion
 - 11. Durable state
 - 12. Last-resort account reset and the reset keys
@@ -313,7 +313,7 @@ A status is a record with kind 2: the sender's small current state, in an applic
 
 #### Publishing
 
-`enqueueLocation` and `enqueueCheckIn` run inside one write transaction (T6): require a usable active epoch whose `desiredRevision` equals current state, enforce the profile's queue limits, encrypt and sign once, insert the complete wire into the outbox, write the author's own history entry, and increment `nextCounter`. `queued(recordId)` is returned only after commit. Accepted queued records are never coalesced or replaced; `QUEUE_FULL` is explicit.
+`enqueueLocation`, `enqueueCheckIn` and `enqueueStatus` run inside one write transaction (T6): answer an idempotency key the caller gave before, otherwise require a usable active epoch whose `desiredRevision` equals current state, enforce the profile's queue limits, encrypt and sign once, insert the complete wire into the outbox, write the author's own history entry and its index entries (a status writes none) and the idempotency key when given, and increment `nextCounter`. `queued(recordId)` is returned only after commit. A queued location or check-in is never coalesced or replaced; only a queued status yields to a newer one (section 9). `QUEUE_FULL` is explicit.
 
 A single serialised sender drains the outbox in (epoch, counter) order with one record in flight per stream: the next handoff waits until the previous outcome is durable, so accepted (epoch, counter) pairs reach the relay in strictly increasing order and the relay's append checkpoint below stays small. For each record it opens a write transaction, re-checks device status, epoch, `desiredRevision` and expiry, marks the row in flight, **initiates the handoff to the transport inside that transaction**, and commits; only awaiting the response happens outside (T6h). Because T3 needs the same lock, no authorization change can commit between the check and the handoff. A timeout retries the same bytes while still eligible. A known change cancels pending uploads sealed for the obsolete audience and emits `cancelled(recordId, reason)`. Old keys are never re-wrapped to newly admitted accounts to deliver a backlog.
 
@@ -342,7 +342,7 @@ Records arrive out of counter order and that is normal: counter 6 after counter 
 
 | `receive` result | Meaning |
 | --- | --- |
-| `updated` | New record stored; the live pin moved (kind 0) or a check-in was added. |
+| `updated` | New record stored; the live pin moved (kind 0), a check-in was added (kind 1) or the author's status slot took it (kind 2). |
 | `history` | New record stored in the trail; the pin did not move because a newer location is already shown. |
 | `duplicate` | Same bytes already stored. Acknowledge, do not reinsert. |
 | `keyPending` | Not stored; the acknowledged prefix holds; read again after the next sync. A manifest or wrap that does not verify leaves the record here with its code named, never refused: the record may be honest, and the relay's expiry resolves one that never verifies. |
@@ -359,10 +359,10 @@ This section states what the local store must guarantee. Which database or secre
 
 - **Secrets.** `accountSeed`, `deviceSeed`, `recoveryKey` and the store's own key live in the platform's protected secret store, device-only. Only the `recoveryKey` is ever placed in a synced platform item. The local store, device seed, counters and outbox are excluded from automatic device backup.
 - **Encryption at rest.** Every row of the local store, including plaintext history, is encrypted at rest under a per-installation key held in the secret store. No plaintext secret appears in a row key, an index or a log.
-- **Binding.** A `meta` row binds schema version, a random store instance id, `identityId` and the current `certificateHash`. A mismatch between the secret store and the local store pauses with `RECOVERY_REQUIRED` and is resolved by device replacement, never by inventing counters.
+- **Binding.** A `meta` row binds schema version, a random store instance id, `identityId` and the current `certificateHash`, and records whether the history index below is complete. A mismatch between the secret store and the local store pauses with `RECOVERY_REQUIRED` and is resolved by device replacement, never by inventing counters.
 - **One writer.** All writes from every execution context of the app run under one mutual-exclusion primitive that spans processes. Reads that only inspect state may run outside it.
 - **The handoff.** The lock protects only what happens inside it, so the one network operation whose ordering matters, the handoff of an outbound record, is initiated inside it (T6h). Every other network call runs outside, and its result is recorded in a new transaction that first revalidates `desiredRevision`, the certificate generation and the epoch; a context whose revalidation fails discards its result.
-- **Bounded waiting.** A writer that cannot acquire the lock returns `RETRYABLE` without allocating counters or keys.
+- **Bounded waiting.** A writer that cannot acquire the lock fails with `LOCKED`, a retryable error, without allocating counters or keys.
 - **Bounded reads.** The store serves an ordered key range under a limit without reading the rest of a table. History carries a time-ordered index, two keys per row (the timeline of a kind, and one author's), written with the row in T6 and T7 and removed with it by the retention purge; queries, cursors and the purge read a slice of that index, never the history table. A store written before the index exists is indexed once on open and the header records it.
 
 #### Transaction boundaries
@@ -488,6 +488,7 @@ The companion package is the SS5 revision 2 `vectors.json` plus `verify_vectors.
 - Lost device, two tests. Device keys only: the attacker holds `deviceSeed` and the store but not the account root; after the new device activates and every author has rotated, it opens nothing new. Full state: the attacker also holds `accountSeed` or `recoveryKey` with the vault; the test shows it can still authorise a device of its own, so replacement is not a repair and only reset ends it.
 - Acknowledgement: a `keyPending` record never advances the prefix while later records still flow; the relay never deletes a record while a required reader's cursor is below it; an equal or older cursor causes no write; a cursor above the tail is rejected; a reader is returned only records addressed to its certificate.
 - Relay: deliver counters 7 then 6 and keep the pin at 7; the record disappears when the last required reader's cursor passes it and at the window without one; expiry advances as a prefix and never expires a newer record; a blocked stream never delays another stream; a retry inside the window returns the original outcome after deletion; an append below the checkpoint without evidence is `STALE_APPEND` and the client marks it `acceptanceUnknown` without re-creating a check-in; a new device's subscription starts at activation and excludes records sealed to the old certificate; every member gets a subscription when an author opens a new stream; epoch blobs disappear only when no record references them and the epoch is not current; a check-in survives a later location end to end.
+- Client reports and queries: a download that fails for one stream is one entry of the sync report and the other streams are still read; the same idempotency key from a retry or a second runtime yields one record and a new key a new one; history pages read through the index keep their order and cursor while records arrive and expire, and a store from before the index reads the same after its backfill.
 - Reset: the 22 key-management cases against the real clock adapter, plus wrong key, revoked key with a backdated receipt, binding mismatch, duplicate, conflicting binding, receipt without a verified certificate, expired list deferring a reset without pausing sharing, and no closure on a bare directory key change.
 
 An independent review of the composed protocol, the recovery flows, the store binding, the handoff serialisation and the host's atomicity contract precedes production. Passing the checker is not that review.
@@ -587,7 +588,7 @@ Moyo passes the following `RetentionPolicy` to `open()`. The values are proposal
 
 | Field | Proposed value | Meaning |
 | --- | --- | --- |
-| `deliveryWindowMs` | 24 hours | How long the relay keeps a record for readers that have not acknowledged it, from acceptance. One window for locations and check-ins keeps expiry a prefix per stream. A reader away longer returns to an empty trail until the next update, which arrives within a minute from an online author. |
+| `deliveryWindowMs` | 24 hours | How long the relay keeps a record for readers that have not acknowledged it, from acceptance. One window for locations and check-ins keeps expiry a prefix per stream. A reader away longer returns to an empty trail until the next update, which arrives within a minute from an online author. The phone also remembers an enqueue idempotency key for this long. |
 | `appendRetryWindowMs` | 7 days | How long the relay keeps the last-append outcome per stream, so a phone that was offline can finish an uncertain upload with the original result. |
 | `locationHistoryMs` | 24 hours | How long a phone keeps location history, and an author's newest status, counted from `sentAt`. |
 | `checkInHistoryMs` | 30 days | How long a phone keeps check-in history. |
@@ -601,13 +602,13 @@ Delivery deadlines use the relay's acceptance time plus the window; the Worker e
 
 #### Secrets
 
-`accountSeed`, `deviceSeed`, `recoveryKey`, `storageKey` and the 16-byte store instance id live in Expo SecureStore with device-only accessibility. Only the `recoveryKey` is ever placed in a synced platform item, through the recovery provider below. The database file, device seed, counters and outbox are excluded from iCloud backup and Android Auto Backup.
+`accountSeed`, `deviceSeed`, `recoveryKey`, `storageKey` and the 16-byte store instance id live in Expo SecureStore with device-only accessibility. Only the `recoveryKey` is ever placed in a synced platform item, through the recovery provider below. Only the foreground app creates the `storageKey` on first run, and one creation at a time per account; a background context that finds none stops with `LOCKED` and tries again on its next wake, so two contexts can never key one database differently. The database file, device seed, counters and outbox are excluded from iCloud backup and Android Auto Backup.
 
 #### Store
 
-One SQLite database opened through Expo SQLite with SQLCipher, keyed by the hex `storageKey`, in WAL mode with `synchronous = FULL`. SQLCipher gives encryption at rest for every row, so there is no second per-value encryption layer. The `meta` row binds schema version 1, the store instance id, `identityId` and the current `certificateHash`, as the protocol requires.
+One SQLite database opened through Expo SQLite with SQLCipher, keyed by the hex `storageKey`, in WAL mode with `synchronous = FULL`. SQLCipher gives encryption at rest for every row, so there is no second per-value encryption layer. The `meta` row binds schema version 1, the store instance id, `identityId` and the current `certificateHash`, as the protocol requires, and marks the history index as built; a database from before the index is indexed once on open. Every logical table is a key-value table of JSON rows, and the ordered key range the protocol's bounded reads need is one indexed SQL query with a limit.
 
-Every SDK write runs inside `BEGIN IMMEDIATE`. SQLite's file lock then serialises writers across the foreground app, the background location task and any headless context, without a native module. The adapter's `transaction(fn)` lets the callback start the transport's `send` before the transaction commits, which is what the protocol's handoff rule (T6h) needs; the callback is synchronous and never awaits the response inside. The busy timeout is finite, and a writer that cannot acquire the lock returns `RETRYABLE`.
+Every SDK write runs inside `BEGIN IMMEDIATE`. SQLite's file lock then serialises writers across the foreground app, the background location task and any headless context, without a native module. The adapter's `transaction(fn)` lets the callback start the transport's `send` before the transaction commits, which is what the protocol's handoff rule (T6h) needs; the callback is synchronous and never awaits the response inside. The busy timeout is finite, and a writer that cannot acquire the lock fails with `LOCKED`, which is retryable.
 
 #### Recovery providers
 
@@ -617,7 +618,7 @@ Every SDK write runs inside `BEGIN IMMEDIATE`. SQLite's file lock then serialise
 
 #### Clock, background work and transport
 
-A clock adapter keeps a durable time high-water mark and monotonic elapsed time for the reset-key list rules. The background location task calls `enqueueLocation` and then `sync`. The transport is Moyo's authenticated fetch and sockets; its `send` queues the bytes synchronously and returns a promise, so it can be initiated inside T6h. Connectivity and push hints stay in the app, which calls `sync` when they arrive.
+A clock adapter keeps a durable time high-water mark and monotonic elapsed time for the reset-key list rules. The background location task calls `enqueueLocation` for each new sample, with an idempotency key derived from the sample's timestamp so a batch the OS redelivers to a fresh process makes no second record, and then `sync`. A sync report's `errors` are logged by operation and code, never by content. The transport is Moyo's authenticated fetch and sockets; its `send` queues the bytes synchronously and returns a promise, so it can be initiated inside T6h. Connectivity and push hints stay in the app, which calls `sync` when they arrive.
 
 ### 4. Server (Cloudflare Worker)
 

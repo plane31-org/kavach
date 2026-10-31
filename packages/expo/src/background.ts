@@ -18,8 +18,10 @@ export interface BackgroundResult {
 }
 
 /**
- * Handle one batch from the location task. Samples older than `lastHandled` are skipped so a
- * redelivered batch does not duplicate records; unusable samples are sent as status 2.
+ * Handle one batch from the location task. Samples older than `lastHandled` are skipped, and
+ * each sample is enqueued under an idempotency key from its timestamp, so a redelivered batch
+ * duplicates no record even in a fresh process whose `lastHandled` starts at zero; unusable
+ * samples are sent as status 2.
  */
 export async function handleBackgroundLocations(client: Client, locations: readonly ExpoLocationObject[], lastHandled: { timestamp: number }): Promise<BackgroundResult> {
   const result: BackgroundResult = { enqueued: 0, skipped: 0, synced: false, error: undefined };
@@ -35,7 +37,7 @@ export async function handleBackgroundLocations(client: Client, locations: reado
       ? locationFromDegrees(l.coords.latitude, l.coords.longitude, l.coords.accuracy ?? 0, BigInt(Math.round(l.timestamp)), status)
       : locationFromDegrees(0, 0, 0, BigInt(Math.round(l.timestamp)), 2);
     try {
-      await client.enqueueLocation(location);
+      await client.enqueueLocation(location, { idempotencyKey: `bg:${Math.round(l.timestamp)}` });
       result.enqueued++;
       lastHandled.timestamp = l.timestamp;
     } catch (e) {
