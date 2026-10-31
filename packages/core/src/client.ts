@@ -17,12 +17,28 @@ import { validatePolicy, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
 import type { CircleRow, PendingResetRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
-import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9Vault } from "./transactions.js";
-import type { Transport, TransportHint } from "./transport.js";
+import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault } from "./transactions.js";
+import type { Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
 
 /** accountSeed, deviceSeed, recoveryKey, instanceId and deviceId of a pending reset, in the secret store. */
 const RESET_ROOTS_BYTES = 32 * 3 + 16 + 16;
+
+/** The vault's entries as the circle rows say they should be. Entries of circles without a row are kept. */
+function reconcileEntries(entries: readonly VaultEntry[], rows: readonly CircleRow[]): VaultEntry[] {
+  let out: VaultEntry[] = [...entries];
+  for (const r of rows) {
+    const circleId = fromHex(r.circleId);
+    if (r.status === "left" || r.status === "closed") out = removeEntry(out, circleId);
+    else if (r.status === "member" || r.status === "requested") out = upsertEntry(out, { circleId, ownerIdentityId: fromHex(r.ownerIdentityId), sharingEnabled: r.enabled });
+  }
+  return out;
+}
+
+function sameEntries(a: readonly VaultEntry[], b: readonly VaultEntry[]): boolean {
+  const key = (es: readonly VaultEntry[]) => es.map((e) => `${toHex(e.circleId)}:${toHex(e.ownerIdentityId)}:${e.sharingEnabled ? 1 : 0}`).sort().join(",");
+  return key(a) === key(b);
+}
 
 export type ClientStatus = "fresh" | "ready" | "locked" | "accountRecoveryRequired" | "activationPending" | "retired" | "paused" | "quarantined";
 export type PauseReason = "sync" | "rotation" | "metadata" | "limit";
@@ -86,7 +102,6 @@ export interface Client {
   restoreAccount(recoveryCode?: string): Promise<{ identityId: Uint8Array; generation: bigint }>;
   enqueueLocation(location: Location): Promise<{ recordId: Uint8Array }>;
   enqueueCheckIn(payload: Location | Uint8Array): Promise<{ recordId: Uint8Array }>;
-  enqueue(payload: Uint8Array): Promise<{ recordId: Uint8Array }>;
   sync(): Promise<SyncReport>;
   receive(wire: Uint8Array): Promise<ReceiveResult>;
   history(query?: HistoryQuery): Promise<HistoryEntry[]>;
@@ -138,9 +153,7 @@ class ClientImpl implements Client {
   private selfPin: AccountPin | undefined;
   private trust: ResetTrust;
   private syncing: Promise<SyncReport> | undefined;
-  private metadataDirty = true;
   private backupChecked = false;
-  private unobserve: (() => void) | undefined;
   readonly circles: Client["circles"];
 
   constructor(
@@ -193,9 +206,6 @@ class ClientImpl implements Client {
       accepted: rows.events.map((e) => e.resetId).length ? (await this.store.read((tx) => tx.list("resetReceipts").map(([, r]) => r.receiptHash))) : [],
       events: rows.events,
       retired: rows.retired
-    });
-    this.unobserve = this.transport.observe((h: TransportHint) => {
-      if (h === "metadataChanged" || h === "resume" || h === "online") this.metadataDirty = true;
     });
   }
 
@@ -336,7 +346,7 @@ class ClientImpl implements Client {
       throw new KavachError("NOT_AUTHORIZED", stage, `host refused registration: ${outcome.status}`);
     }
     await this.store.transaction((tx) => {
-      t9Vault(tx, { revision: "1", hash: toHex(vault.hash), wire: toHex(vault.wire), pending: false });
+      t9Vault(tx, { revision: "1", hash: toHex(vault.hash), wire: toHex(vault.wire), pending: false, dirty: false });
       t1Activate(tx);
     });
     this.account = account;
@@ -348,9 +358,6 @@ class ClientImpl implements Client {
     } catch {
       /* status is reported by recoveryStatus() */
     }
-    this.unobserve ??= this.transport.observe((h) => {
-      if (h === "metadataChanged" || h === "resume" || h === "online") this.metadataDirty = true;
-    });
     await this.emitState();
     return { identityId: pin.identityId };
   }
@@ -440,7 +447,7 @@ class ClientImpl implements Client {
     const { account, device, pin } = input;
     await this.store.transaction((tx) => {
       tx.delete("activation", "pending");
-      t9Vault(tx, { revision: big(input.vaultRevision), hash: toHex(input.vault.hash), wire: toHex(input.vault.wire), pending: false });
+      t9Vault(tx, { revision: big(input.vaultRevision), hash: toHex(input.vault.hash), wire: toHex(input.vault.wire), pending: false, dirty: false });
       for (const e of input.entries) {
         const owned = equalBytes(e.ownerIdentityId, pin.identityId);
         const c = pinCircle(e.circleId, e.ownerIdentityId, e.sharingEnabled, owned ? "member" : "requested");
@@ -457,10 +464,6 @@ class ClientImpl implements Client {
     } catch {
       /* reported by recoveryStatus() */
     }
-    this.unobserve ??= this.transport.observe((h) => {
-      if (h === "metadataChanged" || h === "resume" || h === "online") this.metadataDirty = true;
-    });
-    this.metadataDirty = true;
     await this.emitState();
     return { identityId: pin.identityId, generation: pin.generation };
   }
@@ -535,10 +538,6 @@ class ClientImpl implements Client {
 
   async enqueueCheckIn(payload: Location | Uint8Array): Promise<{ recordId: Uint8Array }> {
     return this.enqueueKind(1, payload instanceof Uint8Array ? payload : encodeLocation(payload));
-  }
-
-  async enqueue(payload: Uint8Array): Promise<{ recordId: Uint8Array }> {
-    return this.enqueueKind(1, payload);
   }
 
   private async enqueueKind(kind: RecordKind, payload: Uint8Array): Promise<{ recordId: Uint8Array }> {
@@ -760,7 +759,7 @@ class ClientImpl implements Client {
       }
     }
     try {
-      await this.republishPendingVault();
+      await this.syncVault();
     } catch (e) {
       report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
     }
@@ -844,7 +843,6 @@ class ClientImpl implements Client {
       }
       checkMemberResolution(byIdentity);
     }
-    this.metadataDirty = false;
   }
 
   private async pinFor(identityId: Uint8Array): Promise<AccountPin | undefined> {
@@ -997,35 +995,49 @@ class ClientImpl implements Client {
     );
   }
 
-  private async vaultUpdate(mutate: (entries: readonly VaultEntry[]) => VaultEntry[]): Promise<void> {
+  /**
+   * Bring the vault in line with the circle rows: the one path for every cause. A write the host
+   * never confirmed is settled first (its exact bytes, else the host's verified current vault).
+   * Then, while the rows are marked as changed, the vault is derived from them inside one
+   * transaction, stored as prepared bytes and published. Nothing comes from a caller's view of
+   * the state, so a change that landed in the rows reaches the vault however the process dies.
+   */
+  private async syncVault(): Promise<void> {
     const { account, pin } = this.requireAccount("vault");
     const recoveryKey = await this.secrets.get("recoveryKey");
     const accountSeed = await this.secrets.get("accountSeed");
     if (!recoveryKey || !accountSeed) throw new KavachError("RECOVERY_REQUIRED", "vault");
     const accountKey = account.account.publicKey;
-    // A write the host never confirmed is settled first: this update is built on its outcome.
-    const unconfirmed = await this.store.read((tx) => tx.get("vault", VAULT));
-    if (unconfirmed?.pending) await this.settlePendingVault(unconfirmed, recoveryKey, accountKey);
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const row = await this.store.read((tx) => tx.get("vault", VAULT));
-      let entries: readonly VaultEntry[] = [];
-      let revision = 0n;
-      let hash: Uint8Array | undefined;
-      if (row) {
-        const opened = openVault(fromHex(row.wire), recoveryKey, this.accountName, accountKey);
-        entries = opened.entries;
-        revision = unbig(row.revision);
-        hash = fromHex(row.hash);
+    let conflicts = 0;
+    for (let round = 0; round < 8; round++) {
+      const unconfirmed = await this.store.read((tx) => tx.get("vault", VAULT));
+      if (unconfirmed?.pending) {
+        await this.settlePendingVault(unconfirmed, recoveryKey, accountKey);
+        continue;
       }
-      const next = buildVault({ accountName: this.accountName, accountKey, vaultRevision: revision + 1n }, { accountSeed, lastDeviceGeneration: pin.generation, lastCertificateHash: pin.certificateHash, entries: mutate(entries) }, recoveryKey);
-      await this.store.transaction((tx) => t9Vault(tx, { revision: big(revision + 1n), hash: toHex(next.hash), wire: toHex(next.wire), pending: true }));
-      const outcome = await this.transport.directory.publishVault({ expectedRevision: revision, expectedHash: hash, newVault: next.wire });
+      const prepared = await this.store.transaction((tx) => {
+        const row = tx.get("vault", VAULT);
+        if (!row || row.pending || !row.dirty) return undefined;
+        const opened = openVault(fromHex(row.wire), recoveryKey, this.accountName, accountKey);
+        const entries = reconcileEntries(opened.entries, tx.list("circles").map(([, r]) => r));
+        if (sameEntries(entries, opened.entries)) {
+          t9Vault(tx, { ...row, dirty: false });
+          return undefined;
+        }
+        const revision = unbig(row.revision);
+        const next = buildVault({ accountName: this.accountName, accountKey, vaultRevision: revision + 1n }, { accountSeed, lastDeviceGeneration: pin.generation, lastCertificateHash: pin.certificateHash, entries }, recoveryKey);
+        t9Vault(tx, { revision: big(revision + 1n), hash: toHex(next.hash), wire: toHex(next.wire), pending: true, dirty: false });
+        return { wire: next.wire, hash: toHex(next.hash), expectedRevision: revision, expectedHash: fromHex(row.hash) };
+      });
+      if (!prepared) return;
+      const outcome = await this.transport.directory.publishVault({ expectedRevision: prepared.expectedRevision, expectedHash: prepared.expectedHash, newVault: prepared.wire });
       if (outcome.status === "COMMITTED" || outcome.status === "ALREADY_COMMITTED") {
-        await this.store.transaction((tx) => t9Vault(tx, { revision: big(revision + 1n), hash: toHex(next.hash), wire: toHex(next.wire), pending: false }));
-        return;
+        await this.confirmVault(prepared.hash);
+        continue; // a change made while publishing has marked the row again
       }
       if (outcome.status === "CONFLICT" && outcome.current) {
-        await this.adoptCurrentVault(outcome.current, recoveryKey, accountKey, revision);
+        if (++conflicts >= 3) break;
+        await this.adoptCurrentVault(outcome.current, recoveryKey, accountKey, prepared.expectedRevision);
         continue;
       }
       throw new KavachError("STORAGE_FAILURE", "vault", `publishVault ${outcome.status}`);
@@ -1033,34 +1045,37 @@ class ClientImpl implements Client {
     throw new KavachError("STORAGE_FAILURE", "vault", "vault conflict persisted");
   }
 
+  /** The host holds the prepared bytes with this hash: they are the committed vault now. A marker set meanwhile stays. */
+  private async confirmVault(hash: string): Promise<void> {
+    await this.store.transaction((tx) => {
+      const row = tx.get("vault", VAULT);
+      if (row?.pending && row.hash === hash) t9Vault(tx, { ...row, pending: false });
+    });
+  }
+
   /**
    * Publish the exact bytes of a vault write the host never confirmed. Either the host has them
-   * now ("committed") or its current vault replaces the unconfirmed one locally ("adopted").
+   * now or its current vault replaces the unconfirmed one locally.
    */
-  private async settlePendingVault(row: VaultRow, recoveryKey: Uint8Array, accountKey: Uint8Array): Promise<"committed" | "adopted"> {
+  private async settlePendingVault(row: VaultRow, recoveryKey: Uint8Array, accountKey: Uint8Array): Promise<void> {
     const localRevision = unbig(row.revision) - 1n;
     const outcome = await this.transport.directory.publishVault({ expectedRevision: localRevision, expectedHash: undefined, newVault: fromHex(row.wire) });
-    if (outcome.status === "COMMITTED" || outcome.status === "ALREADY_COMMITTED") {
-      await this.store.transaction((tx) => t9Vault(tx, { ...row, pending: false }));
-      return "committed";
-    }
-    if (outcome.status === "CONFLICT" && outcome.current) {
-      await this.adoptCurrentVault(outcome.current, recoveryKey, accountKey, localRevision);
-      return "adopted";
-    }
+    if (outcome.status === "COMMITTED" || outcome.status === "ALREADY_COMMITTED") return this.confirmVault(row.hash);
+    if (outcome.status === "CONFLICT" && outcome.current) return this.adoptCurrentVault(outcome.current, recoveryKey, accountKey, localRevision);
     throw new KavachError("STORAGE_FAILURE", "vault", `publishVault ${outcome.status}`);
   }
 
   /**
    * Take the host's current vault as the local committed one. It has to open under this account's
    * recovery key, be bound to this account, and not fall behind the revision already committed
-   * locally; otherwise the local copy is kept and the caller fails.
+   * locally; otherwise the local copy is kept and the caller fails. The adopted vault is marked:
+   * whatever the rows say and it does not is derived again on top of it.
    */
   private async adoptCurrentVault(current: Uint8Array, recoveryKey: Uint8Array, accountKey: Uint8Array, localRevision: bigint): Promise<void> {
     const { header } = openVault(current, recoveryKey, this.accountName, accountKey);
     if (header.vaultRevision < localRevision) throw new KavachError("ROLLBACK", "vault", `host vault at ${header.vaultRevision}, local at ${localRevision}`);
     const { hash } = parseVaultHeader(current);
-    await this.store.transaction((tx) => t9Vault(tx, { revision: big(header.vaultRevision), hash: toHex(hash), wire: toHex(current), pending: false }));
+    await this.store.transaction((tx) => t9Vault(tx, { revision: big(header.vaultRevision), hash: toHex(hash), wire: toHex(current), pending: false, dirty: true }));
   }
 
   private async createCircle(): Promise<{ circleId: Uint8Array }> {
@@ -1072,22 +1087,25 @@ class ClientImpl implements Client {
     await this.store.transaction((tx) => tx.put("circles", toHex(circleId), { ...circleToRow(state.state), pending: { snapshot: toHex(genesis), revision: "1" } }));
     const published = await this.publishPendingSnapshot(circleId);
     if (published !== "COMMITTED") throw new KavachError("STORAGE_FAILURE", "createCircle", published);
-    await this.store.transaction((tx) => t3ApplyChange(tx, { kind: "join", circleId }));
-    await this.vaultUpdate((entries) => upsertEntry(entries, { circleId, ownerIdentityId: pin.identityId, sharingEnabled: true }));
+    await this.store.transaction((tx) => {
+      t3ApplyChange(tx, { kind: "join", circleId });
+      t9MarkVault(tx);
+    });
+    await this.syncVault();
     this.emit({ kind: "circleChanged", circleId, revision: 1n, status: "member" });
     return { circleId };
   }
 
   private async requestJoin(circleId: Uint8Array, ownerIdentityId: Uint8Array, shareOnApproval: boolean): Promise<void> {
     this.requireAccount("requestJoin");
-    // The vault entry first, then the request: a recovering device finds the pin either way.
-    await this.vaultUpdate((entries) => upsertEntry(entries, { circleId, ownerIdentityId, sharingEnabled: shareOnApproval }));
     await this.store.transaction((tx) => {
       if (!tx.get("circles", toHex(circleId))) tx.put("circles", toHex(circleId), circleToRow(pinCircle(circleId, ownerIdentityId, shareOnApproval, "requested")));
+      t9MarkVault(tx);
     });
+    // The vault before the request: a recovering device finds the pin either way.
+    await this.syncVault();
     const outcome = await this.transport.directory.requestJoin(circleId);
     if (outcome.status !== "COMMITTED" && outcome.status !== "ALREADY_COMMITTED") throw new KavachError("STORAGE_FAILURE", "requestJoin", outcome.status);
-    this.metadataDirty = true;
   }
 
   private async approve(circleId: Uint8Array, accountName: string): Promise<{ revision: bigint }> {
@@ -1121,9 +1139,10 @@ class ClientImpl implements Client {
           const r = tx.get("circles", toHex(circleId));
           if (r) tx.put("circles", toHex(circleId), { ...r, status: "closed", enabled: false, pending: undefined });
           t3ApplyChange(tx, { kind: "leave", circleId });
+          t9MarkVault(tx);
         });
         this.emit({ kind: "circleChanged", circleId, revision: state.revision, status: "closed" });
-        await this.vaultUpdate((entries) => removeEntry(entries, circleId));
+        await this.syncVault();
         return { revision: state.revision };
       }
       await this.store.transaction((tx) => t8OwnerSnapshot(tx, circleId, successor, state.revision + 1n, "close" in change));
@@ -1161,6 +1180,7 @@ class ClientImpl implements Client {
         if (live) next = { ...next, enabled: live.enabled, status: live.status === "closed" ? "closed" : next.status };
         tx.put("circles", toHex(circleId), { ...circleToRow(next), pending: undefined });
         t3ApplyChange(tx, { kind: "snapshot", circleId, revision: next.revision });
+        if (pending.close) t9MarkVault(tx);
       });
       const after = new Set(next.members.map(toHex));
       for (const m of state.members) {
@@ -1169,7 +1189,7 @@ class ClientImpl implements Client {
         if (!stillElsewhere) await forgetAuthor(this.store, m);
       }
       this.emit({ kind: "circleChanged", circleId, revision: next.revision, status: next.status });
-      if (pending.close) await this.vaultUpdate((entries) => removeEntry(entries, circleId));
+      if (pending.close) await this.syncVault();
       return "COMMITTED";
     }
     if (outcome.status === "CONFLICT" && outcome.current) {
@@ -1178,29 +1198,6 @@ class ClientImpl implements Client {
       return "CONFLICT";
     }
     throw new KavachError("STORAGE_FAILURE", stage, outcome.status);
-  }
-
-  /** The vault's entries as the local circle rows say they should be: the source of truth after a failed vault write. */
-  private reconcileEntries(entries: readonly VaultEntry[], rows: readonly CircleRow[]): VaultEntry[] {
-    let out: VaultEntry[] = [...entries];
-    for (const r of rows) {
-      const circleId = fromHex(r.circleId);
-      if (r.status === "left" || r.status === "closed") out = removeEntry(out, circleId);
-      else if (r.status === "member" || r.status === "requested") out = upsertEntry(out, { circleId, ownerIdentityId: fromHex(r.ownerIdentityId), sharingEnabled: r.enabled });
-    }
-    return out;
-  }
-
-  /** A vault update the host never confirmed is published again: the exact bytes first, else rebuilt from local state. */
-  private async republishPendingVault(): Promise<void> {
-    const row = await this.store.read((tx) => tx.get("vault", VAULT));
-    if (!row?.pending) return;
-    const { account } = this.requireAccount("vault");
-    const recoveryKey = await this.secrets.get("recoveryKey");
-    if (!recoveryKey) throw new KavachError("RECOVERY_REQUIRED", "vault");
-    if ((await this.settlePendingVault(row, recoveryKey, account.account.publicKey)) === "committed") return;
-    const rows = await this.store.read((tx) => tx.list("circles").map(([, r]) => r));
-    await this.vaultUpdate((entries) => this.reconcileEntries(entries, rows));
   }
 
   private async leave(circleId: Uint8Array): Promise<void> {
@@ -1212,9 +1209,10 @@ class ClientImpl implements Client {
     await this.store.transaction((tx) => {
       tx.put("circles", toHex(circleId), circleToRow({ ...state, enabled: false, status: "left" }));
       t3ApplyChange(tx, { kind: "leave", circleId });
+      t9MarkVault(tx);
     });
     await this.onLeft(state);
-    await this.vaultUpdate((entries) => removeEntry(entries, circleId));
+    await this.syncVault();
     await this.transport.directory.requestLeave(circleId);
     this.emit({ kind: "circleChanged", circleId, revision: state.revision, status: "left" });
   }
@@ -1223,14 +1221,15 @@ class ClientImpl implements Client {
     const row = await this.store.read((tx) => tx.get("circles", toHex(circleId)));
     if (!row) throw new KavachError("NOT_AUTHORIZED", "setEnabled", "unknown circle");
     if (row.enabled === enabled) {
-      await this.republishPendingVault();
+      await this.syncVault();
       return;
     }
     await this.store.transaction((tx) => {
       tx.put("circles", toHex(circleId), { ...row, enabled });
       t3ApplyChange(tx, { kind: enabled ? "enable" : "disable", circleId });
+      t9MarkVault(tx);
     });
-    await this.vaultUpdate((entries) => entries.map((e) => (equalBytes(e.circleId, circleId) ? { ...e, sharingEnabled: enabled } : e)));
+    await this.syncVault();
   }
 
   /** Close: the successor names only the owner; its publication forgets the members and removes the vault entry. */
@@ -1294,7 +1293,7 @@ class ClientImpl implements Client {
         for (const [k] of tx.list(table)) tx.delete(table, k);
       }
       t1Header(tx, { account, device, certificate, instanceId, generation: 1n });
-      t9Vault(tx, { revision: "1", hash: row.vaultHash, wire: row.vault, pending: false });
+      t9Vault(tx, { revision: "1", hash: row.vaultHash, wire: row.vault, pending: false, dirty: false });
       t1Activate(tx);
     });
     await this.secrets.delete("pendingReset");
@@ -1324,7 +1323,6 @@ class ClientImpl implements Client {
   }
 
   async close(): Promise<void> {
-    this.unobserve?.();
     this.listeners.clear();
   }
 }

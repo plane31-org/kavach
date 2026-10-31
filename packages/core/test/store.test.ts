@@ -241,7 +241,7 @@ describe("T2 to T5, T8, T9", () => {
     await store.transaction((tx) => tx.put("circles", toHex(circle.circleId), circleToRow(circle)));
     await store.transaction((tx) => t8OwnerSnapshot(tx, circle.circleId, new Uint8Array([1, 2, 3]), 2n));
     expect(await store.read((tx) => tx.get("circles", toHex(circle.circleId))?.pending)).toEqual({ snapshot: "010203", revision: "2" });
-    await store.transaction((tx) => t9Vault(tx, { revision: "1", hash: "ab", wire: "cd", pending: true }));
+    await store.transaction((tx) => t9Vault(tx, { revision: "1", hash: "ab", wire: "cd", pending: true, dirty: false }));
     expect(await store.read((tx) => tx.get("vault", "vault")?.pending)).toBe(true);
   });
 });

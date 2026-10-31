@@ -66,4 +66,25 @@ describe("feedback findings", () => {
     }
     expect(covered).toBe(1);
   });
+
+  it("3: a crash right after sharing is turned off, before the vault is prepared, still reaches a replacement device as off", async () => {
+    let covered = 0;
+    for (let at = 1; at < 6; at++) {
+      const w = world();
+      const { b, circleId } = await pair(w);
+      const faulty = new FaultyStore(b.store.fork(), { at, phase: "afterCommit" });
+      const crashing = await open({ accountName: "bob", retentionPolicy: testPolicy, recoveryProvider: b.provider, resetTrust, secretStore: b.secrets, store: faulty, transport: b.t, now: w.clock.now });
+      await crashing.circles.setEnabled(circleId, false).catch(() => undefined);
+      if (!faulty.crashed) break;
+      covered++;
+      const again = await open({ accountName: "bob", retentionPolicy: testPolicy, recoveryProvider: b.provider, resetTrust, secretStore: b.secrets, store: b.store.fork(), transport: b.t, now: w.clock.now });
+      w.clock.advance(1_000n);
+      expect((await again.sync()).errors, `crash after transaction ${at}`).toEqual([]);
+      const twin = await w.device("bob", b.provider.twin());
+      await twin.client.restoreAccount();
+      const restored = (await twin.client.circles.list()).find((c) => toHex(c.circleId) === toHex(circleId));
+      expect(restored?.enabled, `crash after transaction ${at}`).toBe(false);
+    }
+    expect(covered).toBeGreaterThan(1);
+  });
 });

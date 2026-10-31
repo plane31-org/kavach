@@ -97,6 +97,8 @@ export interface VaultRow {
   wire: string;
   /** Prepared but not yet confirmed by the host. */
   pending: boolean;
+  /** The circle rows changed since this vault was derived from them; set in the same transaction. */
+  dirty: boolean;
 }
 
 export type EpochStatus = "prepared" | "committed" | "active" | "obsolete" | "retired";

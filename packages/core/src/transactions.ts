@@ -203,6 +203,12 @@ export function t9Vault(tx: Tx, row: VaultRow): void {
   tx.put("vault", VAULT, row);
 }
 
+/** T9 marker: the circle rows changed in this transaction, so the vault has to be derived from them again. */
+export function t9MarkVault(tx: Tx): void {
+  const row = tx.get("vault", VAULT);
+  if (row && !row.dirty) tx.put("vault", VAULT, { ...row, dirty: true });
+}
+
 /** Own identity id from the header, for callers that only hold a transaction. */
 export function selfIdentity(tx: Pick<Tx, "get">, accountName: string, accountKey: Uint8Array): Uint8Array {
   const meta = tx.get("meta", META);
