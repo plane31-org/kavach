@@ -9,7 +9,7 @@ End-to-end encrypted location sharing and check-ins for circles of up to 100 acc
 - `examples/host-worker`: a reference host on Cloudflare Workers, not published.
 - `spec/vectors.json`, `spec/verify_vectors.py`: the revision 4 conformance fixture and its checker; `spec/vectors-rev2/` is the unchanged SS5 revision 2 package it was regenerated from.
 
-Status: steps 0 to 13 of the build sequence are complete: the whole core protocol in `packages/core` with 148 tests against the fixture and an in-memory host. Step 14 (Expo adapters) is next. Nothing here is audited or production-ready.
+Status: steps 0 to 13 of the build sequence are complete: the whole core protocol in `packages/core` with 156 tests against the fixture and an in-memory host. Step 14 (Expo adapters) is next. Nothing here is audited or production-ready.
 
 ```
 pnpm install
