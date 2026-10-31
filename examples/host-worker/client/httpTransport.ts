@@ -2,7 +2,7 @@
  * The core's Transport over the reference host's HTTP surface. Bytes travel as hex; the caller
  * is a bearer of `accountName:certificateHash` (the reference host's stand-in for real login).
  */
-import { fromHex, toHex, type AppendOutcome, type Directory, type EpochBundle, type JoinRequest, type MutationOutcome, type ReadRecordsResult, type Relay, type ResolvedAccount, type Transport } from "@kavach/core/adapters";
+import { KavachError, fromHex, toHex, type AppendOutcome, type Directory, type EpochBundle, type JoinRequest, type MutationOutcome, type ReadRecordsResult, type Relay, type ResolvedAccount, type Transport } from "@kavach/core/adapters";
 
 export interface HttpTransportOptions {
   readonly baseUrl: string;
@@ -21,8 +21,17 @@ export function httpTransport(o: HttpTransportOptions): Transport {
     const c = o.caller();
     if (c) headers["authorization"] = `Bearer ${c.accountName}:${toHex(c.certificateHash)}`;
     if (o.now) headers["x-test-now"] = o.now().toString();
-    const res = await o.fetch(o.baseUrl + path, { method, headers, ...(payload === undefined ? {} : { body: JSON.stringify(payload, (_, v: unknown) => (typeof v === "bigint" ? v.toString() : v)) }) });
+    // Failures at the transport boundary are typed: no answer, a timeout or a server error is
+    // NETWORK (retryable); anything else that goes wrong is a plain error, which core reports as
+    // unexpected and not retryable.
+    let res: Response;
+    try {
+      res = await o.fetch(o.baseUrl + path, { method, headers, ...(payload === undefined ? {} : { body: JSON.stringify(payload, (_, v: unknown) => (typeof v === "bigint" ? v.toString() : v)) }) });
+    } catch (e) {
+      throw new KavachError("NETWORK", "transport", `${method} ${path}: ${e instanceof Error ? e.message : String(e)}`);
+    }
     if (res.status === 404) return null as T;
+    if (res.status >= 500 || res.status === 408 || res.status === 429) throw new KavachError("NETWORK", "transport", `${method} ${path}: ${res.status}`);
     const data = (await res.json()) as Json;
     if (!res.ok) throw new Error(`${method} ${path}: ${String(data["error"] ?? res.status)}`);
     return data as T;

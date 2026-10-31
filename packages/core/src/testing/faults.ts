@@ -181,7 +181,7 @@ export class MaliciousTransport implements Transport {
     this.calls.push(name);
     if (this.knobs.refuse.has(name)) {
       this.knobs.refuse.delete(name);
-      throw new Error("network unreachable");
+      throw new KavachError("NETWORK", "transport", "network unreachable");
     }
     const result = await call();
     const gate = this.knobs.hold.get(name);
@@ -192,7 +192,7 @@ export class MaliciousTransport implements Transport {
     if (this.knobs.loseResponseOf.has(name)) {
       this.knobs.loseResponseOf.delete(name);
       this.losses.push(name);
-      throw new Error("response lost");
+      throw new KavachError("NETWORK", "transport", "response lost");
     }
     return result;
   }
@@ -279,7 +279,7 @@ export class MaliciousTransport implements Transport {
         k.loseResponseOf.delete("appendRecord");
         this.losses.push("appendRecord");
         return p.then(() => {
-          throw new Error("response lost");
+          throw new KavachError("NETWORK", "transport", "response lost");
         });
       },
       readRecords: async (streamId, afterSeq, limit): Promise<ReadRecordsResult> => {

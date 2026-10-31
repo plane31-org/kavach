@@ -56,7 +56,7 @@ describe("vault conflicts", () => {
     const { b, circleId } = await pair(w);
     const before = hostVault(w, "bob").revision;
     b.t.knobs.refuse.add("publishVault");
-    expect(await thrown(() => b.client.circles.setEnabled(circleId, false))).toMatch(/unreachable/);
+    expect(await thrown(() => b.client.circles.setEnabled(circleId, false))).toBe("NETWORK");
     expect(hostVault(w, "bob").revision).toBe(before);
     expect((await b.store.read((tx) => tx.get("vault", VAULT)))?.pending).toBe(true);
     b.t.knobs.refuse.delete("publishVault");

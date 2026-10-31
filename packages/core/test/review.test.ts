@@ -33,7 +33,7 @@ describe("review findings", () => {
     const { b } = await pair(w);
     const b2 = await w.device("bob", b.provider.twin());
     b2.t.knobs.loseResponseOf.add("activateDevice");
-    expect(await thrown(() => b2.client.restoreAccount())).toMatch(/response lost/);
+    expect(await thrown(() => b2.client.restoreAccount())).toBe("NETWORK");
     expect((await b2.client.getState()).status).toBe("activationPending");
     const r = await w.sync(b2);
     expect(r.errors).toEqual([]);
@@ -47,7 +47,7 @@ describe("review findings", () => {
     const w = world();
     const { a, b, bobId, circleId } = await pair(w);
     a.t.knobs.refuse.add("publishOwnedCircle");
-    expect(await thrown(() => a.client.circles.remove(circleId, bobId))).toMatch(/unreachable/);
+    expect(await thrown(() => a.client.circles.remove(circleId, bobId))).toBe("NETWORK");
     expect(w.host.circles.get(toHex(circleId))?.revision).toBe(2n);
     const r = await w.sync(a);
     expect(r.errors).toEqual([]);
@@ -66,7 +66,7 @@ describe("review findings", () => {
     const { b, circleId } = await pair(w);
     const before = w.host.accounts.get("bob")?.vault?.revision;
     b.t.knobs.refuse.add("publishVault");
-    expect(await thrown(() => b.client.circles.setEnabled(circleId, false))).toMatch(/unreachable/);
+    expect(await thrown(() => b.client.circles.setEnabled(circleId, false))).toBe("NETWORK");
     expect((await b.client.circles.list())[0]?.enabled).toBe(false);
     expect(w.host.accounts.get("bob")?.vault?.revision).toBe(before);
     // Repeating the same preference does not lose it either.
@@ -74,7 +74,7 @@ describe("review findings", () => {
     expect(w.host.accounts.get("bob")?.vault?.revision).toBe((before ?? 0n) + 1n);
     // And if nothing is repeated, sync does it.
     b.t.knobs.refuse.add("publishVault");
-    expect(await thrown(() => b.client.circles.setEnabled(circleId, true))).toMatch(/unreachable/);
+    expect(await thrown(() => b.client.circles.setEnabled(circleId, true))).toBe("NETWORK");
     const r = await w.sync(b);
     expect(r.errors).toEqual([]);
     expect(w.host.accounts.get("bob")?.vault?.revision).toBe((before ?? 0n) + 2n);
@@ -134,7 +134,7 @@ describe("second review findings", () => {
     const w = world();
     const { a } = await pair(w);
     a.t.knobs.loseResponseOf.add("resetAccount");
-    expect(await thrown(() => a.client.resetAccount({ confirmed: true }))).toMatch(/response lost/);
+    expect(await thrown(() => a.client.resetAccount({ confirmed: true }))).toBe("NETWORK");
     const host = w.host.accounts.get("alice");
     expect(host?.previousIdentities.size).toBe(1);
     const r = await w.sync(a);
@@ -173,7 +173,7 @@ describe("second review findings", () => {
     const w = world();
     const { a, circleId } = await pair(w);
     a.t.knobs.refuse.add("publishOwnedCircle");
-    expect(await thrown(() => a.client.circles.closeCircle(circleId))).toMatch(/unreachable/);
+    expect(await thrown(() => a.client.circles.closeCircle(circleId))).toBe("NETWORK");
     const r = await w.sync(a);
     expect(r.errors).toEqual([]);
     expect((await a.client.circles.list())[0]?.status).toBe("closed");

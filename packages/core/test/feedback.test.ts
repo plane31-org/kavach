@@ -204,4 +204,31 @@ describe("feedback findings", () => {
     await client.enqueueLocation(w.loc(6));
     expect(seen).toEqual(["queued:boom"]);
   });
+
+  it("11: a host that cannot be reached is a NETWORK error, retryable, in the thrown error and in the sync report", async () => {
+    const w = world();
+    const { b, circleId } = await pair(w);
+    b.t.knobs.refuse.add("publishVault");
+    expect(await thrown(() => b.client.circles.setEnabled(circleId, false))).toBe("NETWORK");
+    b.t.knobs.refuse.add("publishVault");
+    const r = await w.sync(b);
+    expect(r.errors).toEqual([{ operation: "vault", code: "NETWORK", stage: "transport", retryable: true }]);
+    expect((await w.sync(b)).errors).toEqual([]);
+  });
+
+  it("12: a backlog of a thousand expired rows is cancelled in a handful of transactions, and the fresh location still goes out", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    for (let i = 0; i < 1000; i++) await a.client.enqueueLocation(w.loc(1 + (i % 80)));
+    w.clock.advance(86_400_000n + 1n);
+    const fresh = await a.client.enqueueLocation(w.loc(5));
+    const faulty = new FaultyStore(a.store.fork());
+    const counted = await open({ accountName: "alice", retentionPolicy: testPolicy, recoveryProvider: a.provider, resetTrust, secretStore: a.secrets, store: faulty, transport: a.t, now: w.clock.now });
+    const before = faulty.transactions;
+    const r = await counted.sync();
+    expect([r.errors, r.outbox.cancelled, r.outbox.accepted]).toEqual([[], 1000, 1]);
+    expect(faulty.transactions - before).toBeLessThan(40);
+    expect((await w.sync(b)).inbox.stored).toBe(1);
+    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
+  });
 });

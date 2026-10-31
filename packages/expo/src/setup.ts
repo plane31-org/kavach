@@ -4,7 +4,7 @@
  * account name, so two accounts on one device never share a database or a secret. The individual
  * adapters stay exported for apps that need a different arrangement.
  */
-import { KavachError, open, type Client, type RecoveryProvider, type ResetTrustConfig, type RetentionPolicy } from "@kavach/core";
+import { KavachError, open, type Client, type ClientEvent, type RecoveryProvider, type ResetTrustConfig, type RetentionPolicy } from "@kavach/core";
 import { randomBytes, type SecretStore, type Transport } from "@kavach/core/adapters";
 import { ExpoSecretStore, type SecureStoreLike } from "./secretStore.js";
 import { SqliteStore, expoSqliteDriver, type ExpoSqliteDatabaseLike, type SqlDriver } from "./sqliteStore.js";
@@ -38,6 +38,8 @@ export interface KavachSetupOptions {
   /** Finite: a waiting writer fails with `LOCKED` after this. Default 5,000 ms. */
   readonly busyTimeoutMs?: number;
   readonly now?: () => bigint;
+  /** Forwarded to `open()`: called when a subscriber throws, which is otherwise silent. */
+  readonly onListenerError?: (error: unknown, event: ClientEvent) => void;
 }
 
 export interface KavachSetup {
@@ -106,7 +108,8 @@ export async function openKavach(options: KavachSetupOptions): Promise<KavachSet
     secretStore,
     store,
     transport: options.transport,
-    ...(options.now ? { now: options.now } : {})
+    ...(options.now ? { now: options.now } : {}),
+    ...(options.onListenerError ? { onListenerError: options.onListenerError } : {})
   });
   return { client, store, secretStore, databaseFileName: fileName };
 }

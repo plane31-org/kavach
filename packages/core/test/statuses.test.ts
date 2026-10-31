@@ -53,6 +53,26 @@ describe("status records", () => {
     expect((await w.sync(b)).inbox.stored).toBe(0);
   });
 
+  it("a status expires with the location window: the payload goes, the slot stays, and an older status cannot become current", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    await a.client.enqueueStatus(status(50));
+    await w.sync(a);
+    await w.sync(b);
+    const kept = await b.store.read((tx) => tx.get("statuses", toHex(aliceId)));
+    w.clock.advance(86_400_000n + 1n);
+    const r = await w.sync(b);
+    expect(r.purged).toBeGreaterThanOrEqual(1);
+    expect(await b.client.latestStatus(aliceId)).toBeUndefined();
+    const after = await b.store.read((tx) => tx.get("statuses", toHex(aliceId)));
+    expect([after?.payload, after?.recordId, after?.epoch, after?.counter]).toEqual(["", kept?.recordId, kept?.epoch, kept?.counter]);
+    // A fresh status is current again.
+    await a.client.enqueueStatus(status(45));
+    await w.sync(a);
+    await w.sync(b);
+    expect(toHex((await b.client.latestStatus(aliceId))?.payload ?? new Uint8Array())).toBe(toHex(status(45)));
+  });
+
   it("an author who leaves takes their status with them", async () => {
     const w = world();
     const { a, b, aliceId, bobId, circleId } = await pair(w);

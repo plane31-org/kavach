@@ -201,6 +201,18 @@ describe("openKavach", () => {
     }
   });
 
+  it("forwards onListenerError to the client", async () => {
+    const w = world();
+    const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));
+    const seen: string[] = [];
+    const s = await openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets: new MemorySecretStore(), database: cipherLike(dir, new Map()), context: "foreground", now: w.clock.now, onListenerError: (e, ev) => seen.push(`${ev.kind}:${e instanceof Error ? e.message : String(e)}`) });
+    s.client.subscribe((e) => {
+      if (e.kind === "stateChanged") throw new Error("boom");
+    });
+    await s.client.initializeAccount();
+    expect(seen).toContain("stateChanged:boom");
+  });
+
   it("names and validates", () => {
     expect(databaseFileName("alice")).toBe("kavach-alice.db");
     expect(databaseFileName("alice", "moyo")).toBe("moyo-alice.db");

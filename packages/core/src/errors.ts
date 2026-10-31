@@ -40,7 +40,9 @@ export type ErrorCode =
   // Storage and transport
   | "LOCKED"
   | "RECOVERY_REQUIRED"
-  | "STORAGE_FAILURE";
+  | "STORAGE_FAILURE"
+  /** The host could not be reached or did not answer in time; the same call may succeed later. A transport raises it, never a plain error. */
+  | "NETWORK";
 
 const RETRYABLE: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
   "KEY_PENDING",
@@ -48,7 +50,8 @@ const RETRYABLE: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
   "RESET_KEYS_REQUIRED",
   "ROTATION_REQUIRED",
   "LOCKED",
-  "STORAGE_FAILURE"
+  "STORAGE_FAILURE",
+  "NETWORK"
 ]);
 
 /**

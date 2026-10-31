@@ -10,7 +10,7 @@ import { KavachError, isKavachError } from "./errors.js";
 import type { RetentionPolicy } from "./policy.js";
 import { compareSlots, openRecordWire } from "./record.js";
 import { big, unbig } from "./rows.js";
-import type { HistoryRow, LivePinRow, Store, SubscriptionRow, Tx } from "./store.js";
+import type { HistoryRow, LivePinRow, Store, SubscriptionRow, Tx, StatusRow } from "./store.js";
 import type { Relay } from "./transport.js";
 
 export const MAX_FUTURE_SKEW_MS = 300_000n;
@@ -388,16 +388,21 @@ export interface LatestStatus {
 export async function latestStatus(store: Store, authorIdentityId: Uint8Array, now: bigint): Promise<LatestStatus | undefined> {
   return store.read((tx) => {
     const row = tx.get("statuses", toHex(authorIdentityId));
-    if (!row) return undefined;
+    if (!row || row.payload === "") return undefined; // none, or expired: the slot stays, the payload is gone
     return { recordId: fromHex(row.recordId), payload: fromHex(row.payload), sentAt: unbig(row.sentAt), ageMs: now - unbig(row.sentAt) };
   });
 }
 
-/** Retention: drop history outside the windows; a pin whose record is gone disappears with it. */
+/**
+ * Retention: drop history outside the windows; a pin whose record is gone disappears with it. A
+ * status expires with the location window: its payload is dropped while the row keeps its slot,
+ * so an older status replayed later cannot become current.
+ */
 export async function purgeHistory(store: Store, policy: RetentionPolicy, now: bigint): Promise<number> {
-  const expired = (kind: RecordKind, sentAt: string): boolean => unbig(sentAt) + (kind === 0 ? policy.locationHistoryMs : policy.checkInHistoryMs) <= now;
+  const expired = (kind: RecordKind, sentAt: string): boolean => unbig(sentAt) + (kind === 1 ? policy.checkInHistoryMs : policy.locationHistoryMs) <= now;
+  const staleStatus = (r: StatusRow): boolean => r.payload !== "" && expired(2, r.sentAt);
   // Read first: most syncs purge nothing and must not take the writer lock for it.
-  const any = await store.read((tx) => tx.list("history").some(([, r]) => expired(r.kind, r.sentAt)));
+  const any = await store.read((tx) => tx.list("history").some(([, r]) => expired(r.kind, r.sentAt)) || tx.list("statuses").some(([, r]) => staleStatus(r)));
   if (!any) return 0;
   return store.transaction((tx) => {
     let removed = 0;
@@ -406,6 +411,12 @@ export async function purgeHistory(store: Store, policy: RetentionPolicy, now: b
         tx.delete("history", key);
         removed++;
         for (const [pk, pin] of tx.list("livePins")) if (pin.recordId === key) tx.delete("livePins", pk);
+      }
+    }
+    for (const [key, r] of tx.list("statuses")) {
+      if (staleStatus(r)) {
+        tx.put("statuses", key, { ...r, payload: "" });
+        removed++;
       }
     }
     return removed;

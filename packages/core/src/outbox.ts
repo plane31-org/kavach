@@ -174,6 +174,9 @@ export async function drain(deps: OutboxDeps, maxRecords = 1000): Promise<DrainS
   return summary;
 }
 
+/** Dead rows cancelled per handoff transaction; a larger backlog is finished over the next handoffs. */
+const CANCEL_BATCH = 500;
+
 /** A row that will not be sent again keeps its summary and sheds the ciphertext. */
 function terminal(row: OutboxRow, status: "cancelled" | "unknown", reason: string): OutboxRow {
   return { ...row, wire: "", status, reason };
@@ -186,29 +189,33 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
   const step = await deps.store.transaction((tx): HandoffStep => {
     const meta = tx.get("meta", META);
     if (!meta || meta.state !== "ACTIVE") return { kind: "none" };
-    const rows = tx
-      .list("outbox")
-      .filter(([, r]) => r.status === "queued" || r.status === "inflight")
-      .sort(([, a], [, b]) => a.epoch - b.epoch || a.counter - b.counter);
-    const inflight = rows.find(([, r]) => r.status === "inflight");
-    const next = inflight ?? rows[0];
-    if (!next) return { kind: "none" };
-    const [key, row] = next;
     const now = deps.now();
     const revision = currentRevision(tx);
-    if (unbig(row.desiredRevision) !== revision) {
-      tx.put("outbox", key, terminal(row, "cancelled", "rotation"));
-      summary.cancelled++;
-      after.push(() => deps.events?.cancelled?.(fromHex(row.recordId), "rotation"));
-      if (row.kind === 0) after.push(() => deps.events?.needsLocation?.("rotation"));
-      return { kind: "skipped" };
+    // One pass: every row that is no longer sendable (its revision moved on, or its window has
+    // passed) is cancelled here, in bounded batches, and the first sendable row goes out in the
+    // same transaction. A backlog of dead rows costs one scan, not one transaction per row.
+    const live: [string, OutboxRow][] = [];
+    let cancelled = 0;
+    let needsLocation = false;
+    for (const [key, row] of [...tx.list("outbox")].sort(([, a], [, b]) => a.epoch - b.epoch || a.counter - b.counter)) {
+      if (row.status !== "queued" && row.status !== "inflight") continue;
+      const reason = cancelled >= CANCEL_BATCH ? undefined : unbig(row.desiredRevision) !== revision ? "rotation" : unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now ? "expired" : undefined;
+      if (!reason) {
+        live.push([key, row]);
+        continue;
+      }
+      tx.put("outbox", key, terminal(row, "cancelled", reason));
+      cancelled++;
+      after.push(() => deps.events?.cancelled?.(fromHex(row.recordId), reason));
+      if (reason === "rotation" && row.kind === 0) needsLocation = true;
     }
-    if (unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now) {
-      tx.put("outbox", key, terminal(row, "cancelled", "expired"));
-      summary.cancelled++;
-      after.push(() => deps.events?.cancelled?.(fromHex(row.recordId), "expired"));
-      return { kind: "skipped" };
-    }
+    summary.cancelled += cancelled;
+    if (needsLocation) after.push(() => deps.events?.needsLocation?.("rotation"));
+    // A full batch means unchecked rows remain: finish them in the next handoff before sending.
+    if (cancelled >= CANCEL_BATCH) return { kind: "skipped" };
+    const next = live.find(([, r]) => r.status === "inflight") ?? live[0];
+    if (!next) return { kind: "none" };
+    const [key, row] = next;
     const marked: OutboxRow = { ...row, status: "inflight", attempts: row.attempts + 1 };
     tx.put("outbox", key, marked);
     let outcome: Promise<AppendOutcome>;
