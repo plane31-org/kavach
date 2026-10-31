@@ -1,0 +1,75 @@
+/** Error codes of Kavach v1, protocol section 14. The set is closed: new codes are a protocol change. */
+export type ErrorCode =
+  // Parsing
+  | "SIZE_LIMIT"
+  | "MALFORMED"
+  | "UNSUPPORTED_VERSION"
+  | "UNSUPPORTED_TYPE"
+  | "BAD_PAYLOAD"
+  // Authentication
+  | "INVALID_KEY"
+  | "BAD_SIGNATURE"
+  | "DECRYPT_FAILED"
+  | "WRAP_HASH_MISMATCH"
+  | "KEY_COMMITMENT_MISMATCH"
+  // Trust and state
+  | "ACCOUNT_KEY_CHANGED"
+  | "ACCOUNT_RECOVERY_REQUIRED"
+  | "DEVICE_ROLLBACK"
+  | "DEVICE_ID_REUSED"
+  | "SUPERSEDED_DEVICE"
+  | "VAULT_BINDING"
+  | "RESET_BINDING"
+  | "RESET_KEYS_REQUIRED"
+  | "RESET_KEY_REVOKED"
+  | "RESET_CLOCK_UNTRUSTED"
+  | "ROLLBACK"
+  | "EQUIVOCATION"
+  | "METADATA_REQUIRED"
+  | "KEY_PENDING"
+  | "NOT_AUTHORIZED"
+  | "ROTATION_REQUIRED"
+  | "COUNTER_EXHAUSTED"
+  | "RECIPIENT_LIMIT"
+  // Delivery
+  | "CLOCK_SKEW"
+  | "EXPIRED"
+  | "QUEUE_FULL"
+  | "CURSOR_OUT_OF_RANGE"
+  | "STALE_APPEND"
+  // Storage and transport
+  | "LOCKED"
+  | "RECOVERY_REQUIRED"
+  | "STORAGE_FAILURE";
+
+const RETRYABLE: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
+  "KEY_PENDING",
+  "METADATA_REQUIRED",
+  "RESET_KEYS_REQUIRED",
+  "ROTATION_REQUIRED",
+  "LOCKED",
+  "STORAGE_FAILURE"
+]);
+
+/**
+ * Every failure the SDK reports. `code` is one of the protocol's codes, `stage` is a safe
+ * stage name for logs (never a secret, a location or an identifier), `retryable` says whether
+ * the same call may succeed later without any change of state.
+ */
+export class KavachError extends Error {
+  readonly code: ErrorCode;
+  readonly stage: string;
+  readonly retryable: boolean;
+
+  constructor(code: ErrorCode, stage = "unknown", message?: string) {
+    super(message ?? `${code} at ${stage}`);
+    this.name = "KavachError";
+    this.code = code;
+    this.stage = stage;
+    this.retryable = RETRYABLE.has(code);
+  }
+}
+
+export function isKavachError(value: unknown, code?: ErrorCode): value is KavachError {
+  return value instanceof KavachError && (code === undefined || value.code === code);
+}
