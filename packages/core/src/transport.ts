@@ -100,10 +100,7 @@ export interface Relay {
   listSubscriptions(): Promise<readonly { streamId: Uint8Array; authorIdentityId: Uint8Array }[]>;
 }
 
-export type TransportHint = "online" | "offline" | "resume" | "metadataChanged";
-
 export interface Transport {
   readonly directory: Directory;
   readonly relay: Relay;
-  observe(handler: (hint: TransportHint) => void): () => void;
 }

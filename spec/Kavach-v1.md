@@ -427,7 +427,6 @@ Old and new ids must differ. For an unseen receipt the SDK requires a fresh key 
 - Directory: `registerAccount(certificate, vault)` (`ALREADY_COMMITTED` when the name already carries exactly this certificate, so an interrupted enrollment resumes), `resolveAccounts(names)`, `resolveIdentities(identityIds)` (a snapshot names identities; the directory maps them back to accounts, host-trusted like first contact, and attaches the reset receipt when an account's key changed through a reset), `getCertificate(hash)`, `activateDevice(expectedCertificateHash, expectedVaultRevision, expectedVaultHash, newCertificate, newVault)`, `getVault(accountName)`, `publishVault(expectedRevision, expectedHash, newVault)`, `getCircle(circleId)`, `publishOwnedCircle(circleId, expectedRevision, expectedHash, newSnapshot)`, `requestJoin(circleId)`, `requestLeave(circleId)`, `readRequests(circleId)`, `getResetKeyList()`, `resetAccount(...)`, `getResetReceipt(resetId)`.
 - Relay: `getCurrentEpoch(streamId)`, `getEpoch(streamId, epoch)` returning the manifest plus the caller's wrap, `publishEpoch(streamId, expectedEpoch, expectedHash, manifest, wrapMap)`, `appendRecord(recordId, wire)`, `readRecords(streamId, afterSeq, limit)`, `ackThrough(streamId, cursor)`. The host creates a reader's subscription to a stream at admission, at device activation and when an author opens a new stream; the client never asks for one. The transport's `send` MUST be callable from inside T6h without awaiting.
 - Notifications are the host's: a visible notification to the owner on a join request and to each recipient on a check-in append; a silent wake-up otherwise. The SDK never composes notification text.
-- `observe(handler)` emits `online`, `offline`, `resume` and `metadataChanged` hints. Hints never authorise a state change.
 
 Mutation outcomes are `COMMITTED`, `ALREADY_COMMITTED` (same bytes), `CONFLICT` (with the current bytes), `IGNORED_OLDER`, `RETRYABLE`, `UNAUTHORIZED` or `PERMANENT_FAILURE`. Timeouts are uncertain: re-read the target and compare bytes. Use a 30-second timeout and a uniform random delay of 0 to min(60 s, 2^min(attempt, 6) s) between attempts, one pending operation per target. A retry re-enters T6h like a first send.
 
@@ -608,7 +607,7 @@ Every SDK write runs inside `BEGIN IMMEDIATE`. SQLite's file lock then serialise
 
 #### Clock, background work and transport
 
-A clock adapter keeps a durable time high-water mark and monotonic elapsed time for the reset-key list rules. The background location task calls `enqueueLocation` and then `sync`. The transport is Moyo's authenticated fetch and sockets; its `send` queues the bytes synchronously and returns a promise, so it can be initiated inside T6h. The app's `observe` handler forwards online, offline, resume and the Worker's metadata hints.
+A clock adapter keeps a durable time high-water mark and monotonic elapsed time for the reset-key list rules. The background location task calls `enqueueLocation` and then `sync`. The transport is Moyo's authenticated fetch and sockets; its `send` queues the bytes synchronously and returns a promise, so it can be initiated inside T6h. Connectivity and push hints stay in the app, which calls `sync` when they arrive.
 
 ### 4. Server (Cloudflare Worker)
 

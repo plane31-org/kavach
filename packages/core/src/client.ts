@@ -17,7 +17,7 @@ import { validatePolicy, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
 import type { CircleRow, PendingResetRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
-import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault } from "./transactions.js";
+import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t3Circle, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault } from "./transactions.js";
 import type { Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
 
@@ -798,8 +798,7 @@ class ClientImpl implements Client {
               if (fresh.revision >= r.state.revision) return undefined;
               const localFinal = fresh.status === "left" || fresh.status === "closed" || fresh.status === "quarantined";
               const state: CircleState = { ...r.state, enabled: fresh.enabled, status: localFinal ? fresh.status : r.state.status };
-              tx.put("circles", toHex(c.circleId), { ...circleToRow(state), pending: row?.pending && unbig(row.pending.revision) <= state.revision ? undefined : row?.pending });
-              const ch = t3ApplyChange(tx, { kind: "snapshot", circleId: c.circleId, revision: state.revision });
+              const ch = t3Circle(tx, { ...circleToRow(state), pending: row?.pending && unbig(row.pending.revision) <= state.revision ? undefined : row?.pending }, { kind: "snapshot", circleId: c.circleId, revision: state.revision });
               return { state, rotated: ch.changed, leftNow: state.status === "left" && fresh.status !== "left" };
             });
             if (committed) {
@@ -812,7 +811,7 @@ class ClientImpl implements Client {
           } else for (const m of c.members) memberIds.set(toHex(m), m);
         } catch (e) {
           if (isKavachError(e, "EQUIVOCATION")) {
-            await this.store.transaction((tx) => tx.put("circles", toHex(c.circleId), circleToRow({ ...c, status: "quarantined" })));
+            await this.store.transaction((tx) => t3Circle(tx, circleToRow({ ...c, status: "quarantined" })));
             this.emit({ kind: "securityError", code: "EQUIVOCATION", detail: "two snapshots at one revision" });
           } else report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
           for (const m of c.members) memberIds.set(toHex(m), m);
@@ -928,8 +927,7 @@ class ClientImpl implements Client {
     for (const [k, c] of tx.list("certificates")) if (c.identityId === toHex(old.identityId)) tx.put("certificates", k, { ...c, current: false });
     for (const [k, c] of tx.list("circles")) {
       if (c.ownerIdentityId === toHex(old.identityId)) {
-        tx.put("circles", k, { ...c, status: "closed" });
-        t3ApplyChange(tx, { kind: "leave", circleId: fromHex(k) });
+        t3Circle(tx, { ...c, status: "closed" }, { kind: "leave", circleId: fromHex(k) });
       } else if (c.members.includes(toHex(old.identityId))) {
         t3ApplyChange(tx, { kind: "deviceChanged", identityId: old.identityId, certificateHash: newIdentityId });
       }
@@ -1087,7 +1085,7 @@ class ClientImpl implements Client {
     const genesis = createCircleSnapshot({ identityId: pin.identityId, accountSecretKey: account.account.secretKey }, circleId);
     const state = acceptSnapshot(pinCircle(circleId, pin.identityId, true, "member"), genesis, pin.accountKey, pin.identityId, this.now());
     if (state.outcome !== "ACCEPTED") throw new KavachError("STORAGE_FAILURE", "createCircle");
-    await this.store.transaction((tx) => tx.put("circles", toHex(circleId), { ...circleToRow(state.state), pending: { snapshot: toHex(genesis), revision: "1" } }));
+    await this.store.transaction((tx) => t3Circle(tx, { ...circleToRow(state.state), pending: { snapshot: toHex(genesis), revision: "1" } }));
     const published = await this.publishPendingSnapshot(circleId);
     if (published !== "COMMITTED") throw new KavachError("STORAGE_FAILURE", "createCircle", published);
     await this.store.transaction((tx) => {
@@ -1102,8 +1100,14 @@ class ClientImpl implements Client {
   private async requestJoin(circleId: Uint8Array, ownerIdentityId: Uint8Array, shareOnApproval: boolean): Promise<void> {
     this.requireAccount("requestJoin");
     await this.store.transaction((tx) => {
-      if (!tx.get("circles", toHex(circleId))) tx.put("circles", toHex(circleId), circleToRow(pinCircle(circleId, ownerIdentityId, shareOnApproval, "requested")));
-      t9MarkVault(tx);
+      const existing = tx.get("circles", toHex(circleId));
+      if (!existing) t3Circle(tx, circleToRow(pinCircle(circleId, ownerIdentityId, shareOnApproval, "requested")));
+      else if (existing.status === "left") {
+        // An explicit rejoin: the pinned owner and the revision reached stay, so no older snapshot
+        // can be served, and the new preference replaces the one the leave cleared.
+        if (existing.ownerIdentityId !== toHex(ownerIdentityId)) throw new KavachError("NOT_AUTHORIZED", "requestJoin", "another owner is pinned for this circle");
+        t3Circle(tx, { ...existing, status: "requested", enabled: shareOnApproval, pending: undefined });
+      }
     });
     // The vault before the request: a recovering device finds the pin either way.
     await this.syncVault();
@@ -1140,9 +1144,8 @@ class ClientImpl implements Client {
         // Nobody but the owner to tell: the close is local, and the vault entry goes with it.
         await this.store.transaction((tx) => {
           const r = tx.get("circles", toHex(circleId));
-          if (r) tx.put("circles", toHex(circleId), { ...r, status: "closed", enabled: false, pending: undefined });
-          t3ApplyChange(tx, { kind: "leave", circleId });
-          t9MarkVault(tx);
+          if (r) t3Circle(tx, { ...r, status: "closed", enabled: false, pending: undefined }, { kind: "leave", circleId });
+          else t3ApplyChange(tx, { kind: "leave", circleId });
         });
         this.emit({ kind: "circleChanged", circleId, revision: state.revision, status: "closed" });
         await this.syncVault();
@@ -1181,9 +1184,7 @@ class ClientImpl implements Client {
         // circle closed): the host's answer settles membership, never the user's newer preference.
         const live = tx.get("circles", toHex(circleId));
         if (live) next = { ...next, enabled: live.enabled, status: live.status === "closed" ? "closed" : next.status };
-        tx.put("circles", toHex(circleId), { ...circleToRow(next), pending: undefined });
-        t3ApplyChange(tx, { kind: "snapshot", circleId, revision: next.revision });
-        if (pending.close) t9MarkVault(tx);
+        t3Circle(tx, { ...circleToRow(next), pending: undefined }, { kind: "snapshot", circleId, revision: next.revision });
       });
       const after = new Set(next.members.map(toHex));
       for (const m of state.members) {
@@ -1197,7 +1198,7 @@ class ClientImpl implements Client {
     }
     if (outcome.status === "CONFLICT" && outcome.current) {
       const accepted = acceptSnapshot(state, outcome.current, pin.accountKey, pin.identityId, this.now());
-      await this.store.transaction((tx) => tx.put("circles", toHex(circleId), { ...circleToRow(accepted.outcome === "ACCEPTED" ? accepted.state : state), pending: undefined }));
+      await this.store.transaction((tx) => t3Circle(tx, { ...circleToRow(accepted.outcome === "ACCEPTED" ? accepted.state : state), pending: undefined }));
       return "CONFLICT";
     }
     throw new KavachError("STORAGE_FAILURE", stage, outcome.status);
@@ -1210,9 +1211,7 @@ class ClientImpl implements Client {
     if (row.ownerIdentityId === toHex(pin.identityId)) throw new KavachError("NOT_AUTHORIZED", "leave", "the owner closes instead");
     const state = rowToCircle(row);
     await this.store.transaction((tx) => {
-      tx.put("circles", toHex(circleId), circleToRow({ ...state, enabled: false, status: "left" }));
-      t3ApplyChange(tx, { kind: "leave", circleId });
-      t9MarkVault(tx);
+      t3Circle(tx, circleToRow({ ...state, enabled: false, status: "left" }), { kind: "leave", circleId });
     });
     await this.onLeft(state);
     await this.syncVault();
@@ -1228,9 +1227,7 @@ class ClientImpl implements Client {
       return;
     }
     await this.store.transaction((tx) => {
-      tx.put("circles", toHex(circleId), { ...row, enabled });
-      t3ApplyChange(tx, { kind: enabled ? "enable" : "disable", circleId });
-      t9MarkVault(tx);
+      t3Circle(tx, { ...row, enabled }, { kind: enabled ? "enable" : "disable", circleId });
     });
     await this.syncVault();
   }

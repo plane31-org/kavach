@@ -27,8 +27,7 @@ import type {
   ReadRecordsResult,
   Relay,
   ResolvedAccount,
-  Transport,
-  TransportHint
+  Transport
 } from "../transport.js";
 
 interface Account {
@@ -91,7 +90,6 @@ export class FakeHost {
   readonly receipts = new Map<string, Uint8Array>();
   resetKeyList: Uint8Array | undefined;
   resetSigner: { key: SigningKeypair; keyId: Uint8Array } | undefined;
-  private readonly observers = new Set<(hint: TransportHint) => void>();
   /** Test switches. */
   failAppends = false;
   dropAppendResponses = false;
@@ -105,10 +103,6 @@ export class FakeHost {
 
   accountByIdentity(iid: string): Account | undefined {
     return [...this.accounts.values()].find((a) => a.identityId === iid);
-  }
-
-  private hint(h: TransportHint): void {
-    for (const o of this.observers) o(h);
   }
 
   private stream(streamHex: string, authorIdentityId: string, accountName: string): StreamState {
@@ -243,7 +237,6 @@ export class FakeHost {
         a.vault = { wire: input.newVault, revision: vh.vaultRevision, hash: toHex(vh.hash) };
         host.certificates.set(a.certificateHash, input.newCertificate);
         host.stream(toHex(deriveStreamId(fromHex(a.identityId), doc.deviceId)), a.identityId, a.accountName);
-        host.hint("metadataChanged");
         return { status: "COMMITTED" };
       },
       async getVault(name) {
@@ -283,7 +276,6 @@ export class FakeHost {
         // Requests for accounts now admitted are cleared.
         const members = new Set(doc.members.map(toHex));
         host.requests.set(key, (host.requests.get(key) ?? []).filter((r) => !members.has(host.accounts.get(r.accountName)?.identityId ?? "")));
-        host.hint("metadataChanged");
         return { status: "COMMITTED" };
       },
       async requestJoin(circleId): Promise<MutationOutcome> {
@@ -353,7 +345,6 @@ export class FakeHost {
         a.vault = { wire: input.newVault, revision: vh.vaultRevision, hash: toHex(vh.hash) };
         host.certificates.set(a.certificateHash, input.newCertificate);
         host.stream(toHex(deriveStreamId(newIid, doc.deviceId)), a.identityId, a.accountName);
-        host.hint("metadataChanged");
         return { status: "COMMITTED" as const, receipt };
       }
     };
@@ -482,11 +473,7 @@ export class FakeHost {
 
     return {
       directory,
-      relay,
-      observe: (handler) => {
-        host.observers.add(handler);
-        return () => host.observers.delete(handler);
-      }
+      relay
     };
   }
 }

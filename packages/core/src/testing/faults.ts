@@ -172,10 +172,6 @@ export class MaliciousTransport implements Transport {
     this.relay = this.wrapRelay();
   }
 
-  observe(handler: Parameters<Transport["observe"]>[0]): () => void {
-    return this.inner.observe(handler);
-  }
-
   private serve(kind: ServedKind, bytes: Uint8Array | undefined): Uint8Array | undefined {
     if (!bytes) return bytes;
     return this.knobs.tamper.has(kind) ? flipByte(bytes) : bytes;

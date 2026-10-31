@@ -12,7 +12,7 @@ import { promote } from "./epoch.js";
 import { KavachError } from "./errors.js";
 import { openAccount, pinFromCertificate, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { big, pinToRow, preparedToRow, revisionToRow, rowToPrepared, rowToRevision, unbig } from "./rows.js";
-import type { ActivationRow, MetaRow, SecretStore, Store, StoreState, Tx, VaultRow } from "./store.js";
+import type { ActivationRow, CircleRow, MetaRow, SecretStore, Store, StoreState, Tx, VaultRow } from "./store.js";
 
 export const META = "meta";
 export const SELF = "self";
@@ -142,6 +142,17 @@ export function t3ApplyChange(tx: Tx, event: AudienceEvent): ChangeResult {
     }
   }
   return { changed: true, desiredRevision: next.desiredRevision, cancelled };
+}
+
+/**
+ * T3c: one circle row change with its bookkeeping. The row is stored, the audience event it
+ * implies (if any) rotates the sending epoch, and the vault is marked so the backup follows the
+ * rows. Every circle write except the restore from the vault itself goes through here.
+ */
+export function t3Circle(tx: Tx, row: CircleRow, event?: AudienceEvent): ChangeResult {
+  tx.put("circles", row.circleId, row);
+  t9MarkVault(tx);
+  return event ? t3ApplyChange(tx, event) : { changed: false, desiredRevision: currentRevision(tx), cancelled: [] };
 }
 
 export function currentRevision(tx: Pick<Tx, "get">): bigint {

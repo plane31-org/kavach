@@ -63,8 +63,7 @@ function world(listLifetimeMs = 2_592_000_000n) {
       },
       get relay() {
         return bind().relay;
-      },
-      observe: (h) => bind().observe(h)
+      }
     };
     const client = await open({ accountName: name, retentionPolicy: policy, recoveryProvider: provider, resetTrust, secretStore: secrets, store, transport, now: clock.now });
     client.subscribe((e) => events.push(e));

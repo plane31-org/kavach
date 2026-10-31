@@ -101,8 +101,7 @@ export function hostTransport(host: FakeHost, account: string): Transport {
     },
     get relay() {
       return bind().relay;
-    },
-    observe: (h) => bind().observe(h)
+    }
   };
 }
 

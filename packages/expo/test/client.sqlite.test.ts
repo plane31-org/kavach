@@ -50,7 +50,7 @@ describe("client on SqliteStore", () => {
         resetTrust: { managementKey: resetKeys.management.publicKey, minimumVersion: 1n },
         secretStore: secrets,
         store,
-        transport: { get directory() { return bind().directory; }, get relay() { return bind().relay; }, observe: (h) => bind().observe(h) },
+        transport: { get directory() { return bind().directory; }, get relay() { return bind().relay; } },
         now: clock.now
       });
     };

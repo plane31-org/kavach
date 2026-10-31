@@ -87,8 +87,7 @@ export type {
   ReadRecordsResult,
   Relay,
   ResolvedAccount,
-  Transport,
-  TransportHint
+  Transport
 } from "../transport.js";
 
 // Recovery provider --------------------------------------------------------------------------------

@@ -75,8 +75,7 @@ function world(): World {
         },
         get relay() {
           return (bound ?? host.asDevice(name, new Uint8Array(32))).relay;
-        },
-        observe: (h) => host.asDevice(name, new Uint8Array(32)).observe(h)
+        }
       };
       const client = await open({ accountName: name, retentionPolicy: policy, recoveryProvider: provider, resetTrust, secretStore: secrets, store, transport, now: clock.now });
       client.subscribe((e) => {
