@@ -26,6 +26,7 @@ export interface Fixture {
   negative_vectors: { name: string; wire: string; verification_key: string; operation: string; expected: string }[];
   phone_replacement: { new_device_seed: string; new_device_id: string; stable_identity_id: string; new_certificate: string };
   boundary_100: { seed_rule: string; accounts: string[] };
+  status_record: { wire: string; record_id: string; epoch_key: string; payload: string; expected: { kind: number; flags: number; epoch: number; counter: number; pins: boolean; notifies: boolean } };
 }
 
 export const fixture: Fixture = JSON.parse(

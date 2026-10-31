@@ -11,7 +11,7 @@ import { randomBytes, ready, type BoxKeypair } from "./crypto.js";
 import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
-import { forgetAuthor, forgetAuthorIn, history, latest, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryQuery, type Latest, type ReceiveResult } from "./inbox.js";
+import { forgetAuthor, forgetAuthorIn, history, latest, latestStatus, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryQuery, type Latest, type LatestStatus, type ReceiveResult } from "./inbox.js";
 import { drain, enqueue, outboxCount, outboxCounts, purgeOutbox, type OutboxCounts } from "./outbox.js";
 import { validatePolicy, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
@@ -22,7 +22,7 @@ import type { Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
 
 /** The types of the client's queries and of `receive`, defined with the inbox. */
-export type { HistoryEntry, HistoryQuery, Latest, ReceiveResult } from "./inbox.js";
+export type { HistoryEntry, HistoryQuery, Latest, LatestStatus, ReceiveResult } from "./inbox.js";
 
 /** accountSeed, deviceSeed, recoveryKey, instanceId and deviceId of a pending reset, in the secret store. */
 const RESET_ROOTS_BYTES = 32 * 3 + 16 + 16;
@@ -90,6 +90,7 @@ export type ClientEvent =
   | { kind: "queued"; recordId: Uint8Array; recordKind: RecordKind }
   | { kind: "accepted"; recordId: Uint8Array }
   | { kind: "latestUpdated"; identityId: Uint8Array }
+  | { kind: "statusUpdated"; identityId: Uint8Array }
   | { kind: "checkIn"; identityId: Uint8Array; recordId: Uint8Array }
   | { kind: "waiting"; identityId: Uint8Array }
   | { kind: "joinRequests"; circleId: Uint8Array; accountNames: readonly string[] }
@@ -119,10 +120,13 @@ export interface Client {
   restoreAccount(recoveryCode?: string): Promise<{ identityId: Uint8Array; generation: bigint }>;
   enqueueLocation(location: Location): Promise<{ recordId: Uint8Array }>;
   enqueueCheckIn(payload: Location | Uint8Array): Promise<{ recordId: Uint8Array }>;
+  /** A status (kind 2): the sender's current state in an application payload. Latest wins in the outbox. */
+  enqueueStatus(payload: Uint8Array): Promise<{ recordId: Uint8Array }>;
   sync(): Promise<SyncReport>;
   receive(wire: Uint8Array): Promise<ReceiveResult>;
   history(query?: HistoryQuery): Promise<HistoryEntry[]>;
   latest(identityId: Uint8Array): Promise<Latest | undefined>;
+  latestStatus(identityId: Uint8Array): Promise<LatestStatus | undefined>;
   inspect(): Promise<Inspection>;
   readonly circles: {
     create(): Promise<{ circleId: Uint8Array }>;
@@ -281,6 +285,7 @@ class ClientImpl implements Client {
         received: (r: ReceiveResult) => {
           if (r.result === "updated" && r.kind === 0) this.emit({ kind: "latestUpdated", identityId: r.authorIdentityId });
           if (r.result === "updated" && r.kind === 1) this.emit({ kind: "checkIn", identityId: r.authorIdentityId, recordId: r.recordId });
+          if (r.result === "updated" && r.kind === 2) this.emit({ kind: "statusUpdated", identityId: r.authorIdentityId });
         },
         waiting: (identityId: Uint8Array) => this.emit({ kind: "waiting", identityId }),
         securityError: (code: string, detail: string) => this.emit({ kind: "securityError", code, detail })
@@ -572,6 +577,10 @@ class ClientImpl implements Client {
 
   async enqueueCheckIn(payload: Location | Uint8Array): Promise<{ recordId: Uint8Array }> {
     return this.enqueueKind(1, payload instanceof Uint8Array ? payload : encodeLocation(payload));
+  }
+
+  async enqueueStatus(payload: Uint8Array): Promise<{ recordId: Uint8Array }> {
+    return this.enqueueKind(2, payload);
   }
 
   private async enqueueKind(kind: RecordKind, payload: Uint8Array): Promise<{ recordId: Uint8Array }> {
@@ -1014,6 +1023,10 @@ class ClientImpl implements Client {
     return latest(this.store, identityId, this.now());
   }
 
+  latestStatus(identityId: Uint8Array): Promise<LatestStatus | undefined> {
+    return latestStatus(this.store, identityId, this.now());
+  }
+
   // Circles ---------------------------------------------------------------------------------------
 
   private async listCircles(): Promise<CircleSummary[]> {
@@ -1320,7 +1333,7 @@ class ClientImpl implements Client {
     const newPin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage));
     await t1Secrets(this.secrets, { accountSeed, deviceSeed, recoveryKey, instanceId });
     await this.store.transaction((tx) => {
-      for (const table of ["meta", "self", "pins", "certificates", "quarantine", "circles", "revision", "vault", "epochs", "stream", "outbox", "history", "livePins", "readerEpochs", "subscriptions", "unresolved", "activation", "pendingReset"] as const) {
+      for (const table of ["meta", "self", "pins", "certificates", "quarantine", "circles", "revision", "vault", "epochs", "stream", "outbox", "history", "livePins", "statuses", "readerEpochs", "subscriptions", "unresolved", "activation", "pendingReset"] as const) {
         for (const [k] of tx.list(table)) tx.delete(table, k);
       }
       t1Header(tx, { account, device, certificate, instanceId, generation: 1n });

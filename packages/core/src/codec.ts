@@ -50,7 +50,8 @@ export const MAX_VAULT_CIPHERTEXT = 4_990;
 export const VAULT_ENTRY_BYTES = 49;
 export const RECORD_HEADER_BYTES = 51;
 export const FLAG_KIND = 0x02;
-const RESERVED_FLAGS = ~FLAG_KIND & 0xff;
+export const FLAG_STATUS = 0x04;
+const RESERVED_FLAGS = ~(FLAG_KIND | FLAG_STATUS) & 0xff;
 
 export enum DocumentType {
   AccountDevice = 1,
@@ -62,7 +63,7 @@ export enum DocumentType {
   ResetKeyList = 8
 }
 
-export type RecordKind = 0 | 1; // 0 location, 1 check-in
+export type RecordKind = 0 | 1 | 2; // 0 location, 1 check-in, 2 status
 
 export interface AccountDevice {
   readonly type: DocumentType.AccountDevice;
@@ -234,6 +235,7 @@ export function parseDocument(wire: Uint8Array): Parsed {
       const flags = r.u8();
       if (epoch === 0) throw malformed(stage, "epoch zero");
       if ((flags & RESERVED_FLAGS) !== 0) throw malformed(stage, "reserved flag bit set");
+      if ((flags & FLAG_KIND) !== 0 && (flags & FLAG_STATUS) !== 0) throw malformed(stage, "check-in and status bits both set");
       const header = r.consumed();
       const nonce = r.take(NONCE_BYTES);
       const length = r.u32();
@@ -241,7 +243,7 @@ export function parseDocument(wire: Uint8Array): Parsed {
         throw new KavachError("SIZE_LIMIT", stage, "record ciphertext length");
       }
       const ciphertext = r.take(length);
-      fields = { type, streamId, epoch, counter, sentAt, flags, kind: (flags & FLAG_KIND) === 0 ? 0 : 1, header, nonce, ciphertext };
+      fields = { type, streamId, epoch, counter, sentAt, flags, kind: (flags & FLAG_STATUS) !== 0 ? 2 : (flags & FLAG_KIND) !== 0 ? 1 : 0, header, nonce, ciphertext };
       break;
     }
     case DocumentType.AccountResetReceipt: {
@@ -377,7 +379,7 @@ export function encodeRecordHeader(f: { streamId: Uint8Array; epoch: number; cou
     .u32(f.epoch)
     .u32(f.counter)
     .u64(f.sentAt)
-    .u8(f.kind === 1 ? FLAG_KIND : 0)
+    .u8(f.kind === 2 ? FLAG_STATUS : f.kind === 1 ? FLAG_KIND : 0)
     .finish();
 }
 

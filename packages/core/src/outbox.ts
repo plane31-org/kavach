@@ -40,10 +40,12 @@ function requireReady(tx: Pick<Tx, "get">): void {
 /**
  * T6: require a usable active epoch under the current desired revision, enforce the queue limits,
  * seal once, write the outbox row and the own history row, and advance the counter. The record
- * id is returned only after commit.
+ * id is returned only after commit. A status (kind 2) is latest-wins: a status still queued when
+ * a newer one is enqueued is cancelled, never sent, and a status writes no history row.
  */
 export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8Array): Promise<{ recordId: Uint8Array; counter: number; epoch: number }> {
   const stage = "enqueue";
+  const superseded: Uint8Array[] = [];
   const result = await deps.store.transaction((tx) => {
     requireReady(tx);
     const revision = tx.get("revision", REVISION);
@@ -63,7 +65,12 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
     }
     let count = 0;
     let bytes = 0;
-    for (const [, row] of tx.list("outbox")) {
+    for (const [key, row] of tx.list("outbox")) {
+      if (kind === 2 && row.kind === 2 && row.status === "queued") {
+        tx.put("outbox", key, terminal(row, "cancelled", "superseded"));
+        superseded.push(fromHex(row.recordId));
+        continue;
+      }
       if (row.status === "queued" || row.status === "inflight") {
         count++;
         bytes += row.wire.length / 2;
@@ -94,20 +101,22 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
       attempts: 0,
       reason: undefined
     });
-    tx.put("history", id, {
-      recordId: id,
-      authorIdentityId: toHex(a.identityId),
-      streamId: toHex(a.streamId),
-      generation: big(a.generation),
-      epoch: epoch.epoch,
-      counter: sealed.counter,
-      kind,
-      sentAt: big(now),
-      receivedAt: big(now),
-      plaintext: toHex(payload),
-      superseded: false,
-      own: true
-    });
+    if (kind !== 2) {
+      tx.put("history", id, {
+        recordId: id,
+        authorIdentityId: toHex(a.identityId),
+        streamId: toHex(a.streamId),
+        generation: big(a.generation),
+        epoch: epoch.epoch,
+        counter: sealed.counter,
+        kind,
+        sentAt: big(now),
+        receivedAt: big(now),
+        plaintext: toHex(payload),
+        superseded: false,
+        own: true
+      });
+    }
     const nextCounter = epoch.nextCounter + 1;
     tx.put("epochs", String(epoch.epoch), { ...epoch, nextCounter, lastSentAt: big(now) });
     if (nextCounter > MAX_COUNTER) {
@@ -118,6 +127,7 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
   if ("rotate" in result) {
     throw new KavachError(result.rotate === "counterExhausted" ? "COUNTER_EXHAUSTED" : "ROTATION_REQUIRED", stage, result.rotate);
   }
+  for (const id of superseded) deps.events?.cancelled?.(id, "superseded");
   deps.events?.queued?.(result.recordId, kind);
   return result;
 }

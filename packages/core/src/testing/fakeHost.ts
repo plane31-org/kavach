@@ -15,7 +15,8 @@ import {
   type AccountDevice,
   type CircleSnapshot,
   type EncryptedRecord,
-  type EpochManifest
+  type EpochManifest,
+  type RecordKind
 } from "../codec.js";
 import { bodyHash, identityId, streamId as deriveStreamId, type SigningKeypair } from "../crypto.js";
 import type {
@@ -51,7 +52,7 @@ interface StoredRecord {
   acceptedAt: bigint;
   epoch: number;
   counter: number;
-  kind: 0 | 1;
+  kind: RecordKind;
   required: Set<string>; // reader certificate hashes
 }
 
@@ -417,7 +418,8 @@ export class FakeHost {
           for (const r of epoch.rows) {
             if (r.identityId === a.identityId) continue;
             const to = host.accountByIdentity(r.identityId)?.accountName ?? r.identityId;
-            host.notifications.push({ kind: rec.kind === 1 ? "checkIn" : "wake", to, from: a.accountName });
+            // A status (kind 2) carries no notification and needs no wake-up.
+            if (rec.kind !== 2) host.notifications.push({ kind: rec.kind === 1 ? "checkIn" : "wake", to, from: a.accountName });
           }
           if (required.size === 0) s.records.delete(seq);
           return outcome;

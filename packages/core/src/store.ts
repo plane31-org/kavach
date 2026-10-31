@@ -8,6 +8,7 @@
  * of the caller; the callback may initiate a transport send before commit through `tx.handoff`,
  * and must not await it inside; a writer that cannot acquire the lock gets `LOCKED`.
  */
+import type { RecordKind } from "./codec.js";
 import { KavachError } from "./errors.js";
 
 export interface SecretStore {
@@ -131,7 +132,7 @@ export interface OutboxRow {
   wire: string;
   epoch: number;
   counter: number;
-  kind: 0 | 1;
+  kind: RecordKind;
   sentAt: string;
   desiredRevision: string;
   status: OutboxStatus;
@@ -146,7 +147,7 @@ export interface HistoryRow {
   generation: string;
   epoch: number;
   counter: number;
-  kind: 0 | 1;
+  kind: RecordKind;
   sentAt: string;
   receivedAt: string;
   plaintext: string;
@@ -162,6 +163,18 @@ export interface LivePinRow {
   epoch: number;
   counter: number;
   sentAt: string;
+}
+
+/** The newest status (kind 2) per author: one row, never history. Keyed by author identity id. */
+export interface StatusRow {
+  recordId: string;
+  bodyHash: string;
+  generation: string;
+  epoch: number;
+  counter: number;
+  sentAt: string;
+  receivedAt: string;
+  payload: string;
 }
 
 export interface ReaderEpochRow {
@@ -244,6 +257,7 @@ export interface Tables {
   outbox: OutboxRow;
   history: HistoryRow;
   livePins: LivePinRow;
+  statuses: StatusRow;
   readerEpochs: ReaderEpochRow;
   subscriptions: SubscriptionRow;
   unresolved: UnresolvedRow;

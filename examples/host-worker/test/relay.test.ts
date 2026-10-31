@@ -148,6 +148,18 @@ describe("relay: deletion, expiry, cursors", () => {
     expect((await b2.client.sync()).inbox.stored).toBe(1);
   });
 
+  it("a status (kind 2) is relayed with no notification at all, and the reader keeps the newest", async () => {
+    const { a, b, aliceId } = await circleOfTwo();
+    const start = (await hostJson<unknown[]>("/v1/debug/notifications")).length;
+    await a.client.enqueueStatus(new Uint8Array([1, 64, 0, 3]));
+    await a.client.sync();
+    expect((await hostJson<unknown[]>("/v1/debug/notifications")).length).toBe(start);
+    await b.client.sync();
+    const latest = await b.client.latestStatus(aliceId);
+    expect(latest && [...latest.payload]).toEqual([1, 64, 0, 3]);
+    expect((await b.client.history({ authorIdentityId: aliceId })).some((h) => h.kind === 2)).toBe(false);
+  });
+
   it("24: a check-in survives a later location end to end, and each visible notification is sent once without a coordinate", async () => {
     const { a, b, aliceId } = await circleOfTwo();
     const start = (await hostJson<unknown[]>("/v1/debug/notifications")).length;

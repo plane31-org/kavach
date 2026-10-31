@@ -24,8 +24,7 @@ import {
   type EncryptedRecord,
   type EpochManifest,
   type ResetKeyList,
-  type AccountResetReceipt
-} from "../src/codec.js";
+  type AccountResetReceipt, encodeRecordHeader } from "../src/codec.js";
 import { accountKeypair, deviceSigningKeypair, identityId, ready, signingKeypairFromSeed, wrapHash, keyCommitment, type SigningKeypair } from "../src/crypto.js";
 import { KavachError } from "../src/errors.js";
 import { fixture, hex, str } from "./fixture.js";
@@ -153,7 +152,27 @@ describe("Vectors B to E rebuild byte for byte", () => {
   });
 });
 
-describe("all 21 negative vectors", () => {
+describe("status records (revision 6)", () => {
+  it("S: the status vector parses as kind 2, decrypts to the profile payload and rebuilds byte for byte", () => {
+    const v = fixture.status_record;
+    const wire = hex(v.wire);
+    const doc = expectType<EncryptedRecord>(verifyDocument(wire, aliceDsk.publicKey), DocumentType.EncryptedRecord);
+    expect([doc.kind, doc.flags, doc.epoch, doc.counter]).toEqual([v.expected.kind, v.expected.flags, v.expected.epoch, v.expected.counter]);
+    expect(toHex(openRecord(doc, hex(v.epoch_key)))).toBe(v.payload);
+    const rebuilt = buildEncryptedRecord(doc, hex(v.payload), hex(v.epoch_key), doc.nonce, aliceDsk.secretKey);
+    expect(toHex(rebuilt)).toBe(v.wire);
+  });
+
+  it("a header carries exactly one kind: 0, 1 or 2, and the two kind bits together are malformed", () => {
+    const base = { streamId: hex(alice.stream_id), epoch: 1, counter: 0, sentAt: now };
+    expect([0, 1, 2].map((kind) => encodeRecordHeader({ ...base, kind: kind as 0 | 1 | 2 })[50])).toEqual([0, 2, 4]);
+    const both = hex(fixture.status_record.wire);
+    both[50] = 6;
+    expect(code(() => parseDocument(both))).toBe("MALFORMED");
+  });
+});
+
+describe("all 22 negative vectors", () => {
   for (const n of fixture.negative_vectors) {
     it(`${n.name} -> ${n.expected}`, () => {
       const wire = hex(n.wire);

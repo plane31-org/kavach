@@ -2,7 +2,7 @@
 
 End-to-end encrypted location sharing and check-ins for circles of up to 100 accounts, through a server that stores only what it cannot open and deletes each record once every reader has it.
 
-Kavach v1, protocol revision 5, formerly SealedStream SS5. Wire version 5, unchanged since revision 2. October 2026. The companion document "Kavach v1: Moyo implementation profile" holds the platform, server and retention choices of the first host.
+Kavach v1, protocol revision 6, formerly SealedStream SS5. Wire version 5, unchanged since revision 2; revision 6 assigns a flag bit that was reserved. October 2026. The companion document "Kavach v1: Moyo implementation profile" holds the platform, server and retention choices of the first host.
 
 > **How to read this**
 >
@@ -54,6 +54,7 @@ This document is normative for Kavach v1. MUST and MUST NOT are requirements, SH
 | History lives on devices | Devices keep what they received under the host's retention policy. A replacement device never imports old keys or history. The server keeps a record only until every recipient has it. |
 | Recovery first, reset last | A new device recovers the account through a platform recovery provider or a saved recovery code. An explicit destructive reset exists for the case where both fail. |
 | Check-ins are durable events | A check-in is a record kind with its own id. Location updates never overwrite it, and the host notifies recipients of it visibly. |
+| Statuses are current state | A status is a record kind for the sender's small current state (battery, charging, permissions). Only the newest matters: latest wins in the outbox, newest per author on the reader, no pin movement, no history, no notification. |
 | Client-only SDK | The SDK owns cryptography and local security state. The host supplies authenticated login, a directory, an opaque relay, notifications and the interface. The SDK ships no server. |
 
 #### Fixed limits
@@ -276,19 +277,19 @@ Rows sort strictly by identity id, are unique, count 1 to 100, and include the a
 
 An epoch's manifest, wraps and author certificate stay on the host while an undelivered record references the epoch or the epoch is the author's current one; when neither holds the host deletes them. A reader keeps an opened `SK` until every record of that epoch it holds has been decrypted into local history or has expired. Generation and epoch checkpoints are persisted separately from key deletion. A replacement device never fetches old-device wraps or keys. An unexplained higher committed epoch for the local stream means local state was lost; the device replaces its stream under the same account rather than guessing counters. A self-wrap recovers `SK`, never a counter.
 
-### 9. Records: locations and check-ins
+### 9. Records: locations, check-ins and statuses
 
 #### Type 4: EncryptedRecord
 
 ```
 header = u8(5) || u8(4) || streamId[32] || epoch:u32 || counter:u32 || sentAt:u64 || flags:u8     -- 51 bytes
-flags  : bit 0 reserved, MUST be zero; bit 1 = kind (0 location, 1 check-in); bits 2-7 zero
+flags  : bit 0 reserved, MUST be zero; bit 1 = check-in; bit 2 = status; both set is invalid; bits 3-7 zero
 AAD    = C("record-aad") || header
 body   = header || nonce[24] || ciphertextLength:u32 || ciphertextAndTag
 wire   = body || Ed25519(DSK, C("record-sig") || body)
 ```
 
-Bit 0 carried an urgency flag in an earlier revision; this revision reserves it, so existing vectors remain valid and a check-in's kind alone decides how the host notifies. One global counter spans both kinds in an epoch. `sentAt` is the public send time in Unix milliseconds, not an authoritative capture time. Encrypt with the active `SK` and a fresh nonce; ciphertext length is plaintext length plus 16, between 16 and 4,112. The signature covers the entire body; the AAD covers the header. A retry resends the persisted bytes and never changes nonce, counter or `sentAt`.
+Bit 0 carried an urgency flag in an earlier revision; this revision reserves it, so existing vectors remain valid and the kind alone decides how the host notifies. Kind is 0 (location) with neither bit, 1 (check-in) with bit 1, 2 (status) with bit 2; bit 2 was reserved before revision 6, so a revision 5 reader rejects a status as malformed and every reader adopts revision 6 before any sender emits one. One global counter spans every kind in an epoch. `sentAt` is the public send time in Unix milliseconds, not an authoritative capture time. Encrypt with the active `SK` and a fresh nonce; ciphertext length is plaintext length plus 16, between 16 and 4,112. The signature covers the entire body; the AAD covers the header. A retry resends the persisted bytes and never changes nonce, counter or `sentAt`.
 
 **Verification.** Resolve the author's current certificate and the manifest for (`streamId`, `epoch`); verify stream and certificate bindings, then the `DSK` signature, then decrypt. Zero epoch, reserved flags, out-of-range lengths and trailing bytes are invalid. A known superseded author device cannot supply a new live pin (`SUPERSEDED_DEVICE`); its previously accepted records may still be verified under the archived certificate and manifest and stored as history.
 
@@ -303,6 +304,10 @@ Latitude in -900,000,000 to 900,000,000; longitude in -1,800,000,000 to 1,800,00
 #### Check-ins
 
 A check-in is a record with kind 1. Its `recordId` is its stable event id. It may carry the location codec or an application payload. Each accepted check-in is durably queued and retried until server acceptance, explicit security cancellation or configured expiry; a later location never replaces it, in the outbox, on the relay or on the reader. The host notifies each recipient of a check-in visibly, with no record content; the protocol does not promise that every person saw it.
+
+#### Statuses
+
+A status is a record with kind 2: the sender's small current state, in an application payload the host defines and versions, which the protocol does not parse. Only the newest matters, which gives it four properties. In the outbox, latest wins: a status still queued when a newer one is enqueued is cancelled with reason `superseded` and never sent; a status already handed to the network is not recalled, and a check-in is never dropped this way. On the reader, the newest status per author is kept, by the same (generation, epoch, counter) order as the live pin and only from the author's current device; an older one changes nothing, and a different body under a retained status id is `EQUIVOCATION`. A status never moves the live pin, never counts as a check-in and is never history, on the sender or the reader: there is one row per author, read as `latestStatus`, replaced in place and dropped with the author's keys when the author leaves. A status carries no notification and needs no wake-up; readers pick it up on their next sync.
 
 ### 10. Delivery and deletion
 
@@ -325,7 +330,7 @@ A single serialised sender drains the outbox in (epoch, counter) order with one 
 7. **Append checkpoint.** The relay keeps per stream one high-water (epoch, counter) pair and the outcome of the last append (`recordId`, body hash, `deliverySeq`, acceptance time), updated atomically with each append. Within the profile's `appendRetryWindowMs`, a retry matching the last outcome returns it even after the ciphertext was deleted; a different body at that slot is `EQUIVOCATION`. An append at or below the high-water pair with no matching evidence is `STALE_APPEND`: nothing is reinserted and no success is invented. The client records that record as `acceptanceUnknown`, keeps its own history entry, stops retrying it and, for a location, asks for a fresh sample; it never re-creates a check-in on its own, which could duplicate the event. Appends for a retired device stream are refused by the certificate fence and never recreate deleted stream state.
 8. **Epoch material.** A manifest, its wraps and the author's certificate are retained while the epoch is current or any retained record references it, and deleted when neither holds; a certificate shared by several epochs or by trust state stays while any of them still needs it. The expiry watermark is one less than the sequence of the oldest retained record whose deadline has not passed, or the tail when nothing is retained, so records already deleted by acknowledgement need no timestamps of their own.
 9. Sequences, cursors and watermarks are transport state, never authorization. A missing record is `NOT_FOUND`, not proof that it never existed.
-10. On a check-in append the host notifies each recipient visibly; on a location append it wakes the recipient silently. Neither carries record content.
+10. On a check-in append the host notifies each recipient visibly; on a location append it wakes the recipient silently; on a status append it does neither. No notification carries record content.
 
 #### Receiving
 
@@ -416,7 +421,7 @@ Old and new ids must differ. For an unseen receipt the SDK requires a fresh key 
 
 - `initializeAccount()` creates the account, its first device and vault and saves the `recoveryKey` through the provider; it returns without a recovery code. `recoveryStatus()` reports the provider's `backupState`; `recoveryCode()` reveals the code on demand after local authentication.
 - `restoreAccount(optionalCode)` recovers the account and activates a fresh device under it, trying the provider first.
-- `enqueueLocation(location)`, `enqueueCheckIn(location | bytes)`, `enqueue(bytes)`: durable outbound records.
+- `enqueueLocation(location)`, `enqueueCheckIn(location | bytes)`: durable outbound records. `enqueueStatus(bytes)`: the sender's current state, latest wins while queued. `latest(identityId)` and `latestStatus(identityId)` read an author's live pin and newest status; `statusUpdated` is emitted when the latter changes.
 - `sync()` first finishes a pending reset or activation, then publishes pending owner snapshots and vault updates, then verifies metadata (certificates, snapshots, the reset-key list when due), reconciles epochs, drains the outbox, reads and acknowledges batches. Concurrent callers coalesce.
 - `receive(wire)` for a record pushed by the host outside `sync`; `history(query)` and `latest(identityId)` read the durable state; `inspect()` returns public metadata only.
 - `circles.create()`, `requestJoin(circleId, ownerIdentityId, { shareOnApproval })`, `approve(circleId, accountName)`, `remove(circleId, memberIdentityId)`, `leave(circleId)`, `setEnabled(circleId, bool)`, `closeCircle(circleId)`. Device replacement never calls any of these.
@@ -426,7 +431,7 @@ Old and new ids must differ. For an unseen receipt the SDK requires a fresh key 
 
 - Directory: `registerAccount(certificate, vault)` (`ALREADY_COMMITTED` when the name already carries exactly this certificate, so an interrupted enrollment resumes), `resolveAccounts(names)`, `resolveIdentities(identityIds)` (a snapshot names identities; the directory maps them back to accounts, host-trusted like first contact, and attaches the reset receipt when an account's key changed through a reset), `getCertificate(hash)`, `activateDevice(expectedCertificateHash, expectedVaultRevision, expectedVaultHash, newCertificate, newVault)`, `getVault(accountName)`, `publishVault(expectedRevision, expectedHash, newVault)`, `getCircle(circleId)`, `publishOwnedCircle(circleId, expectedRevision, expectedHash, newSnapshot)`, `requestJoin(circleId)`, `requestLeave(circleId)`, `readRequests(circleId)`, `getResetKeyList()`, `resetAccount(...)`, `getResetReceipt(resetId)`.
 - Relay: `getCurrentEpoch(streamId)`, `getEpoch(streamId, epoch)` returning the manifest plus the caller's wrap, `publishEpoch(streamId, expectedEpoch, expectedHash, manifest, wrapMap)`, `appendRecord(recordId, wire)`, `readRecords(streamId, afterSeq, limit)`, `ackThrough(streamId, cursor)`. The host creates a reader's subscription to a stream at admission, at device activation and when an author opens a new stream; the client never asks for one. The transport's `send` MUST be callable from inside T6h without awaiting.
-- Notifications are the host's: a visible notification to the owner on a join request and to each recipient on a check-in append; a silent wake-up otherwise. The SDK never composes notification text.
+- Notifications are the host's: a visible notification to the owner on a join request and to each recipient on a check-in append; a silent wake-up on a location append; nothing on a status append. The SDK never composes notification text.
 
 Mutation outcomes are `COMMITTED`, `ALREADY_COMMITTED` (same bytes), `CONFLICT` (with the current bytes), `IGNORED_OLDER`, `RETRYABLE`, `UNAUTHORIZED` or `PERMANENT_FAILURE`. Timeouts are uncertain: re-read the target and compare bytes. Use a 30-second timeout and a uniform random delay of 0 to min(60 s, 2^min(attempt, 6) s) between attempts, one pending operation per target. A retry re-enters T6h like a first send.
 
@@ -489,6 +494,10 @@ An independent review of the composed protocol, the recovery flows, the store bi
 #### Revision 5
 
 Revision 5 changes no wire byte and no vector. It corrects the durable-state rules that the first implementation and its fault harness exposed: promotion is idempotent and a pending epoch is never overwritten; pending owner snapshots and vault updates are published by every sync; the own reset is persisted before it is sent and the host answers a repeated `resetId` before any identity check; receipt acceptance commits with its effects; a completed approval keeps the newer sharing preference; a circle with no other member closes; the recovery-key save is retried on the first sync; an interrupted enrollment resumes on `ALREADY_COMMITTED`; and a record whose epoch the host served unverifiable is held as `keyPending` with the error named.
+
+#### Revision 6
+
+Revision 6 assigns flag bit 2 of the record header, reserved until now, to a third record kind, the status (section 9), and changes nothing else on the wire. The fixture's reserved-flag negative moves to bit 3, a negative with bits 1 and 2 both set is added, and a status record vector is added; every other vector is unchanged. Readers adopt revision 6 before any sender emits a status, since a revision 5 reader rejects one as malformed.
 
 ### 17. Questions for the reviewer
 
@@ -616,7 +625,7 @@ A clock adapter keeps a durable time high-water mark and monotonic elapsed time 
 | Directory (D1) | Accounts keyed by `accountName` with the current certificate pointer and generation; immutable certificates by hash; snapshots by `circleId` with compare-and-swap on revision and hash; vaults by account with compare-and-swap on revision and hash; pending join and leave requests by circle and account, expiring after 7 days; reset receipts by `resetId`; the current reset-key list. Sessions authenticate the account and its current device; a superseded device is refused every write. Activation emits a metadata hint to every circle the account is in. `registerAccount` answers `ALREADY_COMMITTED` for a name that already carries exactly the submitted certificate, and `resetAccount` checks the `resetId` before the identity. |
 | Relay (`UserDO`) | One Durable Object per author: current epoch and fence; the author's retained records keyed by `deliverySeq` with their acceptance time; one subscription row per reader device with its `ackCursor`; the `expiredThrough` watermark; the manifests and wraps of every epoch that is current or still referenced by a retained record; the per-stream high-water (epoch, counter) pair and last-append outcome. `readRecords` filters by the subscription's certificate. `appendRecord`, `readRecords` and `ackThrough` run here. Deletion on a cursor advance runs inline in the same transaction; the expiry prefix advances on an alarm. The Durable Object's single-threaded storage transaction gives the serialisation the protocol requires without extra locking. |
 | Fan-out (`CircleDO`) | Presence and wake-ups only: on append, notify each recipient's socket that its mailbox has new sequence numbers. It stores no record. |
-| Notifications | Silent pushes wake a closed app for locations and key handoffs. Two events are visible notifications through Expo push: a join request, sent to the owner with the requester's name, and a check-in, sent to each recipient with the sender's name and the app's generic wording. Neither carries a coordinate or a payload. Notification permission is asked for these two and the app's own alerts. |
+| Notifications | Silent pushes wake a closed app for locations and key handoffs; a status append sends nothing. Two events are visible notifications through Expo push: a join request, sent to the owner with the requester's name, and a check-in, sent to each recipient with the sender's name and the app's generic wording. Neither carries a coordinate or a payload. Notification permission is asked for these two and the app's own alerts. |
 | Reset authority | An endpoint that, after fresh re-authentication, signs the type 7 receipt with the active operational key held as a Worker secret. The management key signs a new type 8 list offline every 14 days with a 30-day lifetime; `app.config.ts` pins the management public key and the minimum list version. A standby operational key stays offline until the active one is retired by a new list. |
 | Removed | The server-side trail in the user's Durable Object, past days in R2, device lists, pending devices, key requests, archives and the circle log tables. The Worker keeps no location after delivery. |
 
@@ -628,7 +637,30 @@ A clock adapter keeps a durable time high-water mark and monotonic elapsed time 
 - **A new phone shows people as they arrive.** After `restoreAccount`, the map shows each circle member as "waiting for their phone" while that author's current epoch has no key for the new device, until the author's next sync delivers one. Online authors arrive within a minute; offline ones when they wake. The app never shows a blank map or a stale pin as live.
 - **A pin older than a day leaves the map.** With a 24-hour history and a 24-hour delivery window, a person silent for a day shows as last seen with no position rather than a day-old dot. A reader back after a weekend sees each person again on their next update.
 - **Join requests notify the owner.** The owner's approval screen opens from the notification. Approval is one tap; the requester starts sharing on approval unless they turned that off when requesting.
-- **Check-ins notify recipients visibly.** The notification carries the sender's name and generic wording; the app decrypts the check-in when opened. Locations never notify.
+- **Check-ins notify recipients visibly.** The notification carries the sender's name and generic wording; the app decrypts the check-in when opened. Locations and statuses never notify.
+- **Phone facts travel as statuses.** Battery, charging, Low Power Mode, mock location and location permission are a status record (kind 2) with the payload and send rules below, shown next to the person's pin with its age. A reader who just joined sees them with the first location after admission, because the app sends a status whenever the SDK asks it for a fresh location.
+
+#### Status payload and send rules
+
+```
+payload = version:u8 = 1 || batteryPercent:u8 (0-100, 255 unknown) || flags:u8 || permission:u8   -- 4 bytes
+flags   : bit 0 charging, bit 1 Low Power Mode, bit 2 mock location, bit 3 precise location; bits 4-7 zero
+permission : 0 unknown, 1 denied, 2 while in use, 3 always
+```
+
+Unknown versions are shown as "no details" and never rejected: the SDK does not parse the payload, and a newer phone's status must not break an older reader. The app sends on change, with thresholds that make change rare, and a slow floor so a fresh reader is never left with nothing:
+
+| Trigger | When |
+| --- | --- |
+| Battery level | When it crosses a 5 percent step, and immediately at 20 and 10 percent |
+| Charging started or stopped | Immediately |
+| Low Power Mode on or off | Immediately |
+| Location permission or precision changed | Immediately, since it explains a dot that stops moving |
+| The SDK asks for a fresh location (`needsLocation`) | With that location, so a new member or a new epoch starts with the phone facts |
+| Floor | Once per app start, and at most every 6 hours if nothing changed |
+| Ceiling | Never more than one per minute; the outbox collapses bursts anyway |
+
+That is five to fifteen statuses per phone per day against a few hundred locations.
 - **Leaving a circle takes effect locally at once.** The leaver stops sending and stops seeing that circle's members immediately; the owner's removal follows when the owner is next online.
 - **One active phone.** Setting up the app on a second phone retires the first. The settings screen says so before activation.
 - **Reset is a last resort with a warning.** The reset screen states that circles owned by this account will close and that every other circle will need to re-admit the account.

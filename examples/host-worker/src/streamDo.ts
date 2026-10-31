@@ -195,7 +195,8 @@ export class StreamDO extends DurableObject<Env> {
       }
     });
     void this.ctx.storage.setAlarm(Number(acceptedAt + BigInt(this.env.DELIVERY_WINDOW_MS)));
-    const notify = rows.filter((r) => r.identityId !== b.callerIdentityId).map((r) => ({ identityId: r.identityId, kind: rec.kind === 1 ? "checkIn" : "wake" }));
+    // A status (kind 2) carries no notification and needs no wake-up; readers pick it up on their next sync.
+    const notify = rec.kind === 2 ? [] : rows.filter((r) => r.identityId !== b.callerIdentityId).map((r) => ({ identityId: r.identityId, kind: rec.kind === 1 ? "checkIn" : "wake" }));
     return { status: "ACCEPTED", deliverySeq: String(seq), notify };
   }
 

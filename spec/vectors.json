@@ -135,7 +135,7 @@
     },
     {
       "name": "N05_reserved_flag",
-      "wire": "0504a89beb7c45b0826eb6cc57893b3b4d4edd58009ab860e420af234ee9e8d313a900000001000000000000018bcfe5680004000102030405060708090a0b0c0d0e0f1011121314151617000000268084a42f266ca07c97aa13dd631c8b29d8b382f33386e11ce0ee6d99b06269e829d8a6e949343b894c985fab2b14c0ca9403e5979c1323226193f9ef9ec0536435fc8e9cae62afc04ee72d1598d49471c72919d66f8be3798a1d8effd7e687f00979b877e80e",
+      "wire": "0504a89beb7c45b0826eb6cc57893b3b4d4edd58009ab860e420af234ee9e8d313a900000001000000000000018bcfe5680008000102030405060708090a0b0c0d0e0f1011121314151617000000268084a42f266ca07c97aa13dd631c8b29d8b382f33386e11ce0ee6d99b06269e829d8a6e949343b894c985fab2b14c0ca9403e5979c1323226193f9ef9ec0536435fc8e9cae62afc04ee72d1598d49471c72919d66f8be3798a1d8effd7e687f00979b877e80e",
       "verification_key": "a51f41bb4f808ec7baf67a6c645db26540a0f26b2aee53d49a79cefc66710d45",
       "operation": "verify",
       "expected": "MALFORMED"
@@ -248,6 +248,13 @@
     {
       "name": "N21_reserved_bit0",
       "wire": "0504a89beb7c45b0826eb6cc57893b3b4d4edd58009ab860e420af234ee9e8d313a900000001000000000000018bcfe5680001000102030405060708090a0b0c0d0e0f1011121314151617000000268084a42f266ca07c97aa13dd631c8b29d8b382f33386e11ce0ee6d99b06269e829d8a6e949343b894c985fab2b14c0ca9403e5979c1323226193f9ef9ec0536435fc8e9cae62afc04ee72d1598d49471c72919d66f8be3798a1d8effd7e687f00979b877e80e",
+      "verification_key": "a51f41bb4f808ec7baf67a6c645db26540a0f26b2aee53d49a79cefc66710d45",
+      "operation": "verify",
+      "expected": "MALFORMED"
+    },
+    {
+      "name": "N22_two_kind_bits",
+      "wire": "0504a89beb7c45b0826eb6cc57893b3b4d4edd58009ab860e420af234ee9e8d313a900000001000000000000018bcfe5680006000102030405060708090a0b0c0d0e0f1011121314151617000000268084a42f266ca07c97aa13dd631c8b29d8b382f33386e11ce0ee6d99b06269e829d8a6e949343b894c985fab2b14c0ca9403e5979c1323226193f9ef9ec0536435fc8e9cae62afc04ee72d1598d49471c72919d66f8be3798a1d8effd7e687f00979b877e80e",
       "verification_key": "a51f41bb4f808ec7baf67a6c645db26540a0f26b2aee53d49a79cefc66710d45",
       "operation": "verify",
       "expected": "MALFORMED"
@@ -419,6 +426,20 @@
     "X25519: libsodium public keys exactly equal OpenSSL cryptography public keys",
     "Sealed-box construction: libsodium crypto_box output accepted by libsodium crypto_box_seal_open (same backend, not independent)"
   ],
+  "status_record": {
+    "wire": "0504a89beb7c45b0826eb6cc57893b3b4d4edd58009ab860e420af234ee9e8d313a900000002000000070000018bcfe5680004303132333435363738393a3b3c3d3e3f40414243444546470000001479cfbc1dd008bf7a7c3ff686f0c2e080c5ab2ffdc7460eb7c25c6f7de0cd90bd48d9b080f9d28197fad347ae7518b9ed53377f6db5e009f9f4bf775537e68c423425a1a192a130b651614270cc57ea52aec27901",
+    "record_id": "842c10f10ec5ea584085533476cd25e147007fbdfd608a57a971fac8d0bd2ac4",
+    "epoch_key": "90afe7d0deaaa9b6c7a47dd3a8cbe8a56f2cf4de7fb5e346ab30bb9592f9e74f",
+    "payload": "01490903",
+    "expected": {
+      "kind": 2,
+      "flags": 4,
+      "epoch": 2,
+      "counter": 7,
+      "pins": false,
+      "notifies": false
+    }
+  },
   "boundary_100": {
     "seed_rule": "For i=1..99: accountSeed=H(C(\"fixture-account\")||u32(i)); deviceSeed=H(C(\"fixture-device\")||u32(i)); ephemeral seed for all i=0..99: H(C(\"fixture-ephemeral\")||u32(i)). i=0 is Alice. DeviceId=H(C(\"fixture-device-id\")||deviceSeed)[:16]. TEST ONLY.",
     "epoch_key": "90afe7d0deaaa9b6c7a47dd3a8cbe8a56f2cf4de7fb5e346ab30bb9592f9e74f",

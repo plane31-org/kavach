@@ -115,13 +115,29 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   }
   const id = toHex(opened.recordId);
   const hash = toHex(bodyHash(opened.record.body));
+  const cert = [...author.view.certificates.values()].find((c) => equalBytes(c.streamId, parsed.streamId));
+  const generation = unbig(tx.list("certificates").find(([, c]) => c.streamId === toHex(parsed.streamId))?.[1].generation ?? "0");
+  const base = { recordId: opened.recordId, authorIdentityId: author.identityId, kind: parsed.kind };
+  if (parsed.kind === 2) {
+    // A status is the author's current state, not an event: one row per author, newest slot wins,
+    // never a pin, never a check-in, never history. An older or superseded one changes nothing.
+    const key = toHex(author.identityId);
+    const current = tx.get("statuses", key);
+    if (current?.recordId === id) {
+      if (current.bodyHash === hash) return { result: "duplicate", recordId: opened.recordId };
+      return { result: "invalid", reason: "EQUIVOCATION" };
+    }
+    if (opened.superseded || !cert?.current) return { result: "history", ...base };
+    const slot = { generation, epoch: parsed.epoch, counter: parsed.counter };
+    if (current && compareSlots(slot, { generation: unbig(current.generation), epoch: current.epoch, counter: current.counter }) <= 0) return { result: "history", ...base };
+    tx.put("statuses", key, { recordId: id, bodyHash: hash, generation: big(generation), epoch: parsed.epoch, counter: parsed.counter, sentAt: big(parsed.sentAt), receivedAt: big(now), payload: toHex(opened.plaintext) });
+    return { result: "updated", ...base };
+  }
   const existing = tx.get("history", id);
   if (existing) {
     if (existing.bodyHash === hash) return { result: "duplicate", recordId: opened.recordId };
     return { result: "invalid", reason: "EQUIVOCATION" };
   }
-  const cert = [...author.view.certificates.values()].find((c) => equalBytes(c.streamId, parsed.streamId));
-  const generation = unbig(tx.list("certificates").find(([, c]) => c.streamId === toHex(parsed.streamId))?.[1].generation ?? "0");
   const row: HistoryRow = {
     recordId: id,
     authorIdentityId: toHex(author.identityId),
@@ -149,7 +165,6 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
       moved = true;
     }
   }
-  const base = { recordId: opened.recordId, authorIdentityId: author.identityId, kind: parsed.kind };
   return moved || parsed.kind === 1 ? { result: "updated", ...base } : { result: "history", ...base };
 }
 
@@ -362,9 +377,25 @@ export async function latest(store: Store, authorIdentityId: Uint8Array, now: bi
   });
 }
 
+export interface LatestStatus {
+  readonly recordId: Uint8Array;
+  readonly payload: Uint8Array;
+  readonly sentAt: bigint;
+  readonly ageMs: bigint;
+}
+
+/** The author's newest status (kind 2), with its age. */
+export async function latestStatus(store: Store, authorIdentityId: Uint8Array, now: bigint): Promise<LatestStatus | undefined> {
+  return store.read((tx) => {
+    const row = tx.get("statuses", toHex(authorIdentityId));
+    if (!row) return undefined;
+    return { recordId: fromHex(row.recordId), payload: fromHex(row.payload), sentAt: unbig(row.sentAt), ageMs: now - unbig(row.sentAt) };
+  });
+}
+
 /** Retention: drop history outside the windows; a pin whose record is gone disappears with it. */
 export async function purgeHistory(store: Store, policy: RetentionPolicy, now: bigint): Promise<number> {
-  const expired = (kind: 0 | 1, sentAt: string): boolean => unbig(sentAt) + (kind === 0 ? policy.locationHistoryMs : policy.checkInHistoryMs) <= now;
+  const expired = (kind: RecordKind, sentAt: string): boolean => unbig(sentAt) + (kind === 0 ? policy.locationHistoryMs : policy.checkInHistoryMs) <= now;
   // Read first: most syncs purge nothing and must not take the writer lock for it.
   const any = await store.read((tx) => tx.list("history").some(([, r]) => expired(r.kind, r.sentAt)));
   if (!any) return 0;
@@ -389,6 +420,7 @@ export async function forgetAuthor(store: Store, authorIdentityId: Uint8Array): 
 /** The same, inside a caller's transaction. */
 export function forgetAuthorIn(tx: Tx, authorIdentityId: Uint8Array): void {
   tx.delete("livePins", toHex(authorIdentityId));
+  tx.delete("statuses", toHex(authorIdentityId));
   for (const [, c] of tx.list("certificates")) {
     if (c.identityId !== toHex(authorIdentityId)) continue;
     for (const [k] of tx.list("readerEpochs", c.streamId + ":")) tx.delete("readerEpochs", k);

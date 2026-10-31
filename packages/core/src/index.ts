@@ -1,5 +1,5 @@
 /**
- * @kavach/core: Kavach v1 protocol (revision 4, wire version 5).
+ * @kavach/core: Kavach v1 protocol (revision 6, wire version 5).
  *
  * This entry is what an application imports: the client, its types, the errors and the few
  * helpers an app needs around it. Adapter and host authors import `@kavach/core/adapters`;
@@ -7,7 +7,7 @@
  * `@kavach/core/sodium`. Everything else is internal and reachable only by relative import.
  */
 export const PROTOCOL_NAME = "Kavach";
-export const PROTOCOL_REVISION = 4;
+export const PROTOCOL_REVISION = 6;
 
 // The client ---------------------------------------------------------------------------------------
 export {
@@ -21,6 +21,7 @@ export {
   type HistoryQuery,
   type Inspection,
   type Latest,
+  type LatestStatus,
   type OpenOptions,
   type PauseReason,
   type ReceiveResult,

@@ -64,6 +64,7 @@ export {
   type SecretName,
   type SecretStore,
   type SelfRow,
+  type StatusRow,
   type Store,
   type StoreState,
   type StreamRow,
