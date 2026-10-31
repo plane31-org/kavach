@@ -38,6 +38,7 @@
     "libsodium-wrappers-sumo": "^0.7.15"
   },
   "devDependencies": {
-    "@types/libsodium-wrappers-sumo": "^0.7.8"
+    "@types/libsodium-wrappers-sumo": "^0.7.8",
+    "esbuild": "0.21.5"
   }
 }

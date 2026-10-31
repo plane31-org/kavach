@@ -16,7 +16,7 @@ import { drain, enqueue, outboxCount } from "./outbox.js";
 import { validatePolicy, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
-import type { CircleRow, SecretStore, Store, Tx } from "./store.js";
+import type { CircleRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
 import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9Vault } from "./transactions.js";
 import type { Transport, TransportHint } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
@@ -988,18 +988,22 @@ class ClientImpl implements Client {
     const recoveryKey = await this.secrets.get("recoveryKey");
     const accountSeed = await this.secrets.get("accountSeed");
     if (!recoveryKey || !accountSeed) throw new KavachError("RECOVERY_REQUIRED", "vault");
+    const accountKey = account.account.publicKey;
+    // A write the host never confirmed is settled first: this update is built on its outcome.
+    const unconfirmed = await this.store.read((tx) => tx.get("vault", VAULT));
+    if (unconfirmed?.pending) await this.settlePendingVault(unconfirmed, recoveryKey, accountKey);
     for (let attempt = 0; attempt < 3; attempt++) {
       const row = await this.store.read((tx) => tx.get("vault", VAULT));
       let entries: readonly VaultEntry[] = [];
       let revision = 0n;
       let hash: Uint8Array | undefined;
       if (row) {
-        const opened = openVault(fromHex(row.wire), recoveryKey, this.accountName, account.account.publicKey);
+        const opened = openVault(fromHex(row.wire), recoveryKey, this.accountName, accountKey);
         entries = opened.entries;
         revision = unbig(row.revision);
         hash = fromHex(row.hash);
       }
-      const next = buildVault({ accountName: this.accountName, accountKey: account.account.publicKey, vaultRevision: revision + 1n }, { accountSeed, lastDeviceGeneration: pin.generation, lastCertificateHash: pin.certificateHash, entries: mutate(entries) }, recoveryKey);
+      const next = buildVault({ accountName: this.accountName, accountKey, vaultRevision: revision + 1n }, { accountSeed, lastDeviceGeneration: pin.generation, lastCertificateHash: pin.certificateHash, entries: mutate(entries) }, recoveryKey);
       await this.store.transaction((tx) => t9Vault(tx, { revision: big(revision + 1n), hash: toHex(next.hash), wire: toHex(next.wire), pending: true }));
       const outcome = await this.transport.directory.publishVault({ expectedRevision: revision, expectedHash: hash, newVault: next.wire });
       if (outcome.status === "COMMITTED" || outcome.status === "ALREADY_COMMITTED") {
@@ -1007,13 +1011,42 @@ class ClientImpl implements Client {
         return;
       }
       if (outcome.status === "CONFLICT" && outcome.current) {
-        const h = parseVaultHeader(outcome.current);
-        await this.store.transaction((tx) => t9Vault(tx, { revision: big(h.vaultRevision), hash: toHex(h.hash), wire: toHex(outcome.current ?? new Uint8Array()), pending: false }));
+        await this.adoptCurrentVault(outcome.current, recoveryKey, accountKey, revision);
         continue;
       }
       throw new KavachError("STORAGE_FAILURE", "vault", `publishVault ${outcome.status}`);
     }
     throw new KavachError("STORAGE_FAILURE", "vault", "vault conflict persisted");
+  }
+
+  /**
+   * Publish the exact bytes of a vault write the host never confirmed. Either the host has them
+   * now ("committed") or its current vault replaces the unconfirmed one locally ("adopted").
+   */
+  private async settlePendingVault(row: VaultRow, recoveryKey: Uint8Array, accountKey: Uint8Array): Promise<"committed" | "adopted"> {
+    const localRevision = unbig(row.revision) - 1n;
+    const outcome = await this.transport.directory.publishVault({ expectedRevision: localRevision, expectedHash: undefined, newVault: fromHex(row.wire) });
+    if (outcome.status === "COMMITTED" || outcome.status === "ALREADY_COMMITTED") {
+      await this.store.transaction((tx) => t9Vault(tx, { ...row, pending: false }));
+      return "committed";
+    }
+    if (outcome.status === "CONFLICT" && outcome.current) {
+      await this.adoptCurrentVault(outcome.current, recoveryKey, accountKey, localRevision);
+      return "adopted";
+    }
+    throw new KavachError("STORAGE_FAILURE", "vault", `publishVault ${outcome.status}`);
+  }
+
+  /**
+   * Take the host's current vault as the local committed one. It has to open under this account's
+   * recovery key, be bound to this account, and not fall behind the revision already committed
+   * locally; otherwise the local copy is kept and the caller fails.
+   */
+  private async adoptCurrentVault(current: Uint8Array, recoveryKey: Uint8Array, accountKey: Uint8Array, localRevision: bigint): Promise<void> {
+    const { header } = openVault(current, recoveryKey, this.accountName, accountKey);
+    if (header.vaultRevision < localRevision) throw new KavachError("ROLLBACK", "vault", `host vault at ${header.vaultRevision}, local at ${localRevision}`);
+    const { hash } = parseVaultHeader(current);
+    await this.store.transaction((tx) => t9Vault(tx, { revision: big(header.vaultRevision), hash: toHex(hash), wire: toHex(current), pending: false }));
   }
 
   private async createCircle(): Promise<{ circleId: Uint8Array }> {
@@ -1148,11 +1181,10 @@ class ClientImpl implements Client {
   private async republishPendingVault(): Promise<void> {
     const row = await this.store.read((tx) => tx.get("vault", VAULT));
     if (!row?.pending) return;
-    const outcome = await this.transport.directory.publishVault({ expectedRevision: unbig(row.revision) - 1n, expectedHash: undefined, newVault: fromHex(row.wire) });
-    if (outcome.status === "COMMITTED" || outcome.status === "ALREADY_COMMITTED") {
-      await this.store.transaction((tx) => t9Vault(tx, { ...row, pending: false }));
-      return;
-    }
+    const { account } = this.requireAccount("vault");
+    const recoveryKey = await this.secrets.get("recoveryKey");
+    if (!recoveryKey) throw new KavachError("RECOVERY_REQUIRED", "vault");
+    if ((await this.settlePendingVault(row, recoveryKey, account.account.publicKey)) === "committed") return;
     const rows = await this.store.read((tx) => tx.list("circles").map(([, r]) => r));
     await this.vaultUpdate((entries) => this.reconcileEntries(entries, rows));
   }

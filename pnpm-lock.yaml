@@ -32,7 +32,7 @@ importers:
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: ^0.5.0
-        version: 0.5.41(@cloudflare/workers-types@4.20260702.1)
+        version: 0.5.41(@cloudflare/workers-types@4.20260702.1)(@vitest/runner@2.1.9)(@vitest/snapshot@2.1.9)(vitest@2.1.9(@types/node@26.6.6))
       '@cloudflare/workers-types':
         specifier: ^4.20260702.1
         version: 4.20260702.1
@@ -58,6 +58,9 @@ importers:
       '@types/libsodium-wrappers-sumo':
         specifier: ^0.7.8
         version: 0.7.8
+      esbuild:
+        specifier: 0.21.5
+        version: 0.21.5
 
   packages/expo:
     dependencies:
@@ -1684,14 +1687,17 @@ snapshots:
     optionalDependencies:
       workerd: 1.20250718.0
 
-  '@cloudflare/vitest-pool-workers@0.5.41(@cloudflare/workers-types@4.20260702.1)':
+  '@cloudflare/vitest-pool-workers@0.5.41(@cloudflare/workers-types@4.20260702.1)(@vitest/runner@2.1.9)(@vitest/snapshot@2.1.9)(vitest@2.1.9(@types/node@26.6.6))':
     dependencies:
+      '@vitest/runner': 2.1.9
+      '@vitest/snapshot': 2.1.9
       birpc: 0.2.14
       cjs-module-lexer: 1.4.3
       devalue: 4.3.3
       esbuild: 0.17.19
       miniflare: 3.20241230.0
       semver: 7.8.5
+      vitest: 2.1.9(@types/node@26.6.6)
       wrangler: 3.100.0(@cloudflare/workers-types@4.20260702.1)
       zod: 3.25.76
     transitivePeerDependencies:
