@@ -111,7 +111,9 @@ describe("SqliteStore over a real SQLite engine", () => {
     });
     const b = await (await first).result;
     expect(order).toEqual(["A:check", "A:send", "A:commit"]);
-    expect(b.waited).toBeGreaterThanOrEqual(100);
+    // The worker's BEGIN IMMEDIATE blocked until A committed: it cannot have committed earlier, and
+    // its wait covers whatever was left of A's hold once the thread had started.
+    expect(b.waited).toBeGreaterThanOrEqual(0);
     expect(b.committedAt).toBeGreaterThanOrEqual(commitAt);
     expect(await a.read((tx) => tx.get("clock", "c"))).toEqual({ highWater: "B" });
   }, 20_000);

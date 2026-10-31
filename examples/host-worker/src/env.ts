@@ -9,8 +9,6 @@ export interface Env {
   RESET_KEY_ID?: string;
   /** Hex wire of the current management-signed key list. */
   RESET_KEY_LIST?: string;
-}
-declare global {
-  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
-  interface Env extends import("./env.js").Env {}
+  /** "true" lets a request carry X-Test-Now to drive the host clock. Tests only. */
+  ALLOW_TEST_CLOCK?: string;
 }
