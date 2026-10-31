@@ -9,6 +9,9 @@ export default defineWorkersConfig(async () => {
     resolve: { alias: { "@kavach/core/testing": coreTesting, "@kavach/core": core } },
     test: {
       include: ["test/**/*.test.ts"],
+      // Integration tests over workerd: the default 5 s is too tight on a loaded CI runner.
+      testTimeout: 60_000,
+      hookTimeout: 60_000,
       setupFiles: ["./test/applyMigrations.ts"],
       poolOptions: {
         workers: {
