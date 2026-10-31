@@ -10,3 +10,7 @@ export * from "./errors.js";
 export * from "./bytes.js";
 export * from "./crypto.js";
 export * from "./codec.js";
+export * from "./identity.js";
+export * from "./vault.js";
+export * from "./circle.js";
+export * from "./audience.js";
