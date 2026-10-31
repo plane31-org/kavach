@@ -180,4 +180,28 @@ describe("feedback findings", () => {
     await w.sync(a);
     expect((await a.client.inspect()).outbox).toEqual({ queued: 0, inflight: 0, cancelled: 0, unknown: 0, oldestPendingAgeMs: undefined });
   });
+
+  it("9: an expired backlog does not delay a fresh location: one sync cancels the old rows and delivers the new one", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    for (const lat of [2, 3, 4]) await a.client.enqueueLocation(w.loc(lat));
+    w.clock.advance(86_400_000n + 1n);
+    const fresh = await a.client.enqueueLocation(w.loc(5));
+    const r = await w.sync(a);
+    expect([r.errors, r.outbox.cancelled, r.outbox.sent, r.outbox.accepted]).toEqual([[], 3, 1, 1]);
+    expect((await w.sync(b)).inbox.stored).toBe(1);
+    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
+  });
+
+  it("10: a throwing subscriber is reported through onListenerError, with the event, and the call still succeeds", async () => {
+    const w = world();
+    const { a } = await pair(w);
+    const seen: string[] = [];
+    const client = await open({ accountName: "alice", retentionPolicy: testPolicy, recoveryProvider: a.provider, resetTrust, secretStore: a.secrets, store: a.store.fork(), transport: a.t, now: w.clock.now, onListenerError: (e, ev) => seen.push(`${ev.kind}:${e instanceof Error ? e.message : String(e)}`) });
+    client.subscribe((e) => {
+      if (e.kind === "queued") throw new Error("boom");
+    });
+    await client.enqueueLocation(w.loc(6));
+    expect(seen).toEqual(["queued:boom"]);
+  });
 });

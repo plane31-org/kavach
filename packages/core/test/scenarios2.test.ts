@@ -137,7 +137,7 @@ describe("step 12: an expired list defers a reset without pausing sharing", () =
     w.clock.advance(2n * 3_600_000n);
     await a.client.resetAccount({ confirmed: true });
     const report = await b.client.sync();
-    expect(report.errors.some((e) => e.startsWith("RESET_KEYS_REQUIRED"))).toBe(true);
+    expect(report.errors.some((e) => e.code === "RESET_KEYS_REQUIRED" && e.retryable)).toBe(true);
     expect((await b.client.circles.list())[0]?.status).toBe("member");
     expect(report.metadata.resets).toBe(0);
     // Sharing is not paused: Bob's next location is sealed, sent and accepted.

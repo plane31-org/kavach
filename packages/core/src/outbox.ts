@@ -140,7 +140,8 @@ export interface DrainSummary {
   retry: number;
 }
 
-type HandoffStep = { kind: "none" } | { kind: "sent"; key: string; row: OutboxRow; outcome: Promise<AppendOutcome> };
+/** "none": nothing to send, the drain ends. "skipped": a row was cancelled, the next one is tried. */
+type HandoffStep = { kind: "none" } | { kind: "skipped" } | { kind: "sent"; key: string; row: OutboxRow; outcome: Promise<AppendOutcome> };
 
 /**
  * The single serialised sender: one record in flight per stream, drained in (epoch, counter)
@@ -153,6 +154,7 @@ export async function drain(deps: OutboxDeps, maxRecords = 1000): Promise<DrainS
   for (let i = 0; i < maxRecords; i++) {
     const step = await handoffNext(deps, summary);
     if (step.kind === "none") break;
+    if (step.kind === "skipped") continue; // a cancelled row counts against the limit, never ends the drain
     summary.sent++;
     let outcome: AppendOutcome | undefined;
     try {
@@ -199,13 +201,13 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
       summary.cancelled++;
       after.push(() => deps.events?.cancelled?.(fromHex(row.recordId), "rotation"));
       if (row.kind === 0) after.push(() => deps.events?.needsLocation?.("rotation"));
-      return { kind: "none" };
+      return { kind: "skipped" };
     }
     if (unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now) {
       tx.put("outbox", key, terminal(row, "cancelled", "expired"));
       summary.cancelled++;
       after.push(() => deps.events?.cancelled?.(fromHex(row.recordId), "expired"));
-      return { kind: "none" };
+      return { kind: "skipped" };
     }
     const marked: OutboxRow = { ...row, status: "inflight", attempts: row.attempts + 1 };
     tx.put("outbox", key, marked);

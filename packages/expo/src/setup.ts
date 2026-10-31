@@ -59,15 +59,16 @@ async function storageKeyFor(secretStore: SecretStore, slot: string, context: "f
   if (context !== "foreground") throw new KavachError("LOCKED", "openKavach", "no storage key yet: the foreground app provisions it");
   let inflight = provisioning.get(slot);
   if (!inflight) {
+    // One chain: the cleanup rides on the promise every caller awaits, so a failed write rejects
+    // exactly once, to the callers, and never as a stray unhandled rejection.
     inflight = (async () => {
       const again = await secretStore.get("storageKey");
       if (again) return again;
       const key = randomBytes(32);
       await secretStore.set("storageKey", key);
       return key;
-    })();
+    })().finally(() => provisioning.delete(slot));
     provisioning.set(slot, inflight);
-    void inflight.finally(() => provisioning.delete(slot));
   }
   return inflight;
 }

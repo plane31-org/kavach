@@ -103,7 +103,7 @@ describe("replayed documents", () => {
     expect((await b2.client.getState()).status).toBe("activationPending");
     // A sync in this state changes nothing either.
     const r = await w.sync(b2);
-    expect(r.errors).toEqual(["ACTIVATION_PENDING@sync"]);
+    expect(r.errors).toEqual([{ operation: "resumeActivation", code: "ACTIVATION_PENDING", stage: "sync", retryable: true }]);
     expect(w.host.accounts.get("bob")?.generation).toBe(1n);
     delete b2.t.knobs.replay.vault;
     const done = await b2.client.restoreAccount();

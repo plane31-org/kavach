@@ -59,7 +59,7 @@ export function world(): World {
 
 /** The error codes a sync surfaced, through the report and through securityError events. */
 export function codes(report: SyncReport, events: ClientEvent[], since = 0): Set<string> {
-  const out = new Set(report.errors.map((e) => e.split("@")[0] ?? e));
+  const out = new Set<string>(report.errors.map((e) => e.code));
   for (const e of events.slice(since)) if (e.kind === "securityError") out.add(e.code);
   return out;
 }

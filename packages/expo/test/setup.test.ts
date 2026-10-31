@@ -176,6 +176,31 @@ describe("openKavach", () => {
     expect(toHex((await bg.secretStore.get("storageKey")) ?? new Uint8Array())).toBe(keys.get("kavach-alice.db"));
   });
 
+  it("a failed key write rejects the open once, with no stray unhandled rejection, and the next open provisions again", async () => {
+    const w = world();
+    const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));
+    const keys = new Map<string, string>();
+    const secrets = new MemorySecretStore();
+    const setup = () =>
+      openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets, database: cipherLike(dir, keys), context: "foreground", now: w.clock.now });
+    const stray: unknown[] = [];
+    const onStray = (reason: unknown): void => {
+      stray.push(reason);
+    };
+    process.on("unhandledRejection", onStray);
+    try {
+      secrets.failNextWrite = true;
+      await expect(setup()).rejects.toThrow(expect.objectContaining({ code: "STORAGE_FAILURE" }));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(stray).toEqual([]);
+      const second = await setup();
+      expect((await second.client.getState()).status).toBe("fresh");
+      expect(await secrets.get("storageKey")).toBeDefined();
+    } finally {
+      process.off("unhandledRejection", onStray);
+    }
+  });
+
   it("names and validates", () => {
     expect(databaseFileName("alice")).toBe("kavach-alice.db");
     expect(databaseFileName("alice", "moyo")).toBe("moyo-alice.db");

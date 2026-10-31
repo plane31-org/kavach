@@ -351,7 +351,7 @@ describe("scenarios 11 to 15: reset, removal, limits", () => {
     w.clock.advance(25n * 3_600_000n);
     w.host.resetKeyList = buildResetKeyList({ version: 2n, issuedAt: w.clock.now(), expiresAt: w.clock.now() + 2_592_000_000n, keys: [] }, management.secretKey);
     const report = await b.client.sync();
-    expect(report.errors).toContain("RESET_KEY_REVOKED@resetReceipt");
+    expect(report.errors.map((e) => `${e.operation}:${e.code}@${e.stage}`)).toContain("resetReceipt:RESET_KEY_REVOKED@resetReceipt");
     expect((await b.client.circles.list())[0]?.status).toBe("member");
     expect(report.metadata.quarantined).toBe(1);
   });

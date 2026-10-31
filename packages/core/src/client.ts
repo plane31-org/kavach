@@ -9,7 +9,7 @@ import { acceptSnapshot, checkMemberResolution, createCircleSnapshot, newCircleI
 import { DocumentType, encodeLocation, expectType, parseVaultHeader, verifyDocument, type AccountDevice, type Location, type RecordKind } from "./codec.js";
 import { randomBytes, ready, type BoxKeypair } from "./crypto.js";
 import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
-import { KavachError, isKavachError } from "./errors.js";
+import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { forgetAuthor, forgetAuthorIn, history, latest, latestStatus, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryQuery, type Latest, type LatestStatus, type ReceiveResult } from "./inbox.js";
 import { drain, enqueue, outboxCount, outboxCounts, purgeOutbox, type OutboxCounts } from "./outbox.js";
@@ -108,6 +108,8 @@ export interface OpenOptions {
   readonly store: Store;
   readonly transport: Transport;
   readonly now?: () => bigint;
+  /** Called when a subscriber throws. Listeners are isolated from the protocol and from each other either way. */
+  readonly onListenerError?: (error: unknown, event: ClientEvent) => void;
 }
 
 export interface Client {
@@ -148,7 +150,19 @@ export interface SyncReport {
   outbox: { sent: number; accepted: number; cancelled: number; unknown: number; retry: number };
   inbox: { streams: number; stored: number; keyPending: number; invalid: number; acked: number };
   purged: number;
-  errors: string[];
+  errors: SyncError[];
+}
+
+/** One failure a sync worked around: which step, the protocol code and stage, and whether the same step may succeed later unchanged. */
+export interface SyncError {
+  readonly operation: string;
+  readonly code: ErrorCode | "ACTIVATION_PENDING" | "UNEXPECTED";
+  readonly stage: string;
+  readonly retryable: boolean;
+}
+
+function syncError(operation: string, e: unknown): SyncError {
+  return e instanceof KavachError ? { operation, code: e.code, stage: e.stage, retryable: e.retryable } : { operation, code: "UNEXPECTED", stage: operation, retryable: false };
 }
 
 const RESET_LIST_RECHECK_MS = 86_400_000n;
@@ -235,8 +249,12 @@ class ClientImpl implements Client {
     for (const l of this.listeners) {
       try {
         l(event);
-      } catch {
-        /* the application's error, not the protocol's */
+      } catch (e) {
+        try {
+          this.options.onListenerError?.(e, event);
+        } catch {
+          /* the diagnostic hook is the application's too */
+        }
       }
     }
   }
@@ -709,7 +727,7 @@ class ClientImpl implements Client {
       try {
         await this.resumeReset("sync");
       } catch (e) {
-        report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+        report.errors.push(syncError("resumeReset", e));
         return report;
       }
     }
@@ -717,11 +735,11 @@ class ClientImpl implements Client {
       try {
         const resumed = await this.resumeActivation("sync");
         if (resumed.outcome !== "done") {
-          report.errors.push("ACTIVATION_PENDING@sync"); // restoreAccount prepares again
+          report.errors.push({ operation: "resumeActivation", code: "ACTIVATION_PENDING", stage: "sync", retryable: true }); // restoreAccount prepares again
           return report;
         }
       } catch (e) {
-        report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+        report.errors.push(syncError("resumeActivation", e));
         return report;
       }
     } else if (meta.state !== "ACTIVE") return report;
@@ -729,19 +747,19 @@ class ClientImpl implements Client {
     try {
       await this.syncMetadata(report);
     } catch (e) {
-      report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+      report.errors.push(syncError("metadata", e));
     }
     const after = await this.store.read((tx) => tx.get("meta", META));
     if (after?.state === "RETIRED") return report;
     try {
       report.epoch = await this.ensureEpoch();
     } catch (e) {
-      report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+      report.errors.push(syncError("epoch", e));
     }
     try {
       report.outbox = await drain(this.outboxDeps());
     } catch (e) {
-      report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+      report.errors.push(syncError("outbox", e));
     }
     try {
       const subs = await this.transport.relay.listSubscriptions();
@@ -756,7 +774,7 @@ class ClientImpl implements Client {
         if (r.acked !== undefined) report.inbox.acked++;
       }
     } catch (e) {
-      report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+      report.errors.push(syncError("inbox", e));
     }
     report.purged = (await purgeHistory(this.store, this.policy, this.now())) + (await purgeOutbox(this.store, this.policy, this.now()));
     await this.emitState();
@@ -786,7 +804,7 @@ class ClientImpl implements Client {
           this.trust.install(wire, now);
           await this.persistTrust();
         } catch (e) {
-          report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+          report.errors.push(syncError("resetKeyList", e));
         }
       }
     }
@@ -798,13 +816,13 @@ class ClientImpl implements Client {
       try {
         if ((await this.publishPendingSnapshot(circleId)) === "COMMITTED") report.metadata.snapshots++;
       } catch (e) {
-        report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+        report.errors.push(syncError("publishSnapshot", e));
       }
     }
     try {
       await this.syncVault();
     } catch (e) {
-      report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+      report.errors.push(syncError("vault", e));
     }
     // Circles: owners we have not pinned yet, then snapshots, then members' certificates.
     const circles = await this.store.read((tx) => tx.list("circles").map(([, c]) => rowToCircle(c)));
@@ -853,7 +871,7 @@ class ClientImpl implements Client {
           if (isKavachError(e, "EQUIVOCATION")) {
             await this.store.transaction((tx) => t3Circle(tx, circleToRow({ ...c, status: "quarantined" })));
             this.emit({ kind: "securityError", code: "EQUIVOCATION", detail: "two snapshots at one revision" });
-          } else report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+          } else report.errors.push(syncError("circleSnapshot", e));
           for (const m of c.members) memberIds.set(toHex(m), m);
         }
       } else for (const m of c.members) memberIds.set(toHex(m), m);
@@ -868,7 +886,7 @@ class ClientImpl implements Client {
           try {
             await this.changeMembership(c.circleId, { remove: leaver.identityId });
           } catch (e) {
-            report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+            report.errors.push(syncError("removeLeaver", e));
           }
         }
       }
@@ -906,7 +924,7 @@ class ClientImpl implements Client {
         return;
       }
       if (e instanceof KavachError) {
-        report.errors.push(`${e.code}@${e.stage}`);
+        report.errors.push(syncError("certificate", e));
         if (e.code === "EQUIVOCATION" || e.code === "DEVICE_ROLLBACK" || e.code === "DEVICE_ID_REUSED") this.emit({ kind: "securityError", code: e.code, detail: doc.accountName });
         return;
       }
@@ -946,7 +964,7 @@ class ClientImpl implements Client {
         }
         return;
       } catch (e) {
-        report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+        report.errors.push(syncError("resetReceipt", e));
         if (isKavachError(e, "RESET_KEYS_REQUIRED") || isKavachError(e, "RESET_CLOCK_UNTRUSTED")) {
           // Deferred: sharing continues under the pinned key; the receipt is tried again later.
           return;

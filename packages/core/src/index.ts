@@ -25,6 +25,7 @@ export {
   type OpenOptions,
   type PauseReason,
   type ReceiveResult,
+  type SyncError,
   type SyncReport
 } from "./client.js";
 
