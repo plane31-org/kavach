@@ -9,3 +9,4 @@ export const PROTOCOL_REVISION = 4;
 export * from "./errors.js";
 export * from "./bytes.js";
 export * from "./crypto.js";
+export * from "./codec.js";
