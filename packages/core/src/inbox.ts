@@ -118,7 +118,6 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   const existing = tx.get("history", id);
   if (existing) {
     if (existing.bodyHash === hash) return { result: "duplicate", recordId: opened.recordId };
-    deps.events?.securityError?.("EQUIVOCATION", "a different valid body for a retained record id");
     return { result: "invalid", reason: "EQUIVOCATION" };
   }
   const cert = [...author.view.certificates.values()].find((c) => equalBytes(c.streamId, parsed.streamId));
@@ -161,6 +160,7 @@ export async function receive(deps: InboxDeps, wire: Uint8Array): Promise<Receiv
   if (r.result === "keyPending" && (await fetchEpochKey(deps, r.streamId, r.epoch).catch(() => false))) {
     r = await deps.store.transaction((tx) => storeRecord(tx, deps, wire, now));
   }
+  if (r.result === "invalid" && r.reason === "EQUIVOCATION") deps.events?.securityError?.("EQUIVOCATION", "a different valid body for a retained record id");
   deps.events?.received?.(r);
   return r;
 }

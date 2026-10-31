@@ -111,6 +111,7 @@ describe("openKavach", () => {
         resetTrust: w.resetTrust,
         secrets: { secureStore: secure, thisDeviceOnly: "device-only" },
         database: cipherLike(dir, keys),
+        context: "foreground",
         now: w.clock.now
       });
     const alice = await openAccount("alice");
@@ -135,14 +136,44 @@ describe("openKavach", () => {
     const w = world();
     const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));
     const keys = new Map<string, string>();
-    const setup = (secrets: MemorySecretStore) =>
-      openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets, database: cipherLike(dir, keys), now: w.clock.now });
+    const setup = (secrets: MemorySecretStore, context: "foreground" | "background" = "foreground") =>
+      openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets, database: cipherLike(dir, keys), context, now: w.clock.now });
     const first = await setup(new MemorySecretStore());
     await first.client.initializeAccount();
     const lost = new MemorySecretStore();
     await expect(setup(lost)).rejects.toThrow(expect.objectContaining({ code: "RECOVERY_REQUIRED" }));
     // The key created for the attempt is stored, so a fresh database after the app deletes the file opens under it.
     expect(await lost.get("storageKey")).toBeDefined();
+  });
+
+  it("two first-time opens of one account in one context share one key", async () => {
+    const w = world();
+    const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));
+    const keys = new Map<string, string>();
+    const secrets = new MemorySecretStore();
+    const setup = () =>
+      openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets, database: cipherLike(dir, keys), context: "foreground", now: w.clock.now });
+    const [a, b] = await Promise.all([setup(), setup()]);
+    const stored = toHex((await secrets.get("storageKey")) ?? new Uint8Array());
+    expect(stored).toBe(keys.get("kavach-alice.db"));
+    expect((await a.client.getState()).status).toBe("fresh");
+    expect((await b.client.getState()).status).toBe("fresh");
+  });
+
+  it("a background context never provisions: without a key it stops with LOCKED and creates nothing", async () => {
+    const w = world();
+    const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));
+    const keys = new Map<string, string>();
+    const secrets = new MemorySecretStore();
+    const setup = (context: "foreground" | "background") =>
+      openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets, database: cipherLike(dir, keys), context, now: w.clock.now });
+    await expect(setup("background")).rejects.toThrow(expect.objectContaining({ code: "LOCKED" }));
+    expect(await secrets.get("storageKey")).toBeUndefined();
+    expect(keys.size).toBe(0);
+    // Once the foreground has provisioned, the background opens under the same key.
+    await setup("foreground");
+    const bg = await setup("background");
+    expect(toHex((await bg.secretStore.get("storageKey")) ?? new Uint8Array())).toBe(keys.get("kavach-alice.db"));
   });
 
   it("names and validates", () => {

@@ -12,7 +12,7 @@ import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { forgetAuthor, forgetAuthorIn, history, latest, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryQuery, type Latest, type ReceiveResult } from "./inbox.js";
-import { drain, enqueue, outboxCount } from "./outbox.js";
+import { drain, enqueue, outboxCount, outboxCounts, purgeOutbox, type OutboxCounts } from "./outbox.js";
 import { validatePolicy, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
@@ -56,6 +56,20 @@ export interface ClientState {
   /** Authors whose current epoch has not yet reached this device. */
   readonly waitingFor: readonly Uint8Array[];
   readonly circles: readonly CircleSummary[];
+}
+
+/** Diagnostics: where the protocol stands on this device. Never a secret or a plaintext. */
+export interface Inspection {
+  readonly identityId: Uint8Array | undefined;
+  readonly certificateHash: Uint8Array | undefined;
+  readonly generation: bigint | undefined;
+  readonly desiredRevision: bigint;
+  readonly paused: PauseReason | undefined;
+  readonly activeEpoch: number | undefined;
+  /** An epoch prepared or committed that is not active yet. */
+  readonly pendingEpoch: number | undefined;
+  readonly outbox: OutboxCounts;
+  readonly vault: { readonly revision: bigint; readonly pending: boolean; readonly dirty: boolean } | undefined;
 }
 
 export interface CircleSummary {
@@ -109,7 +123,7 @@ export interface Client {
   receive(wire: Uint8Array): Promise<ReceiveResult>;
   history(query?: HistoryQuery): Promise<HistoryEntry[]>;
   latest(identityId: Uint8Array): Promise<Latest | undefined>;
-  inspect(): Promise<{ identityId: Uint8Array | undefined; certificateHash: Uint8Array | undefined; generation: bigint | undefined; desiredRevision: bigint; activeEpoch: number | undefined }>;
+  inspect(): Promise<Inspection>;
   readonly circles: {
     create(): Promise<{ circleId: Uint8Array }>;
     requestJoin(circleId: Uint8Array, ownerIdentityId: Uint8Array, options?: { shareOnApproval?: boolean }): Promise<void>;
@@ -212,8 +226,15 @@ class ClientImpl implements Client {
     });
   }
 
+  /** Each listener on its own: a throwing subscriber affects neither the other listeners nor the protocol. */
   private emit(event: ClientEvent): void {
-    for (const l of this.listeners) l(event);
+    for (const l of this.listeners) {
+      try {
+        l(event);
+      } catch {
+        /* the application's error, not the protocol's */
+      }
+    }
   }
 
   subscribe(listener: (event: ClientEvent) => void): () => void {
@@ -304,15 +325,25 @@ class ClientImpl implements Client {
     });
   }
 
-  async inspect() {
-    const [stream, revision] = await this.store.read((tx) => [tx.get("stream", STREAM), tx.get("revision", REVISION)] as const);
-    return {
-      identityId: this.selfPin?.identityId,
-      certificateHash: this.selfPin?.certificateHash,
-      generation: this.selfPin?.generation,
-      desiredRevision: revision ? unbig(revision.desiredRevision) : 1n,
-      activeEpoch: stream?.activeEpoch
-    };
+  async inspect(): Promise<Inspection> {
+    const now = this.now();
+    return this.store.read((tx) => {
+      const stream = tx.get("stream", STREAM);
+      const revision = tx.get("revision", REVISION);
+      const vault = tx.get("vault", VAULT);
+      const pendingEpoch = tx.list("epochs").find(([, e]) => e.status === "prepared" || e.status === "committed")?.[1].epoch;
+      return {
+        identityId: this.selfPin?.identityId,
+        certificateHash: this.selfPin?.certificateHash,
+        generation: this.selfPin?.generation,
+        desiredRevision: revision ? unbig(revision.desiredRevision) : 1n,
+        paused: revision?.paused,
+        activeEpoch: stream?.activeEpoch,
+        pendingEpoch,
+        outbox: outboxCounts(tx, now),
+        vault: vault ? { revision: unbig(vault.revision), pending: vault.pending, dirty: vault.dirty } : undefined
+      };
+    });
   }
 
   // Enrollment ------------------------------------------------------------------------------------
@@ -718,7 +749,7 @@ class ClientImpl implements Client {
     } catch (e) {
       report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
     }
-    report.purged = await purgeHistory(this.store, this.policy, this.now());
+    report.purged = (await purgeHistory(this.store, this.policy, this.now())) + (await purgeOutbox(this.store, this.policy, this.now()));
     await this.emitState();
     return report;
   }
@@ -962,7 +993,7 @@ class ClientImpl implements Client {
     await this.store.transaction((tx) => {
       const meta = tx.get("meta", META);
       if (meta) tx.put("meta", META, { ...meta, state: "RETIRED" });
-      for (const [k, r] of tx.list("outbox")) if (r.status === "queued" || r.status === "inflight") tx.put("outbox", k, { ...r, status: "cancelled", reason: "retired" });
+      for (const [k, r] of tx.list("outbox")) if (r.status === "queued" || r.status === "inflight") tx.put("outbox", k, { ...r, wire: "", status: "cancelled", reason: "retired" });
     });
     await this.secrets.delete("deviceSeed");
     this.device = undefined;

@@ -137,7 +137,7 @@ export function t3ApplyChange(tx: Tx, event: AudienceEvent): ChangeResult {
   const cancelled: string[] = [];
   for (const [key, out] of tx.list("outbox")) {
     if (out.status === "queued" && unbig(out.desiredRevision) < next.desiredRevision) {
-      tx.put("outbox", key, { ...out, status: "cancelled", reason: "rotation" });
+      tx.put("outbox", key, { ...out, wire: "", status: "cancelled", reason: "rotation" });
       cancelled.push(key);
     }
   }

@@ -162,8 +162,16 @@ export async function drain(deps: OutboxDeps, maxRecords = 1000): Promise<DrainS
   return summary;
 }
 
+/** A row that will not be sent again keeps its summary and sheds the ciphertext. */
+function terminal(row: OutboxRow, status: "cancelled" | "unknown", reason: string): OutboxRow {
+  return { ...row, wire: "", status, reason };
+}
+
 async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<HandoffStep> {
-  return deps.store.transaction((tx) => {
+  // Application events fire after the commit, never from inside it: a subscriber cannot roll a
+  // transition back, and never sees state the store has not kept yet.
+  const after: (() => void)[] = [];
+  const step = await deps.store.transaction((tx): HandoffStep => {
     const meta = tx.get("meta", META);
     if (!meta || meta.state !== "ACTIVE") return { kind: "none" };
     const rows = tx
@@ -177,16 +185,16 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
     const now = deps.now();
     const revision = currentRevision(tx);
     if (unbig(row.desiredRevision) !== revision) {
-      tx.put("outbox", key, { ...row, status: "cancelled", reason: "rotation" });
+      tx.put("outbox", key, terminal(row, "cancelled", "rotation"));
       summary.cancelled++;
-      deps.events?.cancelled?.(fromHex(row.recordId), "rotation");
-      if (row.kind === 0) deps.events?.needsLocation?.("rotation");
+      after.push(() => deps.events?.cancelled?.(fromHex(row.recordId), "rotation"));
+      if (row.kind === 0) after.push(() => deps.events?.needsLocation?.("rotation"));
       return { kind: "none" };
     }
     if (unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now) {
-      tx.put("outbox", key, { ...row, status: "cancelled", reason: "expired" });
+      tx.put("outbox", key, terminal(row, "cancelled", "expired"));
       summary.cancelled++;
-      deps.events?.cancelled?.(fromHex(row.recordId), "expired");
+      after.push(() => deps.events?.cancelled?.(fromHex(row.recordId), "expired"));
       return { kind: "none" };
     }
     const marked: OutboxRow = { ...row, status: "inflight", attempts: row.attempts + 1 };
@@ -202,50 +210,91 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
     }
     return { kind: "sent", key, row: marked, outcome };
   });
+  for (const fire of after) fire();
+  return step;
 }
 
 type Final = "accepted" | "cancelled" | "unknown" | "retry";
 
 export async function recordOutcome(deps: OutboxDeps, key: string, outcome: AppendOutcome | undefined): Promise<Final> {
-  return deps.store.transaction((tx) => {
+  const after: (() => void)[] = [];
+  const final = await deps.store.transaction((tx): Final => {
     const row = tx.get("outbox", key);
     if (!row || row.status !== "inflight") return "retry";
     const id = fromHex(row.recordId);
-    const finish = (status: OutboxRow["status"], reason?: string): void => {
-      if (status === "accepted") tx.delete("outbox", key);
-      else tx.put("outbox", key, { ...row, status, reason });
-    };
+    const requeue = (): void => tx.put("outbox", key, { ...row, status: "queued", reason: undefined });
+    const cancel = (reason: string): void => tx.put("outbox", key, terminal(row, "cancelled", reason));
     if (!outcome) {
-      finish("queued"); // lost response: retry the identical bytes; the relay answers from its checkpoint
+      requeue(); // lost response: retry the identical bytes; the relay answers from its checkpoint
       return "retry";
     }
     switch (outcome.status) {
       case "ACCEPTED":
       case "ALREADY_ACCEPTED":
-        finish("accepted");
-        deps.events?.accepted?.(id);
+        tx.delete("outbox", key);
+        after.push(() => deps.events?.accepted?.(id));
         return "accepted";
       case "RETRYABLE":
-        finish("queued");
+        requeue();
         return "retry";
       case "STALE_APPEND":
-        finish("unknown", "STALE_APPEND");
-        deps.events?.cancelled?.(id, "acceptanceUnknown");
-        if (row.kind === 0) deps.events?.needsLocation?.("acceptanceUnknown");
+        tx.put("outbox", key, terminal(row, "unknown", "STALE_APPEND"));
+        after.push(() => deps.events?.cancelled?.(id, "acceptanceUnknown"));
+        if (row.kind === 0) after.push(() => deps.events?.needsLocation?.("acceptanceUnknown"));
         return "unknown";
       case "EQUIVOCATION":
-        finish("cancelled", "EQUIVOCATION");
-        deps.events?.securityError?.("EQUIVOCATION", "the relay holds a different record under this id");
+        cancel("EQUIVOCATION");
+        after.push(() => deps.events?.securityError?.("EQUIVOCATION", "the relay holds a different record under this id"));
         return "cancelled";
       case "EPOCH_FENCED":
       case "SUPERSEDED_DEVICE":
       case "UNAUTHORIZED":
-        finish("cancelled", outcome.status);
-        deps.events?.cancelled?.(id, outcome.status);
-        if (row.kind === 0) deps.events?.needsLocation?.(outcome.status);
+        cancel(outcome.status);
+        after.push(() => deps.events?.cancelled?.(id, outcome.status));
+        if (row.kind === 0) after.push(() => deps.events?.needsLocation?.(outcome.status));
         return "cancelled";
     }
   });
+  for (const fire of after) fire();
+  return final;
+}
+
+/** Retention for rows that will not be sent again: they go once the delivery window has passed. */
+export async function purgeOutbox(store: Store, policy: RetentionPolicy, now: bigint): Promise<number> {
+  return store.transaction((tx) => {
+    let purged = 0;
+    for (const [key, row] of tx.list("outbox")) {
+      if ((row.status === "cancelled" || row.status === "unknown") && unbig(row.sentAt) + policy.deliveryWindowMs <= now) {
+        tx.delete("outbox", key);
+        purged++;
+      }
+    }
+    return purged;
+  });
+}
+
+export interface OutboxCounts {
+  readonly queued: number;
+  readonly inflight: number;
+  readonly cancelled: number;
+  readonly unknown: number;
+  /** Age of the oldest row still to send, when there is one. */
+  readonly oldestPendingAgeMs: bigint | undefined;
+}
+
+/** Rows by state, for diagnostics. */
+export function outboxCounts(tx: Pick<Tx, "list">, now: bigint): OutboxCounts {
+  const counts = { queued: 0, inflight: 0, cancelled: 0, unknown: 0 };
+  let oldest: bigint | undefined;
+  for (const [, r] of tx.list("outbox")) {
+    if (r.status === "accepted") continue;
+    counts[r.status]++;
+    if (r.status === "queued" || r.status === "inflight") {
+      const sentAt = unbig(r.sentAt);
+      if (oldest === undefined || sentAt < oldest) oldest = sentAt;
+    }
+  }
+  return { ...counts, oldestPendingAgeMs: oldest === undefined ? undefined : now - oldest };
 }
 
 /** Rows still waiting, for state reporting. */

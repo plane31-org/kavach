@@ -27,11 +27,12 @@ const { client, databaseFileName } = await openKavach({
   retentionPolicy,
   resetTrust,
   secrets: { secureStore: SecureStore, thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, keychainService: "app.getmoyo" },
-  database: SQLite
+  database: SQLite,
+  context: "foreground" // "background" in the location task
 });
 ```
 
-Two accounts on one device never share a database or a secret. Enable SQLCipher through the `expo-sqlite` config plugin (`useSQLCipher: true`), and exclude `databaseFileName` with its `-wal` and `-shm` companions from iCloud backup and Android auto-backup. Call `openKavach` once per JavaScript context: the foreground app and the background task each get their own connection, and SQLite's file lock serialises them.
+Two accounts on one device never share a database or a secret. Only the foreground app creates the storage key on first run; a background task that finds none stops with `LOCKED` and tries again on its next wake, so two contexts can never provision one database under two different keys. Enable SQLCipher through the `expo-sqlite` config plugin (`useSQLCipher: true`), and exclude `databaseFileName` with its `-wal` and `-shm` companions from iCloud backup and Android auto-backup. Call `openKavach` once per JavaScript context: the foreground app and the background task each get their own connection, and SQLite's file lock serialises them.
 
 When the database file survives but its key is gone (the secret store was cleared), SQLCipher refuses the new key and `openKavach` throws `RECOVERY_REQUIRED`: delete the file and restore the account through `client.restoreAccount()` on a fresh open.
 

@@ -19,6 +19,7 @@ export {
   type ClientStatus,
   type HistoryEntry,
   type HistoryQuery,
+  type Inspection,
   type Latest,
   type OpenOptions,
   type PauseReason,

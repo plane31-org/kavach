@@ -9,6 +9,7 @@ import { ready } from "../src/crypto.js";
 import { testPolicy } from "../src/testing/clock.js";
 import { FaultyStore } from "../src/testing/faults.js";
 import type { Directory } from "../src/transport.js";
+import { VAULT } from "../src/transactions.js";
 import { pair, resetTrust, thrown, world } from "./clientWorld.js";
 
 beforeAll(() => ready());
@@ -131,5 +132,52 @@ describe("feedback findings", () => {
     const twin = await w.device("bob", b.provider.twin());
     await twin.client.restoreAccount();
     expect((await twin.client.circles.list()).map((c) => toHex(c.circleId))).toEqual([toHex(circleId)]);
+  });
+
+  it("6: a subscriber that throws on an acceptance neither undoes it nor stops the other listeners", async () => {
+    const w = world();
+    const { a } = await pair(w);
+    const seen: string[] = [];
+    a.client.subscribe((e) => {
+      if (e.kind === "accepted") throw new Error("boom");
+    });
+    a.client.subscribe((e) => seen.push(e.kind));
+    await a.client.enqueueLocation(w.loc(2));
+    const r = await w.sync(a);
+    expect([r.errors, r.outbox.accepted]).toEqual([[], 1]);
+    expect(await a.store.read((tx) => tx.count("outbox"))).toBe(0);
+    expect(seen).toContain("accepted");
+    expect((await w.sync(a)).outbox.sent).toBe(0);
+  });
+
+  it("7: a cancelled record keeps only its summary and goes after the delivery window", async () => {
+    const w = world();
+    const { a, circleId } = await pair(w);
+    const { recordId } = await a.client.enqueueLocation(w.loc(2));
+    await a.client.circles.setEnabled(circleId, false);
+    const row = await a.store.read((tx) => tx.get("outbox", toHex(recordId)));
+    expect([row?.status, row?.reason, row?.wire]).toEqual(["cancelled", "rotation", ""]);
+    const before = await a.client.inspect();
+    expect([before.outbox.cancelled, before.outbox.queued, before.paused]).toEqual([1, 0, "rotation"]);
+    await a.client.circles.setEnabled(circleId, true);
+    expect((await w.sync(a)).purged).toBe(0);
+    expect(await a.store.read((tx) => tx.get("outbox", toHex(recordId)))).toBeDefined();
+    w.clock.advance(86_400_000n);
+    expect((await w.sync(a)).purged).toBeGreaterThanOrEqual(1);
+    expect(await a.store.read((tx) => tx.get("outbox", toHex(recordId)))).toBeUndefined();
+  });
+
+  it("8: inspect shows the outbox by state, the oldest pending age and the vault's state, never a secret", async () => {
+    const w = world();
+    const { a } = await pair(w);
+    await a.client.enqueueLocation(w.loc(3));
+    w.clock.advance(5_000n);
+    const i = await a.client.inspect();
+    expect([i.outbox.queued, i.outbox.inflight, i.outbox.oldestPendingAgeMs, i.pendingEpoch, i.paused]).toEqual([1, 0, 5_000n, undefined, undefined]);
+    const vault = await a.store.read((tx) => tx.get("vault", VAULT));
+    expect(i.vault).toEqual({ revision: BigInt(vault?.revision ?? "0"), pending: false, dirty: false });
+    expect(JSON.stringify(i, (_, v) => (typeof v === "bigint" ? v.toString() : v))).not.toContain(toHex((await a.secrets.get("accountSeed")) ?? new Uint8Array(1)));
+    await w.sync(a);
+    expect((await a.client.inspect()).outbox).toEqual({ queued: 0, inflight: 0, cancelled: 0, unknown: 0, oldestPendingAgeMs: undefined });
   });
 });
