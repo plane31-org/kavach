@@ -4,7 +4,6 @@ import { toHex } from "../src/bytes.js";
 import { open, type Client, type ClientEvent } from "../src/client.js";
 import { buildResetKeyList } from "../src/codec.js";
 import { C, H, ready, signingKeypairFromSeed } from "../src/crypto.js";
-import { KavachError } from "../src/errors.js";
 import { locationFromDegrees } from "../src/record.js";
 import { MemorySecretStore, MemoryStore } from "../src/store.js";
 import type { ProviderLoadResult, ProviderSaveResult, ProviderStatusResult, RecoveryProvider } from "../src/vault.js";
@@ -75,16 +74,6 @@ function world(listLifetimeMs = 2_592_000_000n) {
 }
 
 const loc = (clock: Clock, lat = 37.7749) => locationFromDegrees(lat, -122.4194, 5, clock.now());
-
-async function code(fn: () => Promise<unknown>): Promise<string> {
-  try {
-    await fn();
-    return "OK";
-  } catch (e) {
-    if (e instanceof KavachError) return e.code;
-    throw e;
-  }
-}
 
 describe("step 5: join requests", () => {
   it("an expired or withdrawn request cannot block an unrelated approval", async () => {
