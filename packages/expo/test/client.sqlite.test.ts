@@ -3,10 +3,9 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
-import { open, locationFromDegrees, ready, toHex, type Client, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@kavach/core";
-import { FakeHost, TestClock, testPolicy } from "@kavach/core/testing";
-import { C, H, signingKeypairFromSeed, buildResetKeyList } from "@kavach/core";
-import { MemorySecretStore } from "@kavach/core";
+import { open, locationFromDegrees, toHex, type Client, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@kavach/core";
+import { MemorySecretStore, ready } from "@kavach/core/adapters";
+import { FakeHost, TestClock, testPolicy, testResetKeyList, testResetKeys } from "@kavach/core/testing";
 import { SqliteStore, nodeSqliteDriver } from "../src/sqliteStore.js";
 import { openNodeDatabase } from "./sqlite.js";
 
@@ -30,10 +29,9 @@ describe("client on SqliteStore", () => {
     const host = new FakeHost();
     const clock = new TestClock();
     host.now = clock.now;
-    const management = signingKeypairFromSeed(H(C("identity")));
-    const operational = signingKeypairFromSeed(H(C("stream")));
-    host.resetSigner = { key: operational, keyId: new Uint8Array(16).fill(7) };
-    host.resetKeyList = buildResetKeyList({ version: 1n, issuedAt: clock.now(), expiresAt: clock.now() + 2_592_000_000n, keys: [{ keyId: new Uint8Array(16).fill(7), publicKey: operational.publicKey }] }, management.secretKey);
+    const resetKeys = testResetKeys();
+    host.resetSigner = { key: resetKeys.operational, keyId: resetKeys.operationalKeyId };
+    host.resetKeyList = testResetKeyList(resetKeys, clock.now());
     const dir = mkdtempSync(join(tmpdir(), "kavach-client-"));
     const secretsByName = new Map<string, MemorySecretStore>();
     const device = async (name: string, secrets = secretsByName.get(name) ?? new MemorySecretStore()): Promise<Client> => {
@@ -49,7 +47,7 @@ describe("client on SqliteStore", () => {
         accountName: name,
         retentionPolicy: testPolicy,
         recoveryProvider: new NoProvider(),
-        resetTrust: { managementKey: management.publicKey, minimumVersion: 1n },
+        resetTrust: { managementKey: resetKeys.management.publicKey, minimumVersion: 1n },
         secretStore: secrets,
         store,
         transport: { get directory() { return bind().directory; }, get relay() { return bind().relay; }, observe: (h) => bind().observe(h) },

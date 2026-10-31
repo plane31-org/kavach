@@ -3,7 +3,7 @@
  * accurate-clock assumption, checked against a durable high-water mark and monotonic elapsed
  * time. A reading below the high-water mark is not trusted.
  */
-import { u64, type SecretStore } from "@kavach/core";
+import { u64, type SecretStore } from "@kavach/core/adapters";
 
 export interface HighWaterStorage {
   get(): Promise<bigint | undefined>;

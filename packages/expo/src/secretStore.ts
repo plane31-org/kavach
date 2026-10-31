@@ -4,7 +4,7 @@
  * because SecureStore stores text. No biometric prompt: background location updates are
  * unattended, and a prompt per read would stop them.
  */
-import { fromHex, toHex, type SecretName, type SecretStore } from "@kavach/core";
+import { fromHex, toHex, type SecretName, type SecretStore } from "@kavach/core/adapters";
 
 /** The subset of `expo-secure-store` this adapter uses, so it can be driven by a fake in tests. */
 export interface SecureStoreLike {

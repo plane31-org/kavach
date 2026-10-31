@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { MemorySecretStore, randomBytes, ready, toHex, type Client } from "@kavach/core";
+import type { Client } from "@kavach/core";
+import { MemorySecretStore, randomBytes, ready, toHex } from "@kavach/core/adapters";
 import { ExpoSecretStore, type SecureStoreLike, type SecureStoreOptions } from "../src/secretStore.js";
 import { BlockStoreRecoveryProvider, blockStoreKey, decodeBlockStoreValue, encodeBlockStoreValue, type BlockStoreLike } from "../src/recovery/android.js";
 import { AppleKeychainRecoveryProvider, keychainAccount, type SyncedKeychainLike } from "../src/recovery/apple.js";

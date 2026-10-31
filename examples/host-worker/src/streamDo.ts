@@ -8,7 +8,7 @@
  * single-threaded SQLite transaction is the serialisation the protocol requires.
  */
 import { DurableObject } from "cloudflare:workers";
-import { DocumentType, bodyHash, expectType, fromHex, parseDocument, toHex, type EncryptedRecord, type EpochManifest } from "@kavach/core";
+import { DocumentType, bodyHash, expectType, fromHex, parseDocument, toHex, type EncryptedRecord, type EpochManifest } from "@kavach/core/adapters";
 import type { Env } from "./env.js";
 
 interface OpenBody {
