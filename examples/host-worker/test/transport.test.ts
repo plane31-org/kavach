@@ -30,4 +30,17 @@ describe("httpTransport failures", () => {
     expect(await failure(() => answer(429).directory.resolveAccounts(["alice"]))).toEqual({ network: true, retryable: true });
     expect(await failure(() => answer(400).directory.resolveAccounts(["alice"]))).toEqual({ network: false, retryable: undefined });
   });
+
+  it("a body that fails while streaming is NETWORK; a body that is not JSON is a plain error", async () => {
+    const broken = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("[{"));
+        controller.error(new TypeError("network error"));
+      }
+    });
+    const dropped = transportWith(async () => new Response(broken, { status: 200, headers: { "content-type": "application/json" } }));
+    expect(await failure(() => dropped.directory.resolveAccounts(["alice"]))).toEqual({ network: true, retryable: true });
+    const garbage = transportWith(async () => new Response("<html>", { status: 200, headers: { "content-type": "application/json" } }));
+    expect(await failure(() => garbage.directory.resolveAccounts(["alice"]))).toEqual({ network: false, retryable: undefined });
+  });
 });

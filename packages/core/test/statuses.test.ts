@@ -65,12 +65,29 @@ describe("status records", () => {
     expect(r.purged).toBeGreaterThanOrEqual(1);
     expect(await b.client.latestStatus(aliceId)).toBeUndefined();
     const after = await b.store.read((tx) => tx.get("statuses", toHex(aliceId)));
-    expect([after?.payload, after?.recordId, after?.epoch, after?.counter]).toEqual(["", kept?.recordId, kept?.epoch, kept?.counter]);
+    expect([after?.payload, after?.recordId, after?.epoch, after?.counter]).toEqual([null, kept?.recordId, kept?.epoch, kept?.counter]);
     // A fresh status is current again.
     await a.client.enqueueStatus(status(45));
     await w.sync(a);
     await w.sync(b);
     expect(toHex((await b.client.latestStatus(aliceId))?.payload ?? new Uint8Array())).toBe(toHex(status(45)));
+  });
+
+  it("an empty payload is a status like any other: current until it expires, never mistaken for an expired one", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    await a.client.enqueueStatus(new Uint8Array());
+    await w.sync(a);
+    const events = b.events.length;
+    await w.sync(b);
+    expect(b.events.slice(events).filter((e) => e.kind === "statusUpdated").length).toBe(1);
+    const latest = await b.client.latestStatus(aliceId);
+    expect(latest?.payload.length).toBe(0);
+    expect((await b.store.read((tx) => tx.get("statuses", toHex(aliceId))))?.payload).toBe("");
+    w.clock.advance(86_400_000n + 1n);
+    await w.sync(b);
+    expect(await b.client.latestStatus(aliceId)).toBeUndefined();
+    expect((await b.store.read((tx) => tx.get("statuses", toHex(aliceId))))?.payload).toBeNull();
   });
 
   it("an author who leaves takes their status with them", async () => {

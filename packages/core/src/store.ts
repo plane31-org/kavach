@@ -174,7 +174,8 @@ export interface StatusRow {
   counter: number;
   sentAt: string;
   receivedAt: string;
-  payload: string;
+  /** Hex, possibly empty; `null` once expired, the slot staying so an older status cannot become current. */
+  payload: string | null;
 }
 
 export interface ReaderEpochRow {

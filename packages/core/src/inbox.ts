@@ -388,7 +388,7 @@ export interface LatestStatus {
 export async function latestStatus(store: Store, authorIdentityId: Uint8Array, now: bigint): Promise<LatestStatus | undefined> {
   return store.read((tx) => {
     const row = tx.get("statuses", toHex(authorIdentityId));
-    if (!row || row.payload === "") return undefined; // none, or expired: the slot stays, the payload is gone
+    if (!row || row.payload === null) return undefined; // none, or expired: the slot stays, the payload is gone
     return { recordId: fromHex(row.recordId), payload: fromHex(row.payload), sentAt: unbig(row.sentAt), ageMs: now - unbig(row.sentAt) };
   });
 }
@@ -400,7 +400,7 @@ export async function latestStatus(store: Store, authorIdentityId: Uint8Array, n
  */
 export async function purgeHistory(store: Store, policy: RetentionPolicy, now: bigint): Promise<number> {
   const expired = (kind: RecordKind, sentAt: string): boolean => unbig(sentAt) + (kind === 1 ? policy.checkInHistoryMs : policy.locationHistoryMs) <= now;
-  const staleStatus = (r: StatusRow): boolean => r.payload !== "" && expired(2, r.sentAt);
+  const staleStatus = (r: StatusRow): boolean => r.payload !== null && expired(2, r.sentAt);
   // Read first: most syncs purge nothing and must not take the writer lock for it.
   const any = await store.read((tx) => tx.list("history").some(([, r]) => expired(r.kind, r.sentAt)) || tx.list("statuses").some(([, r]) => staleStatus(r)));
   if (!any) return 0;
@@ -415,7 +415,7 @@ export async function purgeHistory(store: Store, policy: RetentionPolicy, now: b
     }
     for (const [key, r] of tx.list("statuses")) {
       if (staleStatus(r)) {
-        tx.put("statuses", key, { ...r, payload: "" });
+        tx.put("statuses", key, { ...r, payload: null });
         removed++;
       }
     }

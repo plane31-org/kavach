@@ -32,7 +32,15 @@ export function httpTransport(o: HttpTransportOptions): Transport {
     }
     if (res.status === 404) return null as T;
     if (res.status >= 500 || res.status === 408 || res.status === 429) throw new KavachError("NETWORK", "transport", `${method} ${path}: ${res.status}`);
-    const data = (await res.json()) as Json;
+    // The fetch promise resolves at the headers: a connection lost while the body streams fails
+    // here, and is NETWORK too. A body that arrived but is not JSON is the host's bug, a plain error.
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (e) {
+      throw new KavachError("NETWORK", "transport", `${method} ${path}: body: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const data = JSON.parse(text) as Json;
     if (!res.ok) throw new Error(`${method} ${path}: ${String(data["error"] ?? res.status)}`);
     return data as T;
   };
