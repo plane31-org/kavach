@@ -98,6 +98,8 @@ export class FakeHost {
   withholdSnapshots = false;
   withholdEpochs = false;
   appendCalls = 0;
+  /** Every append the relay answered, in order: what the author's stream has been asked to accept. */
+  readonly appendLog: { streamId: string; recordId: string; hash: string; status: AppendOutcome["status"]; epoch: number; counter: number }[] = [];
 
   // Helpers ---------------------------------------------------------------------------------------
 
@@ -427,6 +429,12 @@ export class FakeHost {
           return outcome;
         };
         const result = run();
+        try {
+          const rec = expectType<EncryptedRecord>(parseDocument(wire), DocumentType.EncryptedRecord);
+          host.appendLog.push({ streamId: toHex(rec.streamId), recordId: toHex(recordId), hash: toHex(bodyHash(wire)), status: result.status, epoch: rec.epoch, counter: rec.counter });
+        } catch {
+          /* unparsable wires are refused above */
+        }
         if (host.dropAppendResponses) return new Promise<AppendOutcome>((_, reject) => reject(new Error("response lost")));
         return Promise.resolve(result);
       },

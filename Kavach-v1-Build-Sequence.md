@@ -142,6 +142,8 @@ Write: a test harness that injects time, randomness, dropped responses after com
 
 Test: every crash outcome in protocol section 11 holds against the real SQLCipher database on a device; every malicious-transport case ends in the typed error the protocol names and never in a plaintext fallback or a silent reset; the lost-device scenario runs with the attacker holding the complete old-device state.
 
+Done, with these notes. Time is injected through `now`; randomness is not, because every check compares the bytes the store holds with the bytes the host holds, which is stronger than replaying a random stream. The crash sweep runs on the in-memory store and on SQLite files in Node (real `BEGIN IMMEDIATE`, WAL, `synchronous = FULL`); the same sweep on SQLCipher on a phone is Moyo's durable-state gate in step 18, since it needs the development build. The sweep found and fixed four client gaps: an enrollment interrupted after the host registered the account could not resume (the retry got a conflict and gave up); a replacement interrupted after the host activated the device allocated a third device on retry; a process that died between activation and the provider's save left the account unbacked with nothing retrying; and a record whose epoch the host served tampered was discarded instead of held as key-pending with the error named. Equivocation by the author (two signed bodies for one record id, two snapshots at one revision) is covered at module level in the inbox and circle tests; the transport-level fork knobs cover what a host can do alone.
+
 Next: measurement.
 
 ## Step 17: SDK benchmarks

@@ -9,7 +9,11 @@ End-to-end encrypted location sharing and check-ins for circles of up to 100 acc
 - `examples/host-worker`: a reference host on Cloudflare Workers, not published.
 - `spec/vectors.json`, `spec/verify_vectors.py`: the revision 4 conformance fixture and its checker; `spec/vectors-rev2/` is the unchanged SS5 revision 2 package it was regenerated from.
 
-Status: steps 0 to 15 of the build sequence are complete: the core protocol, the Expo adapters, and the reference host running the relay scenarios inside workerd. The two native recovery bridges and the device tests of step 14 wait for a development build. Step 16 (fault harness) is next. Nothing here is audited or production-ready.
+Status: steps 0 to 16 of the build sequence are complete: the core protocol, the Expo adapters, the reference host running the relay scenarios inside workerd, and the fault harness. The two native recovery bridges and the device tests of step 14, and the crash sweep on SQLCipher on a phone, wait for a development build. Step 17 (benchmarks) is next. Nothing here is audited or production-ready.
+
+## Fault harness
+
+`@kavach/core/testing` carries, besides the fake host, a `FaultyStore` that kills the simulated process before or after a chosen transaction, a `MaliciousTransport` that loses responses after the host committed, withholds, replays, forks and tampers with served documents and duplicates or reorders deliveries, and two sweeps. `crashSweep` runs one scenario (two accounts, a circle, locations both ways, check-ins, two concurrent contexts, a phone replacement) once to count a device's transaction boundaries, then once per boundary and phase with that device crashing there, restarting on the same durable state and finishing the scenario; after every run the durable-state outcomes of protocol section 11 are checked against the host (exact epoch and record bytes, no counter reuse, one activation, cursors never ahead of the host, delivery complete). `lostResponseSweep` does the same with each mutation's response lost once. `packages/core/test/faults.*.test.ts` run them on the in-memory store, `packages/expo/test/faults.sqlite.test.ts` on SQLite files, and `packages/core/test/malicious.test.ts` holds the malicious-transport cases and the lost-device scenario with the attacker holding the complete old-device state. The sweeps take about two minutes and run on the portable backend only.
 
 ```
 pnpm install

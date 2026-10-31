@@ -240,8 +240,12 @@ export async function syncStream(deps: InboxDeps, streamId: Uint8Array, authorId
         fetched = await fetchEpochKey(deps, r.streamId, r.epoch);
       } catch (e) {
         if (isKavachError(e, "NOT_AUTHORIZED")) r = { result: "invalid", reason: "NOT_AUTHORIZED" };
-        else if (e instanceof KavachError) r = { result: "invalid", reason: e.code };
-        else throw e;
+        else if (e instanceof KavachError) {
+          // The served manifest or wrap did not verify. The record may still be honest, so it is
+          // held as keyPending (the prefix stops here, scenario 21) and the code is named; the
+          // relay's expiry resolves a manifest that never verifies.
+          deps.events?.securityError?.(e.code, `epoch ${r.epoch} of stream ${toHex(r.streamId).slice(0, 8)} refused`);
+        } else throw e;
       }
       if (fetched) r = await deps.store.transaction((tx) => storeRecord(tx, deps, item.wire, now));
     }
@@ -254,8 +258,12 @@ export async function syncStream(deps: InboxDeps, streamId: Uint8Array, authorId
     if (r.result === "keyPending") {
       summary.keyPending++;
       deps.events?.waiting?.(authorIdentityId);
-    } else if (r.result === "invalid") summary.invalid++;
-    else if (r.result === "expired") summary.expired++;
+    } else if (r.result === "invalid") {
+      // The relay serves only records addressed to this device, so anything unverifiable here is
+      // the host's or the author's doing: it is named to the app and never stored.
+      summary.invalid++;
+      deps.events?.securityError?.(r.reason, `record at sequence ${item.deliverySeq} refused`);
+    } else if (r.result === "expired") summary.expired++;
     else if (r.result === "duplicate") summary.duplicate++;
     else summary.stored++;
     deps.events?.received?.(r);
@@ -356,11 +364,14 @@ export async function latest(store: Store, authorIdentityId: Uint8Array, now: bi
 
 /** Retention: drop history outside the windows; a pin whose record is gone disappears with it. */
 export async function purgeHistory(store: Store, policy: RetentionPolicy, now: bigint): Promise<number> {
+  const expired = (kind: 0 | 1, sentAt: string): boolean => unbig(sentAt) + (kind === 0 ? policy.locationHistoryMs : policy.checkInHistoryMs) <= now;
+  // Read first: most syncs purge nothing and must not take the writer lock for it.
+  const any = await store.read((tx) => tx.list("history").some(([, r]) => expired(r.kind, r.sentAt)));
+  if (!any) return 0;
   return store.transaction((tx) => {
     let removed = 0;
     for (const [key, r] of tx.list("history")) {
-      const window = r.kind === 0 ? policy.locationHistoryMs : policy.checkInHistoryMs;
-      if (unbig(r.sentAt) + window <= now) {
+      if (expired(r.kind, r.sentAt)) {
         tx.delete("history", key);
         removed++;
         for (const [pk, pin] of tx.list("livePins")) if (pin.recordId === key) tx.delete("livePins", pk);

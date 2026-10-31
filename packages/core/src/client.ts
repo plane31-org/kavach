@@ -19,7 +19,7 @@ import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig
 import type { SecretStore, Store } from "./store.js";
 import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9Vault } from "./transactions.js";
 import type { Transport, TransportHint } from "./transport.js";
-import { buildVault, encodeRecoveryCode, newRecoveryKey, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
+import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
 
 export type ClientStatus = "fresh" | "ready" | "locked" | "accountRecoveryRequired" | "activationPending" | "retired" | "paused" | "quarantined";
 export type PauseReason = "sync" | "rotation" | "metadata" | "limit";
@@ -107,7 +107,7 @@ export interface SyncReport {
   metadata: { certificates: number; snapshots: number; rotations: number; quarantined: number; resets: number };
   epoch: "unchanged" | "prepared" | "paused" | "pending";
   outbox: { sent: number; accepted: number; cancelled: number; unknown: number; retry: number };
-  inbox: { streams: number; stored: number; keyPending: number; acked: number };
+  inbox: { streams: number; stored: number; keyPending: number; invalid: number; acked: number };
   purged: number;
   errors: string[];
 }
@@ -136,6 +136,7 @@ class ClientImpl implements Client {
   private trust: ResetTrust;
   private syncing: Promise<SyncReport> | undefined;
   private metadataDirty = true;
+  private backupChecked = false;
   private unobserve: (() => void) | undefined;
   readonly circles: Client["circles"];
 
@@ -322,7 +323,14 @@ class ClientImpl implements Client {
     await this.store.transaction((tx) => t1Header(tx, { account, device, certificate, instanceId: iid, generation: 1n }));
     const vault = buildVault({ accountName: this.accountName, accountKey: account.account.publicKey, vaultRevision: 1n }, { accountSeed, lastDeviceGeneration: 1n, lastCertificateHash: pin.certificateHash, entries: [] }, recoveryKey);
     const outcome = await this.transport.directory.registerAccount({ certificate, vault: vault.wire });
-    if (outcome.status !== "COMMITTED" && outcome.status !== "ALREADY_COMMITTED") throw new KavachError("NOT_AUTHORIZED", stage, `host refused registration: ${outcome.status}`);
+    if (outcome.status === "CONFLICT") {
+      // A restart or a lost response after the host committed: the name is ours if the host holds
+      // exactly the certificate this device saved; anything else is somebody else's account.
+      const [me] = await this.transport.directory.resolveAccounts([this.accountName]);
+      if (!me || !equalBytes(me.certificate, certificate)) throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, "an account with this name exists under another key");
+    } else if (outcome.status !== "COMMITTED" && outcome.status !== "ALREADY_COMMITTED") {
+      throw new KavachError("NOT_AUTHORIZED", stage, `host refused registration: ${outcome.status}`);
+    }
     await this.store.transaction((tx) => {
       t9Vault(tx, { revision: "1", hash: toHex(vault.hash), wire: toHex(vault.wire), pending: false });
       t1Activate(tx);
@@ -357,6 +365,14 @@ class ClientImpl implements Client {
     const stage = "restoreAccount";
     const opened = await openStore(this.store, this.secrets, this.accountName);
     if (opened.kind === "ACTIVE" || opened.kind === "RETIRED") throw new KavachError("MALFORMED", stage, "an account already exists on this device");
+    let pending: { device: DeviceKeys; instanceId: Uint8Array } | undefined;
+    if (opened.kind === "ACTIVATION_PENDING") {
+      const resumed = await this.resumeActivation(stage);
+      if (resumed.outcome === "done") return resumed.result;
+      // The host still shows the certificate we expected but refused our prepared bytes (the vault
+      // moved under us): prepare again with the same device keys. Nothing was allocated remotely.
+      pending = resumed;
+    }
     const [resolved] = await this.transport.directory.resolveAccounts([this.accountName]);
     if (!resolved) throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, "unknown account");
     const current = expectType<AccountDevice>(verifyDocument(resolved.certificate), DocumentType.AccountDevice, stage);
@@ -373,7 +389,7 @@ class ClientImpl implements Client {
     });
     const account = openAccount(this.accountName, recovered.vault.accountSeed);
     // Fresh device keys and a fresh local store. Nothing from the old device is copied.
-    const device = newDevice();
+    const device = pending?.device ?? newDevice();
     const generation = current.generation + 1n;
     const certificate = certify(account, device, generation);
     const pin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice));
@@ -383,8 +399,8 @@ class ClientImpl implements Client {
       { accountSeed: recovered.vault.accountSeed, lastDeviceGeneration: generation, lastCertificateHash: pin.certificateHash, entries: recovered.vault.entries },
       recovered.recoveryKey
     );
-    const instanceId = randomBytes(16);
-    await t1Secrets(this.secrets, { accountSeed: recovered.vault.accountSeed, deviceSeed: device.deviceSeed, recoveryKey: recovered.recoveryKey, instanceId });
+    const instanceId = pending?.instanceId ?? randomBytes(16);
+    if (!pending) await t1Secrets(this.secrets, { accountSeed: recovered.vault.accountSeed, deviceSeed: device.deviceSeed, recoveryKey: recovered.recoveryKey, instanceId });
     await this.store.transaction((tx) => {
       t1Header(tx, { account, device, certificate, instanceId, generation });
       t2PrepareActivation(tx, {
@@ -396,6 +412,10 @@ class ClientImpl implements Client {
         expectedVaultHash: toHex(header.hash)
       });
     });
+    // Durable now: the device exists locally as activationPending even if the next call fails.
+    this.account = account;
+    this.device = device;
+    this.selfPin = pin;
     const outcome = await this.transport.directory.activateDevice({
       accountName: this.accountName,
       expectedCertificateHash: current.bodyHash,
@@ -408,10 +428,16 @@ class ClientImpl implements Client {
       // Another candidate won, or the metadata moved: report it; the user may try again.
       throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, `activation ${outcome.status}`);
     }
+    return this.finishActivation({ account, device, pin, vaultRevision: header.vaultRevision + 1n, vault: nextVault, entries: recovered.vault.entries, recoveryKey: recovered.recoveryKey });
+  }
+
+  /** The local half of activation, after the host committed it: no new randomness, ever. */
+  private async finishActivation(input: { account: OwnAccount; device: DeviceKeys; pin: AccountPin; vaultRevision: bigint; vault: { wire: Uint8Array; hash: Uint8Array }; entries: readonly VaultEntry[]; recoveryKey: Uint8Array }): Promise<{ identityId: Uint8Array; generation: bigint }> {
+    const { account, device, pin } = input;
     await this.store.transaction((tx) => {
       tx.delete("activation", "pending");
-      t9Vault(tx, { revision: big(header.vaultRevision + 1n), hash: toHex(nextVault.hash), wire: toHex(nextVault.wire), pending: false });
-      for (const e of recovered.vault.entries) {
+      t9Vault(tx, { revision: big(input.vaultRevision), hash: toHex(input.vault.hash), wire: toHex(input.vault.wire), pending: false });
+      for (const e of input.entries) {
         const owned = equalBytes(e.ownerIdentityId, pin.identityId);
         const c = pinCircle(e.circleId, e.ownerIdentityId, e.sharingEnabled, owned ? "member" : "requested");
         tx.put("circles", toHex(e.circleId), circleToRow(c));
@@ -423,7 +449,7 @@ class ClientImpl implements Client {
     this.device = device;
     this.selfPin = pin;
     try {
-      await this.provider.save(this.accountName, pin.identityId, recovered.recoveryKey);
+      await this.provider.save(this.accountName, pin.identityId, input.recoveryKey);
     } catch {
       /* reported by recoveryStatus() */
     }
@@ -432,7 +458,65 @@ class ClientImpl implements Client {
     });
     this.metadataDirty = true;
     await this.emitState();
-    return { identityId: pin.identityId, generation };
+    return { identityId: pin.identityId, generation: pin.generation };
+  }
+
+  /**
+   * A device that crashed, or lost the response, between T2 and the local acknowledgement: the
+   * host is asked what it holds. Our prepared certificate there means the activation happened
+   * and is finished locally; the expected old certificate means it did not, and the exact
+   * prepared bytes are sent again; anything else means another candidate won. No key, device
+   * id or vault is ever generated here.
+   */
+  private async resumeActivation(stage: string): Promise<{ outcome: "done"; result: { identityId: Uint8Array; generation: bigint } } | { outcome: "prepareAgain"; device: DeviceKeys; instanceId: Uint8Array }> {
+    const row = await this.store.read((tx) => tx.get("activation", "pending"));
+    if (!row) throw new KavachError("RECOVERY_REQUIRED", stage, "activation pending without its prepared bytes");
+    const [accountSeed, deviceSeed, recoveryKey, instanceId] = await Promise.all([this.secrets.get("accountSeed"), this.secrets.get("deviceSeed"), this.secrets.get("recoveryKey"), this.secrets.get("instanceId")]);
+    const self = await this.store.read((tx) => tx.get("self", "self"));
+    if (!accountSeed || !deviceSeed || !recoveryKey || !instanceId || !self) throw new KavachError("RECOVERY_REQUIRED", stage, "activation pending without its roots");
+    const account = openAccount(this.accountName, accountSeed);
+    const device = deviceFromSeed(deviceSeed, fromHex(self.deviceId));
+    const certificate = fromHex(row.certificate);
+    const prepared = expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage);
+    const pin = pinFromCertificate(prepared);
+    const [me] = await this.transport.directory.resolveAccounts([this.accountName]);
+    if (!me) throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, "unknown account");
+    const theirs = expectType<AccountDevice>(verifyDocument(me.certificate), DocumentType.AccountDevice, stage);
+    const vaultWire = fromHex(row.vault);
+    if (!equalBytes(theirs.bodyHash, prepared.bodyHash)) {
+      if (toHex(theirs.bodyHash) !== row.expectedCertificateHash) throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, "another device activated first");
+      const outcome = await this.transport.directory.activateDevice({
+        accountName: this.accountName,
+        expectedCertificateHash: fromHex(row.expectedCertificateHash),
+        expectedVaultRevision: unbig(row.expectedVaultRevision),
+        expectedVaultHash: fromHex(row.expectedVaultHash),
+        newCertificate: certificate,
+        newVault: vaultWire
+      });
+      if (outcome.status === "CONFLICT") return { outcome: "prepareAgain", device, instanceId };
+      if (outcome.status !== "COMMITTED" && outcome.status !== "ALREADY_COMMITTED") throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, `activation ${outcome.status}`);
+    }
+    const opened = openVault(vaultWire, recoveryKey, this.accountName, account.account.publicKey);
+    const result = await this.finishActivation({ account, device, pin, vaultRevision: unbig(row.vaultRevision), vault: { wire: vaultWire, hash: parseVaultHeader(vaultWire).hash }, entries: opened.entries, recoveryKey });
+    return { outcome: "done", result };
+  }
+
+  /**
+   * Enrollment and activation hand the recovery key to the provider after their last transaction,
+   * so a process that dies in between leaves the account unbacked. The first sync of each process
+   * asks the provider and saves again when it has nothing for this identity.
+   */
+  private async ensureBackup(): Promise<void> {
+    if (this.backupChecked || !this.selfPin) return;
+    this.backupChecked = true;
+    try {
+      const key = await this.secrets.get("recoveryKey");
+      if (!key) return;
+      const have = await this.provider.load(this.accountName, this.selfPin.identityId);
+      if (have.status === "unavailable") await this.provider.save(this.accountName, this.selfPin.identityId, key);
+    } catch {
+      /* reported by recoveryStatus() */
+    }
   }
 
   private async emitState(): Promise<void> {
@@ -552,13 +636,26 @@ class ClientImpl implements Client {
       metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 },
       epoch: "unchanged",
       outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 },
-      inbox: { streams: 0, stored: 0, keyPending: 0, acked: 0 },
+      inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0 },
       purged: 0,
       errors: []
     };
     if (!this.account || !this.selfPin) return report;
     const meta = await this.store.read((tx) => tx.get("meta", META));
     if (!meta || meta.state === "RETIRED") return report;
+    if (meta.state === "ACTIVATION_PENDING") {
+      try {
+        const resumed = await this.resumeActivation("sync");
+        if (resumed.outcome !== "done") {
+          report.errors.push("ACTIVATION_PENDING@sync"); // restoreAccount prepares again
+          return report;
+        }
+      } catch (e) {
+        report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+        return report;
+      }
+    } else if (meta.state !== "ACTIVE") return report;
+    await this.ensureBackup();
     try {
       await this.syncMetadata(report);
     } catch (e) {
@@ -585,6 +682,7 @@ class ClientImpl implements Client {
         report.inbox.streams++;
         report.inbox.stored += r.stored;
         report.inbox.keyPending += r.keyPending;
+        report.inbox.invalid += r.invalid;
         if (r.acked !== undefined) report.inbox.acked++;
       }
     } catch (e) {
@@ -909,7 +1007,7 @@ class ClientImpl implements Client {
   private async approve(circleId: Uint8Array, accountName: string): Promise<{ revision: bigint }> {
     const [resolved] = await this.transport.directory.resolveAccounts([accountName]);
     if (!resolved) throw new KavachError("METADATA_REQUIRED", "approve", "unknown account");
-    const report: SyncReport = { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, acked: 0 }, purged: 0, errors: [] };
+    const report: SyncReport = { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0 }, purged: 0, errors: [] };
     await this.acceptMemberCertificate(resolved.certificate, resolved.resetReceipt, report);
     const requester = pinFromCertificate(expectType<AccountDevice>(verifyDocument(resolved.certificate), DocumentType.AccountDevice));
     const pinned = await this.pinFor(requester.identityId);

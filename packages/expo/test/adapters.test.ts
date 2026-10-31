@@ -192,7 +192,7 @@ describe("background location glue", () => {
       },
       sync: async () => {
         calls.push("sync");
-        return { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, acked: 0 }, purged: 0, errors: [] };
+        return { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0 }, purged: 0, errors: [] };
       }
     } as unknown as Client & { calls: string[] };
   }

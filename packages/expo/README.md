@@ -35,3 +35,5 @@ Foreground and background tasks write concurrently without a shared counter and 
 ## Cipher suite backend
 
 `@kavach/core` runs on the portable backend (the noble libraries, pure JavaScript) unless told otherwise, which is what Hermes needs: it has no WebAssembly. On Node, `import { loadSodiumBackend } from "@kavach/core/sodium"` and `setCryptoBackend(await loadSodiumBackend())` before `open()` selects libsodium. Both backends pass the same vectors.
+
+`test/faults.sqlite.test.ts` runs the core's crash and lost-response sweeps over SQLite files on Node, as close to the phone's store as a test without the development build can get; the on-device run on SQLCipher is Moyo's gate.
