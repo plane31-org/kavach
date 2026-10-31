@@ -11,7 +11,7 @@
  * The adapter speaks to the database through `SqlDriver`, a three-method surface that
  * `expo-sqlite`'s synchronous API and Node's `node:sqlite` both satisfy.
  */
-import { KavachError, invokeSync, type Store, type TableName, type Tables, type Tx } from "@kavach/core/adapters";
+import { KavachError, invokeSync, type KeyRange, type Store, type TableName, type Tables, type Tx } from "@kavach/core/adapters";
 
 export type SqlValue = string | number | null;
 
@@ -149,6 +149,27 @@ class SqliteTx implements Tx {
       [table, prefix.length, prefix]
     );
     return rows.map((r) => [r.key, JSON.parse(r.value) as Tables[T]]);
+  }
+
+  range<T extends TableName>(table: T, q: KeyRange): readonly [string, Tables[T]][] {
+    const where = ["tbl = ?"];
+    const params: SqlValue[] = [table];
+    if (q.prefix !== undefined) {
+      where.push("substr(key, 1, ?) = ?");
+      params.push(q.prefix.length, q.prefix);
+    }
+    for (const [field, op] of [["gte", ">="], ["gt", ">"], ["lt", "<"], ["lte", "<="]] as const) {
+      const bound = q[field];
+      if (bound === undefined) continue;
+      where.push(`key ${op} ?`);
+      params.push(bound);
+    }
+    let sql = `SELECT key, value FROM kv WHERE ${where.join(" AND ")} ORDER BY key${q.reverse ? " DESC" : ""}`;
+    if (q.limit !== undefined) {
+      sql += " LIMIT ?";
+      params.push(Math.max(0, Math.floor(q.limit)));
+    }
+    return this.db.all<{ key: string; value: string }>(sql, params).map((r) => [r.key, JSON.parse(r.value) as Tables[T]]);
   }
 
   count(table: TableName): number {

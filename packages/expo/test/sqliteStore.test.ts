@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
-import { KavachError, MemorySecretStore, openStore, randomBytes, ready, t1Activate, t1Header, t1Secrets, t3ApplyChange } from "@kavach/core/adapters";
+import { KavachError, MemorySecretStore, MemoryStore, openStore, type KeyRange, randomBytes, ready, t1Activate, t1Header, t1Secrets, t3ApplyChange } from "@kavach/core/adapters";
 import { certify, deviceFromSeed, newDevice, openAccount } from "@kavach/core/testing";
 import { SqliteStore, nodeSqliteDriver, type SqlDriver } from "../src/sqliteStore.js";
 import { openNodeDatabase } from "./sqlite.js";
@@ -70,6 +70,38 @@ describe("SqliteStore over a real SQLite engine", () => {
     expect(await store.read((tx) => tx.list("clock"))).toEqual([["c", { highWater: "2" }]]);
     expect(await store.read((tx) => tx.list("clock", "zz"))).toEqual([]);
     await expect(store.read((tx) => (tx as unknown as { put: (a: string, b: string, c: unknown) => void }).put("clock", "x", {}))).rejects.toThrow(expect.objectContaining({ code: "STORAGE_FAILURE" }));
+  });
+
+  it("serves a key range as the memory store does: prefix, bounds, order and limit, without the rest of the table", async () => {
+    const sqlite = memoryStore();
+    const memory = new MemoryStore();
+    const keys = ["t:0:0001", "t:0:0002", "t:0:0003", "t:1:0001", "a:x:0:0002", "t:0:00025"];
+    for (const store of [sqlite, memory]) {
+      await store.transaction((tx) => {
+        for (const k of keys) tx.put("historyIndex", k, { recordId: k });
+      });
+    }
+    const ranges: KeyRange[] = [
+      { prefix: "t:0:" },
+      { prefix: "t:0:", reverse: true, limit: 2 },
+      { prefix: "t:0:", gt: "t:0:0001", lt: "t:0:0003" },
+      { prefix: "t:0:", gte: "t:0:0002", lte: "t:0:00025" },
+      { gte: "t:0:0002", reverse: true },
+      { prefix: "t:0:", limit: 0 },
+      { prefix: "zz" }
+    ];
+    for (const q of ranges) {
+      const [fromSqlite, fromMemory] = await Promise.all([sqlite.read((tx) => tx.range("historyIndex", q)), memory.read((tx) => tx.range("historyIndex", q))]);
+      expect(fromSqlite, JSON.stringify(q)).toEqual(fromMemory);
+    }
+    expect((await sqlite.read((tx) => tx.range("historyIndex", { prefix: "t:0:", reverse: true, limit: 2 }))).map(([k]) => k)).toEqual(["t:0:0003", "t:0:00025"]);
+    expect((await sqlite.read((tx) => tx.range("historyIndex", { prefix: "t:0:", gt: "t:0:0001", lt: "t:0:0003" }))).map(([k]) => k)).toEqual(["t:0:0002", "t:0:00025"]);
+    // Inside a transaction the range sees the uncommitted writes of that transaction.
+    await sqlite.transaction((tx) => {
+      tx.put("historyIndex", "t:0:0000", { recordId: "new" });
+      tx.delete("historyIndex", "t:0:0003");
+      expect(tx.range("historyIndex", { prefix: "t:0:" }).map(([k]) => k)).toEqual(["t:0:0000", "t:0:0001", "t:0:0002", "t:0:00025"]);
+    });
   });
 
   it("refuses a callback that returns a promise, rolls back, and leaves the connection usable", async () => {

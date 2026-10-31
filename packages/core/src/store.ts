@@ -25,6 +25,8 @@ export type StoreState = "INITIALIZING" | "ACTIVE" | "ACTIVATION_PENDING" | "RET
 
 export interface MetaRow {
   schema: 1;
+  /** Set once the history index holds every history row; a store from before the index is backfilled on open. */
+  historyIndex?: 1;
   instanceId: string;
   accountName: string;
   identityId: string;
@@ -244,6 +246,23 @@ export interface PendingResetRow {
   vaultHash: string;
 }
 
+/**
+ * One entry of the history index. Two keys point at every history row: `t:<kind>:<tuple>` for the
+ * timeline and `a:<author>:<kind>:<tuple>` for one author, where the tuple is the zero-padded
+ * `sentAt`, epoch and counter followed by the record id, so keys sort by time and never collide.
+ */
+export interface HistoryIndexRow {
+  recordId: string;
+}
+
+/** A caller's idempotency key and the record it produced, kept for the delivery window. */
+export interface EnqueueKeyRow {
+  recordId: string;
+  epoch: number;
+  counter: number;
+  sentAt: string;
+}
+
 export interface Tables {
   meta: MetaRow;
   self: SelfRow;
@@ -257,6 +276,8 @@ export interface Tables {
   stream: StreamRow;
   outbox: OutboxRow;
   history: HistoryRow;
+  historyIndex: HistoryIndexRow;
+  enqueueKeys: EnqueueKeyRow;
   livePins: LivePinRow;
   statuses: StatusRow;
   readerEpochs: ReaderEpochRow;
@@ -272,11 +293,43 @@ export interface Tables {
 
 export type TableName = keyof Tables;
 
+/** Bounds for `Tx.range`: every given bound applies; an absent one is open. */
+export interface KeyRange {
+  readonly prefix?: string;
+  /** Inclusive lower bound. */
+  readonly gte?: string;
+  /** Exclusive lower bound. */
+  readonly gt?: string;
+  /** Exclusive upper bound. */
+  readonly lt?: string;
+  /** Inclusive upper bound. */
+  readonly lte?: string;
+  /** Descending key order when true. */
+  readonly reverse?: boolean;
+  readonly limit?: number;
+}
+
+/** Whether a key satisfies the bounds of a range (not its limit or order); shared by the stores. */
+export function inKeyRange(key: string, q: KeyRange): boolean {
+  if (q.prefix !== undefined && !key.startsWith(q.prefix)) return false;
+  if (q.gte !== undefined && key < q.gte) return false;
+  if (q.gt !== undefined && key <= q.gt) return false;
+  if (q.lt !== undefined && key >= q.lt) return false;
+  if (q.lte !== undefined && key > q.lte) return false;
+  return true;
+}
+
 export interface Tx {
   get<T extends TableName>(table: T, key: string): Tables[T] | undefined;
   put<T extends TableName>(table: T, key: string, row: Tables[T]): void;
   delete<T extends TableName>(table: T, key: string): void;
   list<T extends TableName>(table: T, prefix?: string): readonly [string, Tables[T]][];
+  /**
+   * A bounded slice of a table in key order: the rows under `prefix` whose keys fall inside the
+   * bounds, ascending or descending, at most `limit` of them. The store serves it without reading
+   * the rest of the table.
+   */
+  range<T extends TableName>(table: T, q: KeyRange): readonly [string, Tables[T]][];
   count(table: TableName): number;
   /**
    * Initiate a network operation inside this transaction (T6h). The call starts now, before
@@ -367,6 +420,12 @@ class MemoryTx implements Tx {
       .filter(([k]) => k.startsWith(prefix))
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([k, v]) => [k, cloneRow(v as Tables[T])]);
+  }
+
+  range<T extends TableName>(table: T, q: KeyRange): readonly [string, Tables[T]][] {
+    const rows = this.list(table, q.prefix).filter(([k]) => inKeyRange(k, q));
+    if (q.reverse) rows.reverse();
+    return q.limit === undefined ? rows : rows.slice(0, Math.max(0, q.limit));
   }
 
   count(table: TableName): number {

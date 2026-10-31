@@ -8,9 +8,10 @@ import { bodyHash } from "./crypto.js";
 import { openEpoch, type AuthorView, type SelfView } from "./epoch.js";
 import { KavachError, isKavachError } from "./errors.js";
 import type { RetentionPolicy } from "./policy.js";
+import { HISTORY_KINDS, authorPrefix, indexHistory, padTime, timelinePrefix, unindexHistory } from "./historyIndex.js";
 import { compareSlots, openRecordWire } from "./record.js";
 import { big, unbig } from "./rows.js";
-import type { HistoryRow, LivePinRow, Store, SubscriptionRow, Tx, StatusRow } from "./store.js";
+import type { HistoryRow, KeyRange, LivePinRow, Store, SubscriptionRow, Tx, StatusRow } from "./store.js";
 import type { Relay } from "./transport.js";
 
 export const MAX_FUTURE_SKEW_MS = 300_000n;
@@ -154,6 +155,7 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
     bodyHash: hash
   };
   tx.put("history", id, row);
+  indexHistory(tx, row);
   let moved = false;
   if (parsed.kind === 0 && !row.superseded) {
     const pinKey = toHex(author.identityId);
@@ -227,12 +229,9 @@ export async function syncStream(deps: InboxDeps, streamId: Uint8Array, authorId
   // read again; records already stored come back as harmless duplicates.
   const unresolved = await deps.store.read((tx) => tx.list("unresolved", toHex(streamId) + ":"));
   const from = unresolved.length > 0 ? unbig(sub.ackPrefix) : unbig(sub.scanPos);
-  let page;
-  try {
-    page = await deps.relay.readRecords(streamId, from, READ_BATCH);
-  } catch {
-    return summary;
-  }
+  // A failed read is the caller's to report: the sync names the stream in its report and goes on
+  // to the next one, rather than counting a stream it never read as synced.
+  const page = await deps.relay.readRecords(streamId, from, READ_BATCH);
   const now = deps.now();
   // Drop unresolved entries the relay has expired.
   for (const [key, u] of unresolved) {
@@ -325,12 +324,31 @@ export interface HistoryEntry {
   readonly own: boolean;
 }
 
+/**
+ * A history query. Every filter is served from the index: an author, a kind, a `sentAt` window
+ * (`since` inclusive, `before` exclusive), the order and a page size. `cursor` continues a page
+ * from `HistoryPage.cursor`; it names a fixed position in time order, so pages stay stable while
+ * records arrive or expire.
+ */
 export interface HistoryQuery {
   readonly authorIdentityId?: Uint8Array;
   readonly kind?: RecordKind;
   readonly since?: bigint;
+  readonly before?: bigint;
+  /** At most this many entries; 1000 when absent. */
   readonly limit?: number;
+  /** Oldest first by default; `"desc"` reads newest first. */
+  readonly order?: "asc" | "desc";
+  readonly cursor?: string;
 }
+
+export interface HistoryPage {
+  readonly entries: HistoryEntry[];
+  /** Present when the page was full: pass it back as `cursor` for the next page. */
+  readonly cursor: string | undefined;
+}
+
+export const HISTORY_PAGE = 1000;
 
 function toEntry(r: HistoryRow): HistoryEntry {
   return {
@@ -345,18 +363,69 @@ function toEntry(r: HistoryRow): HistoryEntry {
   };
 }
 
+/** One page of history in time order, read through the index: one bounded scan per kind, merged. */
+export async function historyPage(store: Store, q: HistoryQuery = {}): Promise<HistoryPage> {
+  const limit = Math.max(0, Math.floor(q.limit ?? HISTORY_PAGE));
+  const reverse = q.order === "desc";
+  const kinds = q.kind === undefined ? HISTORY_KINDS : HISTORY_KINDS.includes(q.kind) ? [q.kind] : [];
+  if (limit === 0 || kinds.length === 0) return { entries: [], cursor: undefined };
+  return store.read((tx) => {
+    const scans = kinds.map((kind) => {
+      const prefix = q.authorIdentityId ? authorPrefix(toHex(q.authorIdentityId), kind) : timelinePrefix(kind);
+      // Bounds in tuple space, prefixed into key space: the lower end from `since` and an
+      // ascending cursor, the upper end from `before` and a descending cursor, the tighter winning.
+      const upper = [q.before === undefined ? undefined : padTime(q.before), reverse ? q.cursor : undefined].filter((b): b is string => b !== undefined).sort()[0];
+      const range: KeyRange = {
+        prefix,
+        ...(q.since === undefined ? {} : { gte: prefix + padTime(q.since) }),
+        ...(!reverse && q.cursor !== undefined ? { gt: prefix + q.cursor } : {}),
+        ...(upper === undefined ? {} : { lt: prefix + upper }),
+        reverse,
+        limit
+      };
+      return tx.range("historyIndex", range).map(([key, r]) => ({ tuple: key.slice(prefix.length), recordId: r.recordId }));
+    });
+    const merged = mergeByTuple(scans, reverse, limit);
+    const entries: HistoryEntry[] = [];
+    for (const m of merged) {
+      const row = tx.get("history", m.recordId);
+      if (row) entries.push(toEntry(row));
+    }
+    return { entries, cursor: merged.length === limit ? merged[merged.length - 1]?.tuple : undefined };
+  });
+}
+
+/** The first page only, for callers that want a plain list. */
 export async function history(store: Store, q: HistoryQuery = {}): Promise<HistoryEntry[]> {
-  return store.read((tx) =>
-    tx
-      .list("history")
-      .map(([, r]) => r)
-      .filter((r) => (q.authorIdentityId ? r.authorIdentityId === toHex(q.authorIdentityId) : true))
-      .filter((r) => (q.kind === undefined ? true : r.kind === q.kind))
-      .filter((r) => (q.since === undefined ? true : unbig(r.sentAt) >= q.since))
-      .sort((a, b) => (unbig(a.sentAt) < unbig(b.sentAt) ? -1 : unbig(a.sentAt) > unbig(b.sentAt) ? 1 : a.epoch - b.epoch || a.counter - b.counter))
-      .slice(0, q.limit ?? 1000)
-      .map(toEntry)
-  );
+  return (await historyPage(store, q)).entries;
+}
+
+/** The newest history entry matching the filters, read as a one-entry descending page. */
+export async function newest(store: Store, q: Pick<HistoryQuery, "authorIdentityId" | "kind"> = {}): Promise<HistoryEntry | undefined> {
+  return (await historyPage(store, { ...q, order: "desc", limit: 1 })).entries[0];
+}
+
+interface IndexHit {
+  readonly tuple: string;
+  readonly recordId: string;
+}
+
+/** Merge per-kind scans that are each in order into one ordered list of at most `limit`. */
+function mergeByTuple(scans: IndexHit[][], reverse: boolean, limit: number): IndexHit[] {
+  const heads = scans.map(() => 0);
+  const out: IndexHit[] = [];
+  while (out.length < limit) {
+    let pick: { i: number; hit: IndexHit } | undefined;
+    for (let i = 0; i < scans.length; i++) {
+      const hit = scans[i]?.[heads[i] ?? 0];
+      if (!hit) continue;
+      if (!pick || (reverse ? hit.tuple > pick.hit.tuple : hit.tuple < pick.hit.tuple)) pick = { i, hit };
+    }
+    if (!pick) break;
+    out.push(pick.hit);
+    heads[pick.i] = (heads[pick.i] ?? 0) + 1;
+  }
+  return out;
 }
 
 export interface Latest {
@@ -399,19 +468,33 @@ export async function latestStatus(store: Store, authorIdentityId: Uint8Array, n
  * so an older status replayed later cannot become current.
  */
 export async function purgeHistory(store: Store, policy: RetentionPolicy, now: bigint): Promise<number> {
-  const expired = (kind: RecordKind, sentAt: string): boolean => unbig(sentAt) + (kind === 1 ? policy.checkInHistoryMs : policy.locationHistoryMs) <= now;
-  const staleStatus = (r: StatusRow): boolean => r.payload !== null && expired(2, r.sentAt);
+  const window = (kind: RecordKind): bigint => (kind === 1 ? policy.checkInHistoryMs : policy.locationHistoryMs);
+  const staleStatus = (r: StatusRow): boolean => r.payload !== null && unbig(r.sentAt) + window(2) <= now;
+  // The expired prefix of each kind's timeline: `sentAt + window <= now`, as a key bound.
+  const expiredRange = (kind: RecordKind, limit?: number): KeyRange | undefined => {
+    const cutoff = now - window(kind) + 1n;
+    return cutoff <= 0n ? undefined : { prefix: timelinePrefix(kind), lt: timelinePrefix(kind) + padTime(cutoff), ...(limit === undefined ? {} : { limit }) };
+  };
+  const expired = (tx: Pick<Tx, "range">, limit?: number) => HISTORY_KINDS.flatMap((kind) => {
+    const r = expiredRange(kind, limit);
+    return r ? tx.range("historyIndex", r) : [];
+  });
   // Read first: most syncs purge nothing and must not take the writer lock for it.
-  const any = await store.read((tx) => tx.list("history").some(([, r]) => expired(r.kind, r.sentAt)) || tx.list("statuses").some(([, r]) => staleStatus(r)));
+  const any = await store.read((tx) => expired(tx, 1).length > 0 || tx.list("statuses").some(([, r]) => staleStatus(r)));
   if (!any) return 0;
   return store.transaction((tx) => {
     let removed = 0;
-    for (const [key, r] of tx.list("history")) {
-      if (expired(r.kind, r.sentAt)) {
-        tx.delete("history", key);
-        removed++;
-        for (const [pk, pin] of tx.list("livePins")) if (pin.recordId === key) tx.delete("livePins", pk);
+    for (const [key, hit] of expired(tx)) {
+      const row = tx.get("history", hit.recordId);
+      if (!row) {
+        tx.delete("historyIndex", key);
+        continue;
       }
+      unindexHistory(tx, row);
+      tx.delete("history", hit.recordId);
+      removed++;
+      const pin = tx.get("livePins", row.authorIdentityId);
+      if (pin?.recordId === hit.recordId) tx.delete("livePins", row.authorIdentityId);
     }
     for (const [key, r] of tx.list("statuses")) {
       if (staleStatus(r)) {

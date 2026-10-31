@@ -11,18 +11,26 @@ import { randomBytes, ready, type BoxKeypair } from "./crypto.js";
 import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
-import { forgetAuthor, forgetAuthorIn, history, latest, latestStatus, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryQuery, type Latest, type LatestStatus, type ReceiveResult } from "./inbox.js";
-import { drain, enqueue, outboxCount, outboxCounts, purgeOutbox, type OutboxCounts } from "./outbox.js";
+import { ensureHistoryIndex } from "./historyIndex.js";
+import { forgetAuthor, forgetAuthorIn, history, historyPage, latest, latestStatus, newest, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Latest, type LatestStatus, type ReceiveResult } from "./inbox.js";
+import { drain, enqueue, outboxCount, outboxCounts, purgeOutbox, type EnqueueOptions, type OutboxCounts } from "./outbox.js";
+export type { EnqueueOptions } from "./outbox.js";
+
+/** The durable record a hand-over produced; `duplicate` when an idempotency key matched an earlier one. */
+export interface EnqueueResult {
+  readonly recordId: Uint8Array;
+  readonly duplicate: boolean;
+}
 import { validatePolicy, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
 import type { CircleRow, PendingResetRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
 import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t3Circle, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault } from "./transactions.js";
-import type { Transport } from "./transport.js";
+import type { Relay, Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
 
 /** The types of the client's queries and of `receive`, defined with the inbox. */
-export type { HistoryEntry, HistoryQuery, Latest, LatestStatus, ReceiveResult } from "./inbox.js";
+export type { HistoryEntry, HistoryPage, HistoryQuery, Latest, LatestStatus, ReceiveResult } from "./inbox.js";
 
 /** accountSeed, deviceSeed, recoveryKey, instanceId and deviceId of a pending reset, in the secret store. */
 const RESET_ROOTS_BYTES = 32 * 3 + 16 + 16;
@@ -120,13 +128,18 @@ export interface Client {
   recoveryStatus(): Promise<ProviderStatusResult>;
   recoveryCode(): Promise<string>;
   restoreAccount(recoveryCode?: string): Promise<{ identityId: Uint8Array; generation: bigint }>;
-  enqueueLocation(location: Location): Promise<{ recordId: Uint8Array }>;
-  enqueueCheckIn(payload: Location | Uint8Array): Promise<{ recordId: Uint8Array }>;
+  enqueueLocation(location: Location, options?: EnqueueOptions): Promise<EnqueueResult>;
+  enqueueCheckIn(payload: Location | Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult>;
   /** A status (kind 2): the sender's current state in an application payload. Latest wins in the outbox. */
-  enqueueStatus(payload: Uint8Array): Promise<{ recordId: Uint8Array }>;
+  enqueueStatus(payload: Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult>;
   sync(): Promise<SyncReport>;
   receive(wire: Uint8Array): Promise<ReceiveResult>;
+  /** The first page of `historyPage`, as a list. */
   history(query?: HistoryQuery): Promise<HistoryEntry[]>;
+  /** One page of history in time order with a cursor for the next; served from the index. */
+  historyPage(query?: HistoryQuery): Promise<HistoryPage>;
+  /** The newest history entry for an author or kind, own records and superseded ones included. */
+  newest(query?: Pick<HistoryQuery, "authorIdentityId" | "kind">): Promise<HistoryEntry | undefined>;
   latest(identityId: Uint8Array): Promise<Latest | undefined>;
   latestStatus(identityId: Uint8Array): Promise<LatestStatus | undefined>;
   inspect(): Promise<Inspection>;
@@ -220,6 +233,7 @@ class ClientImpl implements Client {
     await this.finishInterruptedReset();
     const opened = await openStore(this.store, this.secrets, this.accountName);
     if (opened.kind === "fresh") return;
+    await ensureHistoryIndex(this.store);
     this.account = opened.account;
     const deviceSeed = await this.secrets.get("deviceSeed");
     const self = await this.store.read((tx) => tx.get("self", "self"));
@@ -589,30 +603,30 @@ class ClientImpl implements Client {
 
   // Sending ---------------------------------------------------------------------------------------
 
-  async enqueueLocation(location: Location): Promise<{ recordId: Uint8Array }> {
-    return this.enqueueKind(0, encodeLocation(location));
+  async enqueueLocation(location: Location, options?: EnqueueOptions): Promise<EnqueueResult> {
+    return this.enqueueKind(0, encodeLocation(location), options);
   }
 
-  async enqueueCheckIn(payload: Location | Uint8Array): Promise<{ recordId: Uint8Array }> {
-    return this.enqueueKind(1, payload instanceof Uint8Array ? payload : encodeLocation(payload));
+  async enqueueCheckIn(payload: Location | Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult> {
+    return this.enqueueKind(1, payload instanceof Uint8Array ? payload : encodeLocation(payload), options);
   }
 
-  async enqueueStatus(payload: Uint8Array): Promise<{ recordId: Uint8Array }> {
-    return this.enqueueKind(2, payload);
+  async enqueueStatus(payload: Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult> {
+    return this.enqueueKind(2, payload, options);
   }
 
-  private async enqueueKind(kind: RecordKind, payload: Uint8Array): Promise<{ recordId: Uint8Array }> {
+  private async enqueueKind(kind: RecordKind, payload: Uint8Array, options: EnqueueOptions = {}): Promise<EnqueueResult> {
     const deps = this.outboxDeps();
     await this.ensureEpoch();
     try {
-      const r = await enqueue(deps, kind, payload);
-      return { recordId: r.recordId };
+      const r = await enqueue(deps, kind, payload, options);
+      return { recordId: r.recordId, duplicate: r.duplicate };
     } catch (e) {
       if (isKavachError(e, "ROTATION_REQUIRED") || isKavachError(e, "COUNTER_EXHAUSTED")) {
         await this.ensureEpoch();
-        const r = await enqueue(deps, kind, payload);
+        const r = await enqueue(deps, kind, payload, options);
         this.emit({ kind: "needsLocation", reason: "rotation" });
-        return { recordId: r.recordId };
+        return { recordId: r.recordId, duplicate: r.duplicate };
       }
       throw e;
     }
@@ -761,9 +775,16 @@ class ClientImpl implements Client {
     } catch (e) {
       report.errors.push(syncError("outbox", e));
     }
+    let subs: Awaited<ReturnType<Relay["listSubscriptions"]>> = [];
     try {
-      const subs = await this.transport.relay.listSubscriptions();
-      for (const s of subs) {
+      subs = await this.transport.relay.listSubscriptions();
+    } catch (e) {
+      report.errors.push(syncError("listSubscriptions", e));
+    }
+    // Each stream on its own: a failed download or a refused record names its stream in the report
+    // and leaves the other streams to be read; a stream that failed is not counted as synced.
+    for (const s of subs) {
+      try {
         const known = await this.store.read((tx) => tx.list("certificates").some(([, c]) => c.streamId === toHex(s.streamId)));
         if (!known) continue;
         const r = await syncStream(this.inboxDeps(), s.streamId, s.authorIdentityId);
@@ -772,9 +793,9 @@ class ClientImpl implements Client {
         report.inbox.keyPending += r.keyPending;
         report.inbox.invalid += r.invalid;
         if (r.acked !== undefined) report.inbox.acked++;
+      } catch (e) {
+        report.errors.push(syncError("inbox", e));
       }
-    } catch (e) {
-      report.errors.push(syncError("inbox", e));
     }
     report.purged = (await purgeHistory(this.store, this.policy, this.now())) + (await purgeOutbox(this.store, this.policy, this.now()));
     await this.emitState();
@@ -1035,6 +1056,14 @@ class ClientImpl implements Client {
 
   history(query?: HistoryQuery): Promise<HistoryEntry[]> {
     return history(this.store, query);
+  }
+
+  historyPage(query?: HistoryQuery): Promise<HistoryPage> {
+    return historyPage(this.store, query);
+  }
+
+  newest(query?: Pick<HistoryQuery, "authorIdentityId" | "kind">): Promise<HistoryEntry | undefined> {
+    return newest(this.store, query);
   }
 
   latest(identityId: Uint8Array): Promise<Latest | undefined> {
@@ -1351,7 +1380,7 @@ class ClientImpl implements Client {
     const newPin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage));
     await t1Secrets(this.secrets, { accountSeed, deviceSeed, recoveryKey, instanceId });
     await this.store.transaction((tx) => {
-      for (const table of ["meta", "self", "pins", "certificates", "quarantine", "circles", "revision", "vault", "epochs", "stream", "outbox", "history", "livePins", "statuses", "readerEpochs", "subscriptions", "unresolved", "activation", "pendingReset"] as const) {
+      for (const table of ["meta", "self", "pins", "certificates", "quarantine", "circles", "revision", "vault", "epochs", "stream", "outbox", "history", "historyIndex", "enqueueKeys", "livePins", "statuses", "readerEpochs", "subscriptions", "unresolved", "activation", "pendingReset"] as const) {
         for (const [k] of tx.list(table)) tx.delete(table, k);
       }
       t1Header(tx, { account, device, certificate, instanceId, generation: 1n });

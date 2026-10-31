@@ -363,6 +363,7 @@ This section states what the local store must guarantee. Which database or secre
 - **One writer.** All writes from every execution context of the app run under one mutual-exclusion primitive that spans processes. Reads that only inspect state may run outside it.
 - **The handoff.** The lock protects only what happens inside it, so the one network operation whose ordering matters, the handoff of an outbound record, is initiated inside it (T6h). Every other network call runs outside, and its result is recorded in a new transaction that first revalidates `desiredRevision`, the certificate generation and the epoch; a context whose revalidation fails discards its result.
 - **Bounded waiting.** A writer that cannot acquire the lock returns `RETRYABLE` without allocating counters or keys.
+- **Bounded reads.** The store serves an ordered key range under a limit without reading the rest of a table. History carries a time-ordered index, two keys per row (the timeline of a kind, and one author's), written with the row in T6 and T7 and removed with it by the retention purge; queries, cursors and the purge read a slice of that index, never the history table. A store written before the index exists is indexed once on open and the header records it.
 
 #### Transaction boundaries
 
@@ -373,9 +374,9 @@ This section states what the local store must guarantee. Which database or secre
 | T3 | Verified circle or device change, `desiredRevision` increment, active `SK` invalidation, cancellation of obsolete pending records. |
 | T4 | Exact manifest, wraps, `SK` and audience checkpoint for a prepared epoch. |
 | T5 | Epoch publication outcome and conditional promotion with `nextCounter = 0`. |
-| T6 | Outbound record into the outbox and local history, counter increment. |
+| T6 | Outbound record into the outbox and local history with its index entries, the idempotency key when given, counter increment. |
 | T6h | Handoff: eligibility re-check, in-flight mark and the send call for one outbound record. |
-| T7 | Inbound record, disposition, conditional live pin, and the acknowledgement cursor under the rule in section 10. |
+| T7 | Inbound record with its index entries, disposition, conditional live pin, and the acknowledgement cursor under the rule in section 10. |
 | T8 | Owner snapshot: the successor revision and its hash, built from local state plus one change; kept pending until the host confirms it, and published again by every sync until then. |
 | T9 | A standalone vault update before publication, kept pending and published again by every sync until confirmed; or an accepted reset-key list; or an accepted reset receipt together with every effect it has: the closures, the rotation and the forgotten author. |
 | T10 | Own reset: the new account, device and recovery roots in the secret store and the exact new certificate, vault and `resetId` in the store, before the reset is sent. |
@@ -421,9 +422,9 @@ Old and new ids must differ. For an unseen receipt the SDK requires a fresh key 
 
 - `initializeAccount()` creates the account, its first device and vault and saves the `recoveryKey` through the provider; it returns without a recovery code. `recoveryStatus()` reports the provider's `backupState`; `recoveryCode()` reveals the code on demand after local authentication.
 - `restoreAccount(optionalCode)` recovers the account and activates a fresh device under it, trying the provider first.
-- `enqueueLocation(location)`, `enqueueCheckIn(location | bytes)`: durable outbound records. `enqueueStatus(bytes)`: the sender's current state, latest wins while queued. `latest(identityId)` and `latestStatus(identityId)` read an author's live pin and newest status; `statusUpdated` is emitted when the latter changes.
-- `sync()` first finishes a pending reset or activation, then publishes pending owner snapshots and vault updates, then verifies metadata (certificates, snapshots, the reset-key list when due), reconciles epochs, drains the outbox, reads and acknowledges batches. Concurrent callers coalesce.
-- `receive(wire)` for a record pushed by the host outside `sync`; `history(query)` and `latest(identityId)` read the durable state; `inspect()` returns public metadata only.
+- `enqueueLocation(location, options?)`, `enqueueCheckIn(location | bytes, options?)`: durable outbound records. `enqueueStatus(bytes, options?)`: the sender's current state, latest wins while queued. `options.idempotencyKey`, a caller-chosen string of at most 128 characters derived from the sample itself, makes a repeated hand-over, from a retry after a crash or from another runtime on the same store, return the record the first one made with `duplicate: true` and seal nothing; a key is kept for `deliveryWindowMs`, and the check happens before any other condition because the record is already durable. `latest(identityId)` and `latestStatus(identityId)` read an author's live pin and newest status; `statusUpdated` is emitted when the latter changes.
+- `sync()` first finishes a pending reset or activation, then publishes pending owner snapshots and vault updates, then verifies metadata (certificates, snapshots, the reset-key list when due), reconciles epochs, drains the outbox, reads and acknowledges batches. Concurrent callers coalesce. Every step a sync worked around is one entry of the report's `errors`, with the operation, the protocol code and whether a retry may succeed; a failed download names its stream as the `inbox` operation, that stream is not counted among the streams synced, and the other streams are still read. A report with an empty `errors` means every step ran.
+- `receive(wire)` for a record pushed by the host outside `sync`. `historyPage(query)` reads history in time order through the history index (section 11): an author, a kind, a `sentAt` window, ascending or descending, a page size and a cursor that names a fixed position, so pages stay stable while records arrive or expire; `history(query)` is its first page as a list and `newest(query)` its newest entry. `latest(identityId)` reads the live pin; `inspect()` returns public metadata only.
 - `circles.create()`, `requestJoin(circleId, ownerIdentityId, { shareOnApproval })`, `approve(circleId, accountName)`, `remove(circleId, memberIdentityId)`, `leave(circleId)`, `setEnabled(circleId, bool)`, `closeCircle(circleId)`. Device replacement never calls any of these.
 - `resetAccount({ confirmed: true })`. `subscribe(listener)` for state and events. `close()` cancels work and zeroes temporary secrets best-effort.
 
@@ -497,7 +498,7 @@ Revision 5 changes no wire byte and no vector. It corrects the durable-state rul
 
 #### Revision 6
 
-Revision 6 assigns flag bit 2 of the record header, reserved until now, to a third record kind, the status (section 9), and changes nothing else on the wire. The fixture's reserved-flag negative moves to bit 3, a negative with bits 1 and 2 both set is added, and a status record vector is added; every other vector is unchanged. Readers adopt revision 6 before any sender emits a status, since a revision 5 reader rejects one as malformed.
+Revision 6 assigns flag bit 2 of the record header, reserved until now, to a third record kind, the status (section 9), and changes nothing else on the wire. The fixture's reserved-flag negative moves to bit 3, a negative with bits 1 and 2 both set is added, and a status record vector is added; every other vector is unchanged. Readers adopt revision 6 before any sender emits a status, since a revision 5 reader rejects one as malformed. Revision 6 also states three client-contract rules (section 13) that need no wire change: a failed download is reported, not counted as a synced stream; history is read through a time-ordered index with stable cursors (section 11); and an enqueue may carry an idempotency key.
 
 ### 17. Questions for the reviewer
 

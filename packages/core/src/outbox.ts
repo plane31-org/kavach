@@ -4,10 +4,11 @@
 import { fromHex, toHex } from "./bytes.js";
 import { rotationReason, MAX_COUNTER } from "./epoch.js";
 import { KavachError } from "./errors.js";
+import { indexHistory } from "./historyIndex.js";
 import type { RetentionPolicy } from "./policy.js";
 import { sealRecord } from "./record.js";
 import { big, unbig } from "./rows.js";
-import type { OutboxRow, Store, Tx } from "./store.js";
+import type { HistoryRow, OutboxRow, Store, Tx } from "./store.js";
 import { META, REVISION, STREAM, currentRevision, t3ApplyChange } from "./transactions.js";
 import type { AppendOutcome, Relay } from "./transport.js";
 import type { RecordKind } from "./codec.js";
@@ -37,17 +38,45 @@ function requireReady(tx: Pick<Tx, "get">): void {
   if (meta.state !== "ACTIVE") throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", "enqueue", `store is ${meta.state}`);
 }
 
+export interface EnqueueOptions {
+  /**
+   * A caller-chosen key for this hand-over, derived from the sample itself (its fix time and
+   * source, say). A second enqueue under the same key, from a retry after a crash or from another
+   * runtime, returns the record the first one made and seals nothing. Keys are kept for the
+   * delivery window. Up to 128 characters.
+   */
+  readonly idempotencyKey?: string;
+}
+
+export interface Enqueued {
+  recordId: Uint8Array;
+  counter: number;
+  epoch: number;
+  /** True when the idempotency key matched an earlier enqueue and this call made no record. */
+  duplicate: boolean;
+}
+
+export const MAX_IDEMPOTENCY_KEY = 128;
+
 /**
  * T6: require a usable active epoch under the current desired revision, enforce the queue limits,
  * seal once, write the outbox row and the own history row, and advance the counter. The record
  * id is returned only after commit. A status (kind 2) is latest-wins: a status still queued when
- * a newer one is enqueued is cancelled, never sent, and a status writes no history row.
+ * a newer one is enqueued is cancelled, never sent, and a status writes no history row. An
+ * idempotency key is answered before any check: its record is already durable, whatever has
+ * happened to the queue since.
  */
-export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8Array): Promise<{ recordId: Uint8Array; counter: number; epoch: number }> {
+export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8Array, options: EnqueueOptions = {}): Promise<Enqueued> {
   const stage = "enqueue";
+  const key = options.idempotencyKey;
+  if (key !== undefined && (key.length === 0 || key.length > MAX_IDEMPOTENCY_KEY)) throw new KavachError("MALFORMED", stage, "idempotency key must be 1 to 128 characters");
   const superseded: Uint8Array[] = [];
   const result = await deps.store.transaction((tx) => {
     requireReady(tx);
+    if (key !== undefined) {
+      const seen = tx.get("enqueueKeys", key);
+      if (seen) return { recordId: fromHex(seen.recordId), counter: seen.counter, epoch: seen.epoch, duplicate: true } as const;
+    }
     const revision = tx.get("revision", REVISION);
     if (revision?.paused === "metadata") throw new KavachError("METADATA_REQUIRED", stage);
     if (revision?.paused === "limit") throw new KavachError("RECIPIENT_LIMIT", stage);
@@ -101,8 +130,9 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
       attempts: 0,
       reason: undefined
     });
+    if (key !== undefined) tx.put("enqueueKeys", key, { recordId: id, epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now) });
     if (kind !== 2) {
-      tx.put("history", id, {
+      const own: HistoryRow = {
         recordId: id,
         authorIdentityId: toHex(a.identityId),
         streamId: toHex(a.streamId),
@@ -115,18 +145,21 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
         plaintext: toHex(payload),
         superseded: false,
         own: true
-      });
+      };
+      tx.put("history", id, own);
+      indexHistory(tx, own);
     }
     const nextCounter = epoch.nextCounter + 1;
     tx.put("epochs", String(epoch.epoch), { ...epoch, nextCounter, lastSentAt: big(now) });
     if (nextCounter > MAX_COUNTER) {
       // The final counter was just used: the next enqueue rotates.
     }
-    return { recordId: sealed.recordId, counter: sealed.counter, epoch: epoch.epoch };
+    return { recordId: sealed.recordId, counter: sealed.counter, epoch: epoch.epoch, duplicate: false } as const;
   });
   if ("rotate" in result) {
     throw new KavachError(result.rotate === "counterExhausted" ? "COUNTER_EXHAUSTED" : "ROTATION_REQUIRED", stage, result.rotate);
   }
+  if (result.duplicate) return result;
   for (const id of superseded) deps.events?.cancelled?.(id, "superseded");
   deps.events?.queued?.(result.recordId, kind);
   return result;
@@ -288,6 +321,8 @@ export async function purgeOutbox(store: Store, policy: RetentionPolicy, now: bi
         purged++;
       }
     }
+    // Idempotency keys outlive the delivery window by nothing: a replay later is a new record.
+    for (const [key, row] of tx.list("enqueueKeys")) if (unbig(row.sentAt) + policy.deliveryWindowMs <= now) tx.delete("enqueueKeys", key);
     return purged;
   });
 }

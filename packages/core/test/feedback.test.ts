@@ -8,9 +8,11 @@ import { open } from "../src/client.js";
 import { ready } from "../src/crypto.js";
 import { testPolicy } from "../src/testing/clock.js";
 import { FaultyStore } from "../src/testing/faults.js";
-import type { Directory } from "../src/transport.js";
-import { VAULT } from "../src/transactions.js";
-import { pair, resetTrust, thrown, world } from "./clientWorld.js";
+import { KavachError } from "../src/errors.js";
+import { MemoryStore, type Store, type Tx } from "../src/store.js";
+import type { Directory, Relay } from "../src/transport.js";
+import { META, VAULT } from "../src/transactions.js";
+import { pair, resetTrust, thrown, world, type World } from "./clientWorld.js";
 
 beforeAll(() => ready());
 
@@ -231,4 +233,151 @@ describe("feedback findings", () => {
     expect((await w.sync(b)).inbox.stored).toBe(1);
     expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
   });
+
+  it("13: a stream whose download fails is named in the sync report, is not counted as synced, and the other streams are still read", async () => {
+    const w = world();
+    const { a, b } = await pair(w);
+    const c = await thirdAuthor(w, b);
+    await a.client.enqueueLocation(w.loc(2));
+    await c.client.enqueueLocation(w.loc(3));
+    await w.sync(a);
+    await w.sync(c);
+    // The first read of this sync fails before reaching the host; the second stream is served.
+    const relay = b.t.relay as { readRecords: Relay["readRecords"] };
+    const read = relay.readRecords;
+    relay.readRecords = async () => {
+      relay.readRecords = read;
+      throw new KavachError("NETWORK", "transport", "network unreachable");
+    };
+    const r = await w.sync(b);
+    expect(r.errors).toEqual([{ operation: "inbox", code: "NETWORK", stage: "transport", retryable: true }]);
+    expect([r.inbox.streams, r.inbox.stored]).toEqual([1, 1]);
+    const again = await w.sync(b);
+    expect([again.errors, again.inbox.streams, again.inbox.stored]).toEqual([[], 2, 1]);
+  });
+
+  it("14: the same idempotency key from a retry or another runtime yields the one record; a new key or an expired one makes a new record", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    const first = await a.client.enqueueLocation(w.loc(4), { idempotencyKey: "fix:1" });
+    const retry = await a.client.enqueueLocation(w.loc(4), { idempotencyKey: "fix:1" });
+    expect([retry.duplicate, toHex(retry.recordId)]).toEqual([true, toHex(first.recordId)]);
+    // Another runtime on the same store, as the background task would be.
+    const other = await open({ accountName: "alice", retentionPolicy: testPolicy, recoveryProvider: a.provider, resetTrust, secretStore: a.secrets, store: a.store.fork(), transport: a.t, now: w.clock.now });
+    const fromOther = await other.enqueueLocation(w.loc(4), { idempotencyKey: "fix:1" });
+    expect([fromOther.duplicate, toHex(fromOther.recordId)]).toEqual([true, toHex(first.recordId)]);
+    expect(a.events.filter((e) => e.kind === "queued").length).toBe(2); // the pair's location and this one
+    expect(await a.store.read((tx) => tx.list("outbox").filter(([, r]) => r.status === "queued").length)).toBe(1);
+    const second = await a.client.enqueueLocation(w.loc(4), { idempotencyKey: "fix:2" });
+    expect([second.duplicate, toHex(second.recordId) === toHex(first.recordId)]).toEqual([false, false]);
+    expect(await thrown(() => a.client.enqueueLocation(w.loc(4), { idempotencyKey: "" }))).toBe("MALFORMED");
+    expect(await thrown(() => a.client.enqueueLocation(w.loc(4), { idempotencyKey: "k".repeat(129) }))).toBe("MALFORMED");
+    await w.sync(a);
+    expect((await w.sync(b)).inbox.stored).toBe(2);
+    expect((await b.client.history({ authorIdentityId: aliceId })).length).toBe(3);
+    // Keys live for the delivery window; after it the same key is a new hand-over.
+    w.clock.advance(testPolicy.deliveryWindowMs + 1n);
+    await w.sync(a);
+    expect(await a.store.read((tx) => tx.count("enqueueKeys"))).toBe(0);
+    const later = await a.client.enqueueLocation(w.loc(4), { idempotencyKey: "fix:1" });
+    expect([later.duplicate, toHex(later.recordId) === toHex(first.recordId)]).toEqual([false, false]);
+  });
+
+  it("15: history pages are served from the index in time order, with a stable cursor, a window, a kind filter and a newest query", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    const c = await thirdAuthor(w, b);
+    const carolId = (await c.client.inspect()).identityId ?? new Uint8Array();
+    const pairRecord = toHex((await b.client.history())[0]?.recordId ?? new Uint8Array());
+    const sent: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      w.clock.advance(60_000n);
+      const r = i % 3 === 2 ? await a.client.enqueueCheckIn(w.loc(10 + i)) : await (i % 2 ? c : a).client.enqueueLocation(w.loc(10 + i));
+      sent.push(toHex(r.recordId));
+    }
+    await w.sync(a);
+    await w.sync(c);
+    await w.sync(b);
+    // The history table itself is never listed: every query goes through the index.
+    const guarded = guardListing(b.store, "history");
+    const all = await b.client.history();
+    expect(all.map((h) => toHex(h.recordId))).toEqual([pairRecord, ...sent]);
+    const { historyPage, newest } = await import("../src/inbox.js");
+    const pages: string[][] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await historyPage(guarded, { order: "desc", limit: 3, cursor });
+      pages.push(page.entries.map((h) => toHex(h.recordId)));
+      cursor = page.cursor;
+      // A record arriving mid-pagination does not move the cursor's position.
+      if (pages.length === 1) await c.client.enqueueLocation(w.loc(30));
+    } while (cursor);
+    expect(pages.flat()).toEqual([...sent].reverse().concat([pairRecord]));
+    expect(pages.map((p) => p.length)).toEqual([3, 3, 1]);
+    expect((await historyPage(guarded, { kind: 1 })).entries.map((h) => toHex(h.recordId))).toEqual([sent[2], sent[5]]);
+    expect((await historyPage(guarded, { authorIdentityId: carolId })).entries.map((h) => toHex(h.recordId))).toEqual([sent[1], sent[3]]);
+    expect((await historyPage(guarded, { since: all[2]?.sentAt, before: all[4]?.sentAt })).entries.map((h) => toHex(h.recordId))).toEqual([sent[1], sent[2]]);
+    expect((await historyPage(guarded, { kind: 2 })).entries).toEqual([]);
+    expect(toHex((await newest(guarded, { authorIdentityId: aliceId }))?.recordId ?? new Uint8Array())).toBe(sent[5] ?? "");
+    expect(toHex((await newest(guarded, { kind: 0 }))?.recordId ?? new Uint8Array())).toBe(sent[4] ?? "");
+    expect(toHex((await b.client.newest())?.recordId ?? new Uint8Array())).toBe(sent[5] ?? "");
+    // Expiry removes the index entries with the rows, and the pin that pointed at one of them.
+    w.clock.advance(testPolicy.locationHistoryMs);
+    const r = await w.sync(b);
+    expect(r.purged).toBeGreaterThan(0);
+    expect(await b.store.read((tx) => [tx.count("history"), tx.count("historyIndex"), tx.count("livePins")])).toEqual([2, 4, 0]);
+    expect((await b.client.history()).map((h) => h.kind)).toEqual([1, 1]);
+  });
+
+  it("16: a store written before the index exists is indexed on open, and its history reads the same", async () => {
+    const w = world();
+    const { b, aliceId } = await pair(w);
+    const before = (await b.client.history()).map((h) => toHex(h.recordId));
+    await b.store.transaction((tx) => {
+      for (const [k] of tx.list("historyIndex")) tx.delete("historyIndex", k);
+      const meta = tx.get("meta", META);
+      if (!meta) throw new Error("no meta");
+      const legacy = { ...meta };
+      delete legacy.historyIndex;
+      tx.put("meta", META, legacy);
+    });
+    expect(await b.client.history()).toEqual([]);
+    const reopened = await open({ accountName: "bob", retentionPolicy: testPolicy, recoveryProvider: b.provider, resetTrust, secretStore: b.secrets, store: b.store.fork(), transport: b.t, now: w.clock.now });
+    expect((await reopened.history({ authorIdentityId: aliceId })).map((h) => toHex(h.recordId))).toEqual(before);
+    expect(await b.store.read((tx) => [tx.get("meta", META)?.historyIndex, tx.count("historyIndex")])).toEqual([1, 2]);
+  });
 });
+
+/** Carol: a third author who shares with Bob through a circle of her own. */
+async function thirdAuthor(w: World, b: Awaited<ReturnType<World["device"]>>): Promise<Awaited<ReturnType<World["device"]>>> {
+  const c = await w.device("carol");
+  await c.client.initializeAccount();
+  const { circleId } = await c.client.circles.create();
+  const carolId = (await c.client.inspect()).identityId ?? new Uint8Array();
+  await b.client.circles.requestJoin(circleId, carolId);
+  await w.sync(c);
+  await c.client.circles.approve(circleId, "bob");
+  await w.sync(c);
+  await w.sync(b);
+  await w.sync(c);
+  return c;
+}
+
+/** A store whose reads refuse to list one table, so a test can prove a query never scans it. */
+function guardListing(store: MemoryStore, table: string): Store {
+  const guard = <T extends object>(tx: T): T =>
+    new Proxy(tx, {
+      get(target, prop, receiver) {
+        const v = Reflect.get(target, prop, receiver) as unknown;
+        if (prop === "list") return (t: string, prefix?: string) => {
+          if (t === table) throw new Error(`listed ${table}`);
+          return (target as unknown as Tx).list(t as never, prefix);
+        };
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      }
+    });
+  return {
+    transaction: (fn) => store.transaction((tx) => fn(guard(tx))),
+    read: (fn) => store.read((tx) => fn(guard(tx)))
+  };
+}

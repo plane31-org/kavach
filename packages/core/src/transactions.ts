@@ -65,6 +65,7 @@ export function t1Header(tx: Tx, input: { account: OwnAccount; device: DeviceKey
   if (!equalBytes(pin.identityId, input.account.identityId)) throw new KavachError("MALFORMED", "t1", "certificate is not for this account");
   tx.put("meta", META, {
     schema: 1,
+    historyIndex: 1,
     instanceId: toHex(input.instanceId),
     accountName: input.account.accountName,
     identityId: toHex(input.account.identityId),
