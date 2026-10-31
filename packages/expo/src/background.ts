@@ -14,6 +14,8 @@ export interface BackgroundResult {
   enqueued: number;
   skipped: number;
   synced: boolean;
+  /** The sync's inbox budget stopped before the relay was drained: schedule another sync soon. */
+  hasMore: boolean;
   error: string | undefined;
 }
 
@@ -24,7 +26,7 @@ export interface BackgroundResult {
  * samples are sent as status 2.
  */
 export async function handleBackgroundLocations(client: Client, locations: readonly ExpoLocationObject[], lastHandled: { timestamp: number }): Promise<BackgroundResult> {
-  const result: BackgroundResult = { enqueued: 0, skipped: 0, synced: false, error: undefined };
+  const result: BackgroundResult = { enqueued: 0, skipped: 0, synced: false, hasMore: false, error: undefined };
   const sorted = [...locations].sort((a, b) => a.timestamp - b.timestamp);
   for (const l of sorted) {
     if (l.timestamp <= lastHandled.timestamp) {
@@ -46,7 +48,7 @@ export async function handleBackgroundLocations(client: Client, locations: reado
     }
   }
   try {
-    await client.sync();
+    result.hasMore = (await client.sync()).inbox.hasMore;
     result.synced = true;
   } catch (e) {
     result.error ??= e instanceof Error ? e.message : String(e);

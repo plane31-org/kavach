@@ -41,9 +41,13 @@ function requireReady(tx: Pick<Tx, "get">): void {
 export interface EnqueueOptions {
   /**
    * A caller-chosen key for this hand-over, derived from the sample itself (its fix time and
-   * source, say). A second enqueue under the same key, from a retry after a crash or from another
-   * runtime, returns the record the first one made and seals nothing. Keys are kept for the
-   * delivery window. Up to 128 characters.
+   * source, say). The guarantee: a keyed enqueue that returns has committed its record and the
+   * key in one transaction; a second enqueue under the same key, from a retry after a crash or
+   * from another runtime on the same store, returns that record with `duplicate: true` and seals
+   * nothing, concurrent calls included, since the store's writer lock orders them; a refused
+   * enqueue stores no key, so its retry is checked again. The key is kept for the delivery
+   * window and covers the hand-over, not delivery: the record it names can still be cancelled by
+   * a rotation, which the `cancelled` event reports as for any record. Up to 128 characters.
    */
   readonly idempotencyKey?: string;
 }

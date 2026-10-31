@@ -193,7 +193,7 @@ describe("background location glue", () => {
       },
       sync: async () => {
         calls.push("sync");
-        return { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0 }, purged: 0, errors: [] };
+        return { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false }, purged: 0, errors: [] };
       }
     } as unknown as Client & { calls: string[] };
   }
@@ -207,7 +207,7 @@ describe("background location glue", () => {
       { coords: { latitude: 3, longitude: 3, accuracy: null }, timestamp: 3000 }
     ];
     const r = await handleBackgroundLocations(client, batch, last);
-    expect(r).toEqual({ enqueued: 3, skipped: 0, synced: true, error: undefined });
+    expect(r).toEqual({ enqueued: 3, skipped: 0, synced: true, hasMore: false, error: undefined });
     expect(client.calls).toEqual(["enqueue:0:10000000:bg:1000", "enqueue:0:20000000:bg:2000", "enqueue:2:0:bg:3000", "sync"]);
     const again = await handleBackgroundLocations(client, batch, last);
     expect(again).toMatchObject({ enqueued: 0, skipped: 3, synced: true });

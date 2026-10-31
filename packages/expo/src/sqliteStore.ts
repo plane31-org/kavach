@@ -144,22 +144,24 @@ class SqliteTx implements Tx {
   }
 
   list<T extends TableName>(table: T, prefix = ""): readonly [string, Tables[T]][] {
-    const rows = this.db.all<{ key: string; value: string }>(
-      "SELECT key, value FROM kv WHERE tbl = ? AND substr(key, 1, ?) = ? ORDER BY key",
-      [table, prefix.length, prefix]
-    );
-    return rows.map((r) => [r.key, JSON.parse(r.value) as Tables[T]]);
+    return this.range(table, { prefix });
   }
 
+  /**
+   * One primary-key search: a prefix becomes the key bounds `[prefix, successor(prefix))`, so
+   * every query is `tbl = ? AND key > ? AND key < ?` on the (tbl, key) index, never a filter
+   * over the table's rows (`SqliteStore` tests check the query plan).
+   */
   range<T extends TableName>(table: T, q: KeyRange): readonly [string, Tables[T]][] {
     const where = ["tbl = ?"];
     const params: SqlValue[] = [table];
-    if (q.prefix !== undefined) {
-      where.push("substr(key, 1, ?) = ?");
-      params.push(q.prefix.length, q.prefix);
+    const bounds: [string, string | undefined][] = [[">=", q.gte], [">", q.gt], ["<", q.lt], ["<=", q.lte]];
+    if (q.prefix) {
+      bounds.push([">=", q.prefix]);
+      const upper = keySuccessor(q.prefix);
+      if (upper !== undefined) bounds.push(["<", upper]);
     }
-    for (const [field, op] of [["gte", ">="], ["gt", ">"], ["lt", "<"], ["lte", "<="]] as const) {
-      const bound = q[field];
+    for (const [op, bound] of bounds) {
       if (bound === undefined) continue;
       where.push(`key ${op} ?`);
       params.push(bound);
@@ -184,6 +186,20 @@ class SqliteTx implements Tx {
   private guard(): void {
     if (this.readOnly) throw new KavachError("STORAGE_FAILURE", "sqliteStore", "write outside a transaction");
   }
+}
+
+/** The smallest string greater than every string with this prefix, or `undefined` when there is none. */
+function keySuccessor(prefix: string): string | undefined {
+  const units = [...prefix].map((c) => c.codePointAt(0) ?? 0);
+  while (units.length > 0) {
+    const last = units[units.length - 1] ?? 0;
+    if (last < 0x10ffff) {
+      units[units.length - 1] = last + 1 === 0xd800 ? 0xe000 : last + 1;
+      return String.fromCodePoint(...units);
+    }
+    units.pop();
+  }
+  return undefined;
 }
 
 function hex(bytes: Uint8Array): string {

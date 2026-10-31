@@ -3,7 +3,7 @@
  * (protocol section 10, receiving; transaction T7).
  */
 import { equalBytes, fromHex, toHex } from "./bytes.js";
-import { DocumentType, expectType, parseDocument, type EncryptedRecord, type RecordKind } from "./codec.js";
+import { DocumentType, decodeLocation, expectType, parseDocument, type EncryptedRecord, type RecordKind } from "./codec.js";
 import { bodyHash } from "./crypto.js";
 import { openEpoch, type AuthorView, type SelfView } from "./epoch.js";
 import { KavachError, isKavachError } from "./errors.js";
@@ -12,7 +12,7 @@ import { HISTORY_KINDS, authorPrefix, indexHistory, padTime, timelinePrefix, uni
 import { compareSlots, openRecordWire } from "./record.js";
 import { big, unbig } from "./rows.js";
 import type { HistoryRow, KeyRange, LivePinRow, Store, SubscriptionRow, Tx, StatusRow } from "./store.js";
-import type { Relay } from "./transport.js";
+import type { ReadRecordsResult, Relay } from "./transport.js";
 
 export const MAX_FUTURE_SKEW_MS = 300_000n;
 export const READ_BATCH = 100;
@@ -160,9 +160,9 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   if (parsed.kind === 0 && !row.superseded) {
     const pinKey = toHex(author.identityId);
     const pin = tx.get("livePins", pinKey);
-    const slot = { generation, epoch: parsed.epoch, counter: parsed.counter };
-    if (!pin || compareSlots(slot, { generation: unbig(pin.generation), epoch: pin.epoch, counter: pin.counter }) > 0) {
-      const next: LivePinRow = { recordId: id, generation: big(generation), epoch: parsed.epoch, counter: parsed.counter, sentAt: big(parsed.sentAt) };
+    const candidate: PinOrder = { generation, capturedAt: measuredAt(opened.plaintext, parsed.sentAt), epoch: parsed.epoch, counter: parsed.counter };
+    if (!pin || comparePins(candidate, pinOrder(tx, pin)) > 0) {
+      const next: LivePinRow = { recordId: id, generation: big(generation), epoch: parsed.epoch, counter: parsed.counter, sentAt: big(parsed.sentAt), capturedAt: big(candidate.capturedAt) };
       tx.put("livePins", pinKey, next);
       moved = true;
     }
@@ -171,6 +171,44 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
 }
 
 /** A record pushed by the host outside `sync`: stored, but it never advances a relay cursor. */
+/**
+ * The order of live pins (protocol section 10): a newer device generation first; within one
+ * generation the later measurement, the decoded `capturedAt` clamped to the record's `sentAt`
+ * so a phone clock set ahead cannot pin a stale fix; equal measurements by (epoch, counter).
+ */
+interface PinOrder {
+  readonly generation: bigint;
+  readonly capturedAt: bigint;
+  readonly epoch: number;
+  readonly counter: number;
+}
+
+function comparePins(a: PinOrder, b: PinOrder): number {
+  if (a.generation !== b.generation) return a.generation < b.generation ? -1 : 1;
+  if (a.capturedAt !== b.capturedAt) return a.capturedAt < b.capturedAt ? -1 : 1;
+  return compareSlots(a, b);
+}
+
+/** The measurement time of a kind 0 payload: its `capturedAt`, never later than `sentAt`; `sentAt` for a payload that is not the location codec. */
+export function measuredAt(plaintext: Uint8Array, sentAt: bigint): bigint {
+  try {
+    const captured = decodeLocation(plaintext).capturedAt;
+    return captured < sentAt ? captured : sentAt;
+  } catch {
+    return sentAt;
+  }
+}
+
+/** A pin's order, deriving the measurement time from its record for a row written before revision 7. */
+function pinOrder(tx: Pick<Tx, "get">, pin: LivePinRow): PinOrder {
+  let capturedAt = pin.capturedAt === undefined ? undefined : unbig(pin.capturedAt);
+  if (capturedAt === undefined) {
+    const row = tx.get("history", pin.recordId);
+    capturedAt = row ? measuredAt(fromHex(row.plaintext), unbig(row.sentAt)) : unbig(pin.sentAt);
+  }
+  return { generation: unbig(pin.generation), capturedAt, epoch: pin.epoch, counter: pin.counter };
+}
+
 export async function receive(deps: InboxDeps, wire: Uint8Array): Promise<ReceiveResult> {
   const now = deps.now();
   let r = await deps.store.transaction((tx) => storeRecord(tx, deps, wire, now));
@@ -192,6 +230,8 @@ export interface StreamSyncSummary {
   invalid: number;
   expired: number;
   acked: bigint | undefined;
+  /** The relay holds more records past the last page read; the budget stopped the catch-up. */
+  hasMore: boolean;
 }
 
 function subscription(tx: Pick<Tx, "get">, streamId: Uint8Array, authorIdentityId: Uint8Array): SubscriptionRow {
@@ -222,25 +262,52 @@ function eligiblePrefix(tx: Pick<Tx, "list">, streamId: Uint8Array, scanPos: big
  * One pass over one author stream: read a batch above the local scan position, process every
  * record, hold the prefix at any `keyPending` record, and send at most one acknowledgement.
  */
-export async function syncStream(deps: InboxDeps, streamId: Uint8Array, authorIdentityId: Uint8Array): Promise<StreamSyncSummary> {
-  const summary: StreamSyncSummary = { read: 0, stored: 0, duplicate: 0, keyPending: 0, invalid: 0, expired: 0, acked: undefined };
+/** What one sync may still read across every stream: records left and the time it must stop at. */
+export interface ReadBudget {
+  remainingRecords: number;
+  readonly deadline: bigint;
+}
+
+/**
+ * Read a stream in pages until it is caught up or the budget is spent. The first page restarts
+ * from the eligible prefix while a record is unresolved (the held record is read again; stored
+ * ones come back as harmless duplicates); later pages of the same sync continue from the last
+ * sequence examined, so a held record never makes the loop re-read its own page. Each page is
+ * processed and acknowledged before the next is read. `hasMore` says the relay still holds
+ * records past the last page when the budget stopped the loop.
+ */
+export async function syncStream(deps: InboxDeps, streamId: Uint8Array, authorIdentityId: Uint8Array, budget: ReadBudget = { remainingRecords: READ_BATCH, deadline: deps.now() }): Promise<StreamSyncSummary> {
+  const summary: StreamSyncSummary = { read: 0, stored: 0, duplicate: 0, keyPending: 0, invalid: 0, expired: 0, acked: undefined, hasMore: false };
   const sub = await deps.store.read((tx) => subscription(tx, streamId, authorIdentityId));
-  // While a record is unresolved the scan restarts from the eligible prefix, so the held record is
-  // read again; records already stored come back as harmless duplicates.
   const unresolved = await deps.store.read((tx) => tx.list("unresolved", toHex(streamId) + ":"));
-  const from = unresolved.length > 0 ? unbig(sub.ackPrefix) : unbig(sub.scanPos);
-  // A failed read is the caller's to report: the sync names the stream in its report and goes on
-  // to the next one, rather than counting a stream it never read as synced.
-  const page = await deps.relay.readRecords(streamId, from, READ_BATCH);
+  let from = unresolved.length > 0 ? unbig(sub.ackPrefix) : unbig(sub.scanPos);
+  for (;;) {
+    // A failed read is the caller's to report: the sync names the stream in its report and goes
+    // on to the next one, rather than counting a stream it never read as synced.
+    const page = await deps.relay.readRecords(streamId, from, READ_BATCH);
+    await processPage(deps, streamId, authorIdentityId, page, summary);
+    budget.remainingRecords -= page.records.length;
+    const caughtUp = page.nextSeq >= page.tail || page.nextSeq <= from;
+    if (caughtUp) break;
+    if (budget.remainingRecords <= 0 || deps.now() >= budget.deadline) {
+      summary.hasMore = true;
+      break;
+    }
+    from = page.nextSeq;
+  }
+  return summary;
+}
+
+/** T7 for every record of one page, then the scan position, the eligible prefix and one acknowledgement. */
+async function processPage(deps: InboxDeps, streamId: Uint8Array, authorIdentityId: Uint8Array, page: ReadRecordsResult, summary: StreamSyncSummary): Promise<void> {
   const now = deps.now();
   // Drop unresolved entries the relay has expired.
-  for (const [key, u] of unresolved) {
+  for (const [key, u] of await deps.store.read((tx) => tx.list("unresolved", toHex(streamId) + ":"))) {
     if (unbig(u.deliverySeq) <= page.expiredThrough) {
       await deps.store.transaction((tx) => tx.delete("unresolved", key));
       summary.expired++;
     }
   }
-
   for (const item of page.records) {
     summary.read++;
     if (item.deliverySeq <= page.expiredThrough) {
@@ -308,7 +375,6 @@ export async function syncStream(deps: InboxDeps, streamId: Uint8Array, authorId
     });
     summary.acked = committed;
   }
-  return summary;
 }
 
 // Reads ------------------------------------------------------------------------------------------------
@@ -432,6 +498,8 @@ export interface Latest {
   readonly recordId: Uint8Array;
   readonly plaintext: Uint8Array;
   readonly sentAt: bigint;
+  /** The measurement time the pin was chosen by: the decoded capture time, never later than `sentAt`. */
+  readonly capturedAt: bigint;
   readonly ageMs: bigint;
 }
 
@@ -442,7 +510,8 @@ export async function latest(store: Store, authorIdentityId: Uint8Array, now: bi
     if (!pin) return undefined;
     const row = tx.get("history", pin.recordId);
     if (!row) return undefined;
-    return { recordId: fromHex(row.recordId), plaintext: fromHex(row.plaintext), sentAt: unbig(row.sentAt), ageMs: now - unbig(row.sentAt) };
+    const plaintext = fromHex(row.plaintext);
+    return { recordId: fromHex(row.recordId), plaintext, sentAt: unbig(row.sentAt), capturedAt: measuredAt(plaintext, unbig(row.sentAt)), ageMs: now - unbig(row.sentAt) };
   });
 }
 

@@ -7,7 +7,7 @@
  * `@kavach/core/sodium`. Everything else is internal and reachable only by relative import.
  */
 export const PROTOCOL_NAME = "Kavach";
-export const PROTOCOL_REVISION = 6;
+export const PROTOCOL_REVISION = 7;
 
 // The client ---------------------------------------------------------------------------------------
 export {
@@ -29,6 +29,7 @@ export {
   type PauseReason,
   type ReceiveResult,
   type SyncError,
+  type SyncOptions,
   type SyncReport
 } from "./client.js";
 

@@ -12,7 +12,7 @@ import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { ensureHistoryIndex } from "./historyIndex.js";
-import { forgetAuthor, forgetAuthorIn, history, historyPage, latest, latestStatus, newest, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Latest, type LatestStatus, type ReceiveResult } from "./inbox.js";
+import { forgetAuthor, forgetAuthorIn, history, historyPage, latest, latestStatus, newest, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Latest, type LatestStatus, type ReadBudget, type ReceiveResult } from "./inbox.js";
 import { drain, enqueue, outboxCount, outboxCounts, purgeOutbox, type EnqueueOptions, type OutboxCounts } from "./outbox.js";
 export type { EnqueueOptions } from "./outbox.js";
 
@@ -132,7 +132,8 @@ export interface Client {
   enqueueCheckIn(payload: Location | Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult>;
   /** A status (kind 2): the sender's current state in an application payload. Latest wins in the outbox. */
   enqueueStatus(payload: Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult>;
-  sync(): Promise<SyncReport>;
+  /** One synchronisation; `options.catchUp` bounds how much of a backlog this call reads (`SyncReport.inbox.hasMore` says when to call again). */
+  sync(options?: SyncOptions): Promise<SyncReport>;
   receive(wire: Uint8Array): Promise<ReceiveResult>;
   /** The first page of `historyPage`, as a list. */
   history(query?: HistoryQuery): Promise<HistoryEntry[]>;
@@ -157,11 +158,24 @@ export interface Client {
   close(): Promise<void>;
 }
 
+export interface SyncOptions {
+  /**
+   * The inbox budget of this sync, shared by every stream: at most this many records
+   * (default 500) and this many milliseconds of reading (default 5,000) before the sync stops
+   * and reports `inbox.hasMore`, so a long backlog never holds a wake-up open. Each stream reads
+   * at least one page.
+   */
+  readonly catchUp?: { readonly maxRecords?: number; readonly maxMs?: number };
+}
+
+export const DEFAULT_CATCH_UP = { maxRecords: 500, maxMs: 5_000 } as const;
+
 export interface SyncReport {
   metadata: { certificates: number; snapshots: number; rotations: number; quarantined: number; resets: number };
   epoch: "unchanged" | "prepared" | "paused" | "pending";
   outbox: { sent: number; accepted: number; cancelled: number; unknown: number; retry: number };
-  inbox: { streams: number; stored: number; keyPending: number; invalid: number; acked: number };
+  /** `hasMore`: a stream still has records on the relay that this sync's budget did not reach; sync again soon. */
+  inbox: { streams: number; stored: number; keyPending: number; invalid: number; acked: number; hasMore: boolean };
   purged: number;
   errors: SyncError[];
 }
@@ -716,20 +730,20 @@ class ClientImpl implements Client {
 
   // Sync ------------------------------------------------------------------------------------------
 
-  async sync(): Promise<SyncReport> {
+  async sync(options: SyncOptions = {}): Promise<SyncReport> {
     if (this.syncing) return this.syncing;
-    this.syncing = this.runSync().finally(() => {
+    this.syncing = this.runSync(options).finally(() => {
       this.syncing = undefined;
     });
     return this.syncing;
   }
 
-  private async runSync(): Promise<SyncReport> {
+  private async runSync(options: SyncOptions): Promise<SyncReport> {
     const report: SyncReport = {
       metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 },
       epoch: "unchanged",
       outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 },
-      inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0 },
+      inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false },
       purged: 0,
       errors: []
     };
@@ -783,16 +797,22 @@ class ClientImpl implements Client {
     }
     // Each stream on its own: a failed download or a refused record names its stream in the report
     // and leaves the other streams to be read; a stream that failed is not counted as synced.
+    // One budget spans the streams; a stream it stops early reports hasMore.
+    const budget: ReadBudget = {
+      remainingRecords: Math.max(1, Math.floor(options.catchUp?.maxRecords ?? DEFAULT_CATCH_UP.maxRecords)),
+      deadline: this.now() + BigInt(Math.max(0, Math.floor(options.catchUp?.maxMs ?? DEFAULT_CATCH_UP.maxMs)))
+    };
     for (const s of subs) {
       try {
         const known = await this.store.read((tx) => tx.list("certificates").some(([, c]) => c.streamId === toHex(s.streamId)));
         if (!known) continue;
-        const r = await syncStream(this.inboxDeps(), s.streamId, s.authorIdentityId);
+        const r = await syncStream(this.inboxDeps(), s.streamId, s.authorIdentityId, budget);
         report.inbox.streams++;
         report.inbox.stored += r.stored;
         report.inbox.keyPending += r.keyPending;
         report.inbox.invalid += r.invalid;
         if (r.acked !== undefined) report.inbox.acked++;
+        if (r.hasMore) report.inbox.hasMore = true;
       } catch (e) {
         report.errors.push(syncError("inbox", e));
       }
@@ -1209,7 +1229,7 @@ class ClientImpl implements Client {
   private async approve(circleId: Uint8Array, accountName: string): Promise<{ revision: bigint }> {
     const [resolved] = await this.transport.directory.resolveAccounts([accountName]);
     if (!resolved) throw new KavachError("METADATA_REQUIRED", "approve", "unknown account");
-    const report: SyncReport = { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0 }, purged: 0, errors: [] };
+    const report: SyncReport = { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false }, purged: 0, errors: [] };
     await this.acceptMemberCertificate(resolved.certificate, resolved.resetReceipt, report);
     const requester = pinFromCertificate(expectType<AccountDevice>(verifyDocument(resolved.certificate), DocumentType.AccountDevice));
     const pinned = await this.pinFor(requester.identityId);

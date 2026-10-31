@@ -6,6 +6,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { toHex } from "../src/bytes.js";
 import { open } from "../src/client.js";
 import { ready } from "../src/crypto.js";
+import { locationFromDegrees } from "../src/record.js";
 import { testPolicy } from "../src/testing/clock.js";
 import { FaultyStore } from "../src/testing/faults.js";
 import { KavachError } from "../src/errors.js";
@@ -345,6 +346,84 @@ describe("feedback findings", () => {
     const reopened = await open({ accountName: "bob", retentionPolicy: testPolicy, recoveryProvider: b.provider, resetTrust, secretStore: b.secrets, store: b.store.fork(), transport: b.t, now: w.clock.now });
     expect((await reopened.history({ authorIdentityId: aliceId })).map((h) => toHex(h.recordId))).toEqual(before);
     expect(await b.store.read((tx) => [tx.get("meta", META)?.historyIndex, tx.count("historyIndex")])).toEqual([1, 2]);
+  });
+
+  it("17: two runtimes enqueueing the same key at once get one committed record, and a key is not kept for a refused enqueue", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    const other = await open({ accountName: "alice", retentionPolicy: testPolicy, recoveryProvider: a.provider, resetTrust, secretStore: a.secrets, store: a.store.fork(), transport: a.t, now: w.clock.now });
+    const [x, y] = await Promise.all([a.client.enqueueLocation(w.loc(7), { idempotencyKey: "race" }), other.enqueueLocation(w.loc(7), { idempotencyKey: "race" })]);
+    expect(toHex(x.recordId)).toBe(toHex(y.recordId));
+    expect([x.duplicate, y.duplicate].sort()).toEqual([false, true]);
+    // The record is durable before either call returned.
+    expect(await a.store.read((tx) => tx.get("outbox", toHex(x.recordId))?.status)).toBe("queued");
+    expect(await a.store.read((tx) => tx.get("enqueueKeys", "race")?.recordId)).toBe(toHex(x.recordId));
+    await w.sync(a);
+    expect((await w.sync(b)).inbox.stored).toBe(1);
+    expect((await b.client.history({ authorIdentityId: aliceId })).length).toBe(2);
+    // A refused enqueue stores no key: the retry is checked again, not answered from the key.
+    for (let i = 0; i < testPolicy.maxOutboxRecords; i++) await a.client.enqueueLocation(w.loc(1 + (i % 80)));
+    expect(await thrown(() => a.client.enqueueLocation(w.loc(8), { idempotencyKey: "full" }))).toBe("QUEUE_FULL");
+    expect(await a.store.read((tx) => tx.get("enqueueKeys", "full"))).toBeUndefined();
+  });
+
+  it("18: a backlog is read in pages within the sync's budget, hasMore says when to come back, and the rest follows", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    for (let i = 0; i < 250; i++) await a.client.enqueueLocation(w.loc(1 + (i % 80)));
+    expect((await w.sync(a)).outbox.accepted).toBe(250);
+    // No time left after the first page: one page per stream, and the report asks for another sync.
+    const timed = await b.client.sync({ catchUp: { maxMs: 0 } });
+    expect([timed.inbox.stored, timed.inbox.hasMore, timed.errors]).toEqual([100, true, []]);
+    // A record budget stops after the page that spends it; here the backlog ends inside it.
+    const second = await b.client.sync({ catchUp: { maxRecords: 150 } });
+    expect([second.inbox.stored, second.inbox.hasMore]).toEqual([150, false]);
+    const rest = await w.sync(b);
+    expect([rest.inbox.stored, rest.inbox.hasMore]).toEqual([0, false]);
+    expect((await b.client.history({ authorIdentityId: aliceId })).length).toBe(251);
+    expect((await w.sync(b)).inbox.hasMore).toBe(false);
+  });
+
+  it("19: the live pin follows the measurement time within a generation: a late older sample never moves it back, a clock set ahead cannot hold it", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    const at = (lat: number, capturedAt: bigint) => locationFromDegrees(lat, -122.4194, 5, capturedAt);
+    const fresh = await a.client.enqueueLocation(at(10, w.clock.now()));
+    const stale = await a.client.enqueueLocation(at(11, w.clock.now() - 60_000n)); // a buffered sample flushed later, higher counter
+    await w.sync(a);
+    await w.sync(b);
+    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
+    expect((await b.client.history({ authorIdentityId: aliceId })).map((h) => toHex(h.recordId))).toContain(toHex(stale.recordId));
+    expect(b.events.filter((e) => e.kind === "latestUpdated").length).toBe(2); // the pair's location and the fresh one
+    // A sample claiming to be captured a day ahead counts as captured when sent, so the next honest sample still wins.
+    w.clock.advance(1_000n);
+    const ahead = await a.client.enqueueLocation(at(12, w.clock.now() + 86_400_000n));
+    await w.sync(a);
+    await w.sync(b);
+    const pinned = await b.client.latest(aliceId);
+    expect([toHex(pinned?.recordId ?? new Uint8Array()), pinned?.capturedAt]).toEqual([toHex(ahead.recordId), pinned?.sentAt]);
+    w.clock.advance(1_000n);
+    const honest = await a.client.enqueueLocation(at(13, w.clock.now()));
+    await w.sync(a);
+    await w.sync(b);
+    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(honest.recordId));
+  });
+
+  it("20: a pin row from before the measurement rule is compared by its record's capture time", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    const before = toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array());
+    await b.store.transaction((tx) => {
+      const pin = tx.get("livePins", toHex(aliceId));
+      if (!pin) throw new Error("no pin");
+      const legacy = { ...pin };
+      delete legacy.capturedAt;
+      tx.put("livePins", toHex(aliceId), legacy);
+    });
+    await a.client.enqueueLocation(locationFromDegrees(20, -122.4194, 5, w.clock.now() - 3_600_000n));
+    await w.sync(a);
+    await w.sync(b);
+    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(before);
   });
 });
 

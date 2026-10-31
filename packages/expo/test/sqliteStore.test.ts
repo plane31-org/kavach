@@ -104,6 +104,31 @@ describe("SqliteStore over a real SQLite engine", () => {
     });
   });
 
+  it("answers a prefix or a range with one two-sided primary-key search, never a filter over the table", async () => {
+    const inner = nodeSqliteDriver(openNodeDatabase(":memory:"));
+    const queries: { sql: string; params: readonly SqlValue[] }[] = [];
+    const recording: SqlDriver = {
+      exec: inner.exec,
+      run: inner.run,
+      all: <T>(sql: string, params: readonly SqlValue[] = []) => {
+        if (sql.startsWith("SELECT key, value")) queries.push({ sql, params });
+        return inner.all<T>(sql, params);
+      }
+    };
+    const store = SqliteStore.open({ driver: recording });
+    await store.read((tx) => {
+      tx.list("historyIndex", "t:0:");
+      tx.range("historyIndex", { prefix: "t:0:", lt: "t:0:5", reverse: true, limit: 3 });
+      tx.range("historyIndex", { gte: "a:", lt: "b" });
+    });
+    expect(queries.length).toBe(3);
+    for (const q of queries) {
+      const plan = inner.all<{ detail: string }>("EXPLAIN QUERY PLAN " + q.sql, q.params).map((r) => r.detail).join(" ");
+      expect(plan, q.sql).toMatch(/SEARCH kv USING PRIMARY KEY \(tbl=\? AND key>\? AND key<\?\)/);
+      expect(q.sql).not.toContain("substr");
+    }
+  });
+
   it("refuses a callback that returns a promise, rolls back, and leaves the connection usable", async () => {
     const store = memoryStore();
     const refused = store.transaction((tx) => {

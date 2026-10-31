@@ -165,6 +165,8 @@ export interface LivePinRow {
   epoch: number;
   counter: number;
   sentAt: string;
+  /** Measurement time (the decoded `capturedAt`, clamped to `sentAt`); absent on rows from before revision 7, derived from the record then. */
+  capturedAt?: string;
 }
 
 /** The newest status (kind 2) per author: one row, never history. Keyed by author identity id. */
