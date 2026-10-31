@@ -1,5 +1,5 @@
 /** JSON over HTTP helpers for the reference host. Bytes travel as hex strings. */
-import { fromHex, toHex } from "@kavach/core";
+import { fromHex, toHex } from "@kavach/core/adapters";
 import type { Env } from "./env.js";
 
 export class HttpError extends Error {

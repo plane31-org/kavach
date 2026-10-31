@@ -2,7 +2,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
-import { KavachError, certify, deviceFromSeed, newDevice, openAccount, randomBytes, ready, t1Activate, t1Header, t1Secrets, t3ApplyChange, openStore, MemorySecretStore } from "@kavach/core";
+import { KavachError, MemorySecretStore, openStore, randomBytes, ready, t1Activate, t1Header, t1Secrets, t3ApplyChange } from "@kavach/core/adapters";
+import { certify, deviceFromSeed, newDevice, openAccount } from "@kavach/core/testing";
 import { SqliteStore, nodeSqliteDriver, type SqlDriver } from "../src/sqliteStore.js";
 import { openNodeDatabase } from "./sqlite.js";
 

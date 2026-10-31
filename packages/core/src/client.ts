@@ -21,6 +21,9 @@ import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secre
 import type { Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
 
+/** The types of the client's queries and of `receive`, defined with the inbox. */
+export type { HistoryEntry, HistoryQuery, Latest, ReceiveResult } from "./inbox.js";
+
 /** accountSeed, deviceSeed, recoveryKey, instanceId and deviceId of a pending reset, in the secret store. */
 const RESET_ROOTS_BYTES = 32 * 3 + 16 + 16;
 

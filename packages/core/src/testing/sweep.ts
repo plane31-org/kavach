@@ -7,8 +7,6 @@
  */
 import { fromHex, toHex } from "../bytes.js";
 import { open, type Client, type ClientEvent } from "../client.js";
-import { buildResetKeyList } from "../codec.js";
-import { C, H, signingKeypairFromSeed } from "../crypto.js";
 import { KavachError } from "../errors.js";
 import { locationFromDegrees } from "../record.js";
 import { MemorySecretStore, type Store } from "../store.js";
@@ -16,6 +14,7 @@ import type { Transport } from "../transport.js";
 import { TestClock, testPolicy } from "./clock.js";
 import { FakeHost } from "./fakeHost.js";
 import { FaultyStore, MaliciousTransport, type CrashPhase, type CrashPlan, type MutationName } from "./faults.js";
+import { testResetKeyList, testResetKeys } from "./fixtures.js";
 import { MemoryPlatformProvider } from "./providers.js";
 
 export type DeviceName = "alice" | "bob" | "bob2";
@@ -58,10 +57,8 @@ export interface LostResponseRun {
   readonly exercised: boolean;
 }
 
-const management = signingKeypairFromSeed(H(C("identity")));
-const operational = signingKeypairFromSeed(H(C("stream")));
-const operationalId = new Uint8Array(16).fill(7);
-const resetTrust = { managementKey: management.publicKey, minimumVersion: 1n };
+const resetKeys = testResetKeys();
+const resetTrust = { managementKey: resetKeys.management.publicKey, minimumVersion: 1n };
 
 interface Device {
   name: DeviceName;
@@ -83,8 +80,8 @@ function newHost(): { host: FakeHost; clock: TestClock } {
   const host = new FakeHost();
   const clock = new TestClock();
   host.now = clock.now;
-  host.resetSigner = { key: operational, keyId: operationalId };
-  host.resetKeyList = buildResetKeyList({ version: 1n, issuedAt: clock.now(), expiresAt: clock.now() + 2_592_000_000n, keys: [{ keyId: operationalId, publicKey: operational.publicKey }] }, management.secretKey);
+  host.resetSigner = { key: resetKeys.operational, keyId: resetKeys.operationalKeyId };
+  host.resetKeyList = testResetKeyList(resetKeys, clock.now());
   return { host, clock };
 }
 

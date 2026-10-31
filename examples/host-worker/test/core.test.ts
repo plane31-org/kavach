@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { identityId, ready, toHex, accountKeypair } from "@kavach/core";
+import { ready, toHex } from "@kavach/core/adapters";
+import { accountKeypair, identityId } from "@kavach/core/testing";
 
 describe("core inside workerd", () => {
   it("loads the portable cipher suite and derives the fixture identity", async () => {

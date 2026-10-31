@@ -5,8 +5,9 @@ export default defineWorkersConfig(async () => {
   const migrations = await readD1Migrations(path.join(__dirname, "migrations"));
   const core = path.join(__dirname, "../../packages/core/src/index.ts");
   const coreTesting = path.join(__dirname, "../../packages/core/src/testing/index.ts");
+  const coreAdapters = path.join(__dirname, "../../packages/core/src/adapters/index.ts");
   return {
-    resolve: { alias: { "@kavach/core/testing": coreTesting, "@kavach/core": core } },
+    resolve: { alias: { "@kavach/core/testing": coreTesting, "@kavach/core/adapters": coreAdapters, "@kavach/core": core } },
     test: {
       include: ["test/**/*.test.ts"],
       // Integration tests over workerd: the default 5 s is too tight on a loaded CI runner.

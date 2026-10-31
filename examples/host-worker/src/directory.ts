@@ -14,7 +14,7 @@ import {
   verifyDocument,
   type AccountDevice,
   type CircleSnapshot
-} from "@kavach/core";
+} from "@kavach/core/adapters";
 import type { Env } from "./env.js";
 import { HttpError, hex, unhex, type Caller } from "./wire.js";
 

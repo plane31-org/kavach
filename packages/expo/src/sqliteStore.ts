@@ -11,7 +11,7 @@
  * The adapter speaks to the database through `SqlDriver`, a three-method surface that
  * `expo-sqlite`'s synchronous API and Node's `node:sqlite` both satisfy.
  */
-import { KavachError, invokeSync, type Store, type TableName, type Tables, type Tx } from "@kavach/core";
+import { KavachError, invokeSync, type Store, type TableName, type Tables, type Tx } from "@kavach/core/adapters";
 
 export type SqlValue = string | number | null;
 

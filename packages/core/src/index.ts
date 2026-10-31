@@ -1,27 +1,54 @@
 /**
  * @kavach/core: Kavach v1 protocol (revision 4, wire version 5).
  *
- * Build order follows Kavach-v1-Build-Sequence.md. Step 1: primitives and labels.
+ * This entry is what an application imports: the client, its types, the errors and the few
+ * helpers an app needs around it. Adapter and host authors import `@kavach/core/adapters`;
+ * test harnesses import `@kavach/core/testing`; the optional libsodium backend is
+ * `@kavach/core/sodium`. Everything else is internal and reachable only by relative import.
  */
 export const PROTOCOL_NAME = "Kavach";
 export const PROTOCOL_REVISION = 4;
 
-export * from "./errors.js";
-export * from "./bytes.js";
-export * from "./crypto.js";
-export * from "./codec.js";
-export * from "./identity.js";
-export * from "./vault.js";
-export * from "./circle.js";
-export * from "./audience.js";
-export * from "./epoch.js";
-export * from "./record.js";
-export * from "./policy.js";
-export * from "./transport.js";
-export * from "./store.js";
-export * from "./rows.js";
-export * from "./transactions.js";
-export * from "./outbox.js";
-export * from "./inbox.js";
-export * from "./reset.js";
-export * from "./client.js";
+// The client ---------------------------------------------------------------------------------------
+export {
+  open,
+  type CircleSummary,
+  type Client,
+  type ClientEvent,
+  type ClientState,
+  type ClientStatus,
+  type HistoryEntry,
+  type HistoryQuery,
+  type Latest,
+  type OpenOptions,
+  type PauseReason,
+  type ReceiveResult,
+  type SyncReport
+} from "./client.js";
+
+// Errors -------------------------------------------------------------------------------------------
+export { KavachError, isKavachError, type ErrorCode } from "./errors.js";
+
+// Locations ----------------------------------------------------------------------------------------
+export { locationFromDegrees, locationToDegrees } from "./record.js";
+export type { Location, LocationStatus, RecordKind } from "./codec.js";
+
+// Configuration ------------------------------------------------------------------------------------
+export { validatePolicy, type RetentionPolicy } from "./policy.js";
+export type { ResetTrustConfig } from "./reset.js";
+export { setCryptoBackend, type CryptoBackend } from "./crypto.js";
+
+// Recovery -----------------------------------------------------------------------------------------
+export {
+  decodeRecoveryCode,
+  encodeRecoveryCode,
+  type BackupState,
+  type ProviderLoadResult,
+  type ProviderSaveResult,
+  type ProviderStatus,
+  type ProviderStatusResult,
+  type RecoveryProvider
+} from "./vault.js";
+
+// Identifiers --------------------------------------------------------------------------------------
+export { equalBytes, fromHex, toHex } from "./bytes.js";

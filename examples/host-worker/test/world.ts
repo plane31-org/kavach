@@ -1,6 +1,7 @@
 /** Devices as clients of the real Worker, through SELF.fetch. */
 import { SELF, env } from "cloudflare:test";
-import { MemorySecretStore, MemoryStore, open, toHex, type Client, type ClientEvent, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@kavach/core";
+import { open, toHex, type Client, type ClientEvent, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@kavach/core";
+import { MemorySecretStore, MemoryStore } from "@kavach/core/adapters";
 import { TestClock, testPolicy } from "@kavach/core/testing";
 import { httpTransport } from "../client/httpTransport.js";
 
