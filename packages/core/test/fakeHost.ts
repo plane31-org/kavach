@@ -286,10 +286,12 @@ export class FakeHost {
         const a = caller();
         const c = host.circles.get(toHex(circleId));
         if (!c) return { status: "PERMANENT_FAILURE" };
-        const list = host.requests.get(toHex(circleId)) ?? [];
-        if (!list.some((r) => r.accountName === a.accountName && r.action === "join")) {
-          list.push({ circleId, accountName: a.accountName, action: "join", requestedAt: host.now() });
-          host.requests.set(toHex(circleId), list);
+        const list = (host.requests.get(toHex(circleId)) ?? []).filter((r) => !(r.accountName === a.accountName && r.action === "join"));
+        // A repeated request refreshes the pending one; the owner is notified once per live request.
+        const hadLive = (host.requests.get(toHex(circleId)) ?? []).some((r) => r.accountName === a.accountName && r.action === "join" && r.requestedAt > host.now() - 7n * 86_400_000n);
+        list.push({ circleId, accountName: a.accountName, action: "join", requestedAt: host.now() });
+        host.requests.set(toHex(circleId), list);
+        if (!hadLive) {
           const owner = host.accountByIdentity(c.ownerIdentityId);
           if (owner) host.notifications.push({ kind: "joinRequest", to: owner.accountName, from: a.accountName, circleId: toHex(circleId) });
         }
