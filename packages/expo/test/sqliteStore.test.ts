@@ -71,6 +71,29 @@ describe("SqliteStore over a real SQLite engine", () => {
     await expect(store.read((tx) => (tx as unknown as { put: (a: string, b: string, c: unknown) => void }).put("clock", "x", {}))).rejects.toThrow(expect.objectContaining({ code: "STORAGE_FAILURE" }));
   });
 
+  it("a read during a transaction in flight waits for it and never sees what rolls back", async () => {
+    const store = memoryStore();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const writing = store.transaction(async (tx) => {
+      tx.put("clock", "c", { highWater: "1" });
+      await gate;
+      throw new Error("boom");
+    });
+    const reading = store.read((tx) => tx.get("clock", "c"));
+    let settled = false;
+    void reading.then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    release();
+    await expect(writing).rejects.toThrow("boom");
+    expect(await reading).toBeUndefined();
+  });
+
   it("serialises another process with BEGIN IMMEDIATE: a worker's write lands only after the handoff and commit", async () => {
     // Two JavaScript contexts, as the foreground app and the background task are on a phone. A second
     // connection in the same thread cannot be used for this: SQLite's busy wait blocks the thread.

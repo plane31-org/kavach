@@ -16,10 +16,13 @@ import { drain, enqueue, outboxCount } from "./outbox.js";
 import { validatePolicy, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
-import type { CircleRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
+import type { CircleRow, PendingResetRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
 import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9Vault } from "./transactions.js";
 import type { Transport, TransportHint } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
+
+/** accountSeed, deviceSeed, recoveryKey, instanceId and deviceId of a pending reset, in the secret store. */
+const RESET_ROOTS_BYTES = 32 * 3 + 16 + 16;
 
 export type ClientStatus = "fresh" | "ready" | "locked" | "accountRecoveryRequired" | "activationPending" | "retired" | "paused" | "quarantined";
 export type PauseReason = "sync" | "rotation" | "metadata" | "limit";
@@ -166,6 +169,7 @@ class ClientImpl implements Client {
   // Loading ---------------------------------------------------------------------------------------
 
   async load(): Promise<void> {
+    await this.finishInterruptedReset();
     const opened = await openStore(this.store, this.secrets, this.accountName);
     if (opened.kind === "fresh") return;
     this.account = opened.account;
@@ -783,16 +787,26 @@ class ClientImpl implements Client {
         try {
           const r = acceptSnapshot(c, wire, ownerPin.accountKey, pin.identityId, now);
           if (r.outcome === "ACCEPTED") {
-            await this.store.transaction((tx) => {
+            // The row may have moved since it was read: a sharing preference, a leave or a close
+            // made meanwhile wins over the fetched snapshot, and a newer snapshot already stored
+            // makes this one stale.
+            const committed = await this.store.transaction((tx) => {
               const row = tx.get("circles", toHex(c.circleId));
-              tx.put("circles", toHex(c.circleId), { ...circleToRow(r.state), pending: row?.pending && unbig(row.pending.revision) <= r.state.revision ? undefined : row?.pending });
-              const ch = t3ApplyChange(tx, { kind: "snapshot", circleId: c.circleId, revision: r.state.revision });
-              if (ch.changed) report.metadata.rotations++;
+              const fresh = row ? rowToCircle(row) : c;
+              if (fresh.revision >= r.state.revision) return undefined;
+              const localFinal = fresh.status === "left" || fresh.status === "closed" || fresh.status === "quarantined";
+              const state: CircleState = { ...r.state, enabled: fresh.enabled, status: localFinal ? fresh.status : r.state.status };
+              tx.put("circles", toHex(c.circleId), { ...circleToRow(state), pending: row?.pending && unbig(row.pending.revision) <= state.revision ? undefined : row?.pending });
+              const ch = t3ApplyChange(tx, { kind: "snapshot", circleId: c.circleId, revision: state.revision });
+              return { state, rotated: ch.changed, leftNow: state.status === "left" && fresh.status !== "left" };
             });
-            report.metadata.snapshots++;
-            this.emit({ kind: "circleChanged", circleId: c.circleId, revision: r.state.revision, status: r.state.status });
-            if (r.state.status === "left") await this.onLeft(c);
-            for (const m of r.state.members) memberIds.set(toHex(m), m);
+            if (committed) {
+              if (committed.rotated) report.metadata.rotations++;
+              report.metadata.snapshots++;
+              this.emit({ kind: "circleChanged", circleId: c.circleId, revision: committed.state.revision, status: committed.state.status });
+              if (committed.leftNow) await this.onLeft(c);
+              for (const m of committed.state.members) memberIds.set(toHex(m), m);
+            } else for (const m of c.members) memberIds.set(toHex(m), m);
           } else for (const m of c.members) memberIds.set(toHex(m), m);
         } catch (e) {
           if (isKavachError(e, "EQUIVOCATION")) {
@@ -1251,7 +1265,20 @@ class ClientImpl implements Client {
   private async resumeReset(stage: string, reauthProof?: Uint8Array): Promise<{ identityId: Uint8Array }> {
     const row = await this.store.read((tx) => tx.get("pendingReset", "pending"));
     const roots = await this.secrets.get("pendingReset");
-    if (!row || !roots || roots.length !== 32 * 3 + 16 + 16) throw new KavachError("RECOVERY_REQUIRED", stage, "reset pending without its roots");
+    if (!row || !roots || roots.length !== RESET_ROOTS_BYTES) throw new KavachError("RECOVERY_REQUIRED", stage, "reset pending without its roots");
+    const certificate = fromHex(row.certificate);
+    expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage);
+    const outcome = await this.transport.directory.resetAccount({ accountName: this.accountName, expectedOldIdentityId: fromHex(row.oldIdentityId), newCertificate: certificate, newVault: fromHex(row.vault), resetId: fromHex(row.resetId), reauthProof: reauthProof ?? new Uint8Array() });
+    if ((outcome.status !== "COMMITTED" && outcome.status !== "ALREADY_COMMITTED") || !outcome.receipt) throw new KavachError("NOT_AUTHORIZED", stage, `host refused reset: ${outcome.status}`);
+    return this.finishReset(stage, row, roots);
+  }
+
+  /**
+   * The local half of a reset the host holds: the new roots, then a new store under the new
+   * identity. Nothing of the old identity's keys survives. Safe to run again after a crash at
+   * any point, until the pending row is gone.
+   */
+  private async finishReset(stage: string, row: PendingResetRow, roots: Uint8Array): Promise<{ identityId: Uint8Array }> {
     const accountSeed = roots.subarray(0, 32);
     const deviceSeed = roots.subarray(32, 64);
     const recoveryKey = roots.subarray(64, 96);
@@ -1261,10 +1288,6 @@ class ClientImpl implements Client {
     const device = deviceFromSeed(deviceSeed, deviceId);
     const certificate = fromHex(row.certificate);
     const newPin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage));
-    const vaultWire = fromHex(row.vault);
-    const outcome = await this.transport.directory.resetAccount({ accountName: this.accountName, expectedOldIdentityId: fromHex(row.oldIdentityId), newCertificate: certificate, newVault: vaultWire, resetId: fromHex(row.resetId), reauthProof: reauthProof ?? new Uint8Array() });
-    if ((outcome.status !== "COMMITTED" && outcome.status !== "ALREADY_COMMITTED") || !outcome.receipt) throw new KavachError("NOT_AUTHORIZED", stage, `host refused reset: ${outcome.status}`);
-    // A new identity: a new store under it. Nothing of the old identity's keys survives.
     await t1Secrets(this.secrets, { accountSeed, deviceSeed, recoveryKey, instanceId });
     await this.store.transaction((tx) => {
       for (const table of ["meta", "self", "pins", "certificates", "quarantine", "circles", "revision", "vault", "epochs", "stream", "outbox", "history", "livePins", "readerEpochs", "subscriptions", "unresolved", "activation", "pendingReset"] as const) {
@@ -1285,6 +1308,19 @@ class ClientImpl implements Client {
     }
     await this.emitState();
     return { identityId: newPin.identityId };
+  }
+
+  /**
+   * A reset the host committed whose local half was interrupted: the roots already name the new
+   * identity while the store header still names the old one, which openStore would refuse. The
+   * roots are switched only after the host confirmed, so the new identity is the one to finish.
+   */
+  private async finishInterruptedReset(): Promise<void> {
+    const row = await this.store.read((tx) => tx.get("pendingReset", "pending"));
+    if (!row) return;
+    const [roots, accountSeed] = await Promise.all([this.secrets.get("pendingReset"), this.secrets.get("accountSeed")]);
+    if (!roots || roots.length !== RESET_ROOTS_BYTES || !accountSeed || !equalBytes(accountSeed, roots.subarray(0, 32))) return;
+    await this.finishReset("load", row, roots);
   }
 
   async close(): Promise<void> {

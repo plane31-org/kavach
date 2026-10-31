@@ -5,7 +5,8 @@
  * so SQLite's file lock serialises writers across the foreground app, the background location
  * task and any headless context; a writer that cannot take the lock within the busy timeout
  * gets `LOCKED`. The transaction callback may initiate a transport send before commit through
- * `tx.handoff` (T6h). Reads outside a transaction see committed state only.
+ * `tx.handoff` (T6h). Reads outside a transaction wait for the transaction in flight and see
+ * committed state only.
  *
  * The adapter speaks to the database through `SqlDriver`, a three-method surface that
  * `expo-sqlite`'s synchronous API and Node's `node:sqlite` both satisfy.
@@ -84,8 +85,18 @@ export class SqliteStore implements Store {
     }
   }
 
+  /**
+   * Reads share the one connection with writers, and a connection sees its own uncommitted
+   * writes, so a read waits for the transaction in flight: it then sees committed state only.
+   * (A read awaited from inside a transaction callback would wait on itself; core never does that.)
+   */
   async read<R>(fn: (tx: Omit<Tx, "put" | "delete" | "handoff">) => R): Promise<R> {
-    return fn(new SqliteTx(this.db, true));
+    const release = await this.acquire();
+    try {
+      return fn(new SqliteTx(this.db, true));
+    } finally {
+      release();
+    }
   }
 
   private rollback(): void {
