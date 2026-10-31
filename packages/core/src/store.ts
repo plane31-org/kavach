@@ -15,7 +15,7 @@ export interface SecretStore {
   delete(name: SecretName): Promise<void>;
 }
 
-export type SecretName = "accountSeed" | "deviceSeed" | "recoveryKey" | "storageKey" | "instanceId";
+export type SecretName = "accountSeed" | "deviceSeed" | "recoveryKey" | "storageKey" | "instanceId" | "pendingReset";
 
 // Logical tables. Rows are JSON-safe: bytes as hex strings, u64 as decimal strings.
 
@@ -218,6 +218,15 @@ export interface ClockRow {
   highWater: string;
 }
 
+/** A last-resort reset prepared and persisted before it is sent, so a lost response can be resumed. */
+export interface PendingResetRow {
+  resetId: string;
+  oldIdentityId: string;
+  certificate: string;
+  vault: string;
+  vaultHash: string;
+}
+
 export interface Tables {
   meta: MetaRow;
   self: SelfRow;
@@ -240,6 +249,7 @@ export interface Tables {
   resetReceipts: ResetReceiptRow;
   retiredIdentities: { identityId: string };
   clock: ClockRow;
+  pendingReset: PendingResetRow;
 }
 
 export type TableName = keyof Tables;

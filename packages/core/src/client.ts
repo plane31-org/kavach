@@ -3,7 +3,7 @@
  * transport, the recovery provider and the reset trust. States are emitted only after the
  * corresponding durable transition.
  */
-import { equalBytes, fromHex, toHex } from "./bytes.js";
+import { concat, equalBytes, fromHex, toHex } from "./bytes.js";
 import { resolveAudience, type ResolvedAudience } from "./audience.js";
 import { acceptSnapshot, checkMemberResolution, createCircleSnapshot, newCircleId, pinCircle, successorSnapshot, type CircleState } from "./circle.js";
 import { DocumentType, encodeLocation, expectType, parseVaultHeader, verifyDocument, type AccountDevice, type Location, type RecordKind } from "./codec.js";
@@ -11,12 +11,12 @@ import { randomBytes, ready, type BoxKeypair } from "./crypto.js";
 import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
-import { forgetAuthor, history, latest, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryQuery, type Latest, type ReceiveResult } from "./inbox.js";
+import { forgetAuthor, forgetAuthorIn, history, latest, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryQuery, type Latest, type ReceiveResult } from "./inbox.js";
 import { drain, enqueue, outboxCount } from "./outbox.js";
 import { validatePolicy, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
-import type { CircleRow, SecretStore, Store } from "./store.js";
+import type { CircleRow, SecretStore, Store, Tx } from "./store.js";
 import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9Vault } from "./transactions.js";
 import type { Transport, TransportHint } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
@@ -658,6 +658,15 @@ class ClientImpl implements Client {
     if (!this.account || !this.selfPin) return report;
     const meta = await this.store.read((tx) => tx.get("meta", META));
     if (!meta || meta.state === "RETIRED") return report;
+    if (await this.store.read((tx) => tx.get("pendingReset", "pending"))) {
+      // A reset the host may already hold: nothing else runs under the old identity.
+      try {
+        await this.resumeReset("sync");
+      } catch (e) {
+        report.errors.push(e instanceof KavachError ? `${e.code}@${e.stage}` : String(e));
+        return report;
+      }
+    }
     if (meta.state === "ACTIVATION_PENDING") {
       try {
         const resumed = await this.resumeActivation("sync");
@@ -871,9 +880,13 @@ class ClientImpl implements Client {
     if (receipt) {
       try {
         const effect = this.trust.apply(receipt, wire, current.accountName, current.identityId, this.now());
-        await this.persistTrust();
+        // One transaction: a receipt is never on record without the closures and rotations it
+        // causes, so a restart cannot see it as a duplicate with nothing done.
+        await this.store.transaction((tx) => {
+          this.persistTrustIn(tx);
+          if (effect.outcome === "ACCOUNT_KEY_CHANGED") this.applyResetIn(tx, current, effect.newIdentityId);
+        });
         if (effect.outcome === "ACCOUNT_KEY_CHANGED") {
-          await this.applyReset(current, effect.newIdentityId);
           report.metadata.resets++;
           this.emit({ kind: "accountKeyChanged", accountName: current.accountName, quarantined: false });
         }
@@ -894,32 +907,32 @@ class ClientImpl implements Client {
   }
 
   /** Peers on a validated reset: stop sharing to the old identity, close its circles, rotate. */
-  private async applyReset(old: AccountPin, newIdentityId: Uint8Array): Promise<void> {
-    await this.store.transaction((tx) => {
-      tx.delete("pins", toHex(old.identityId));
-      tx.delete("quarantine", old.accountName);
-      for (const [k, c] of tx.list("certificates")) if (c.identityId === toHex(old.identityId)) tx.put("certificates", k, { ...c, current: false });
-      for (const [k, c] of tx.list("circles")) {
-        if (c.ownerIdentityId === toHex(old.identityId)) {
-          tx.put("circles", k, { ...c, status: "closed" });
-          t3ApplyChange(tx, { kind: "leave", circleId: fromHex(k) });
-        } else if (c.members.includes(toHex(old.identityId))) {
-          t3ApplyChange(tx, { kind: "deviceChanged", identityId: old.identityId, certificateHash: newIdentityId });
-        }
+  private applyResetIn(tx: Tx, old: AccountPin, newIdentityId: Uint8Array): void {
+    tx.delete("pins", toHex(old.identityId));
+    tx.delete("quarantine", old.accountName);
+    for (const [k, c] of tx.list("certificates")) if (c.identityId === toHex(old.identityId)) tx.put("certificates", k, { ...c, current: false });
+    for (const [k, c] of tx.list("circles")) {
+      if (c.ownerIdentityId === toHex(old.identityId)) {
+        tx.put("circles", k, { ...c, status: "closed" });
+        t3ApplyChange(tx, { kind: "leave", circleId: fromHex(k) });
+      } else if (c.members.includes(toHex(old.identityId))) {
+        t3ApplyChange(tx, { kind: "deviceChanged", identityId: old.identityId, certificateHash: newIdentityId });
       }
-    });
-    await forgetAuthor(this.store, old.identityId);
+    }
+    forgetAuthorIn(tx, old.identityId);
+  }
+
+  private persistTrustIn(tx: Tx): void {
+    const rows = this.trust.toRows();
+    if (rows.list) tx.put("resetList", "list", rows.list);
+    tx.put("clock", "clock", rows.clock);
+    const hashes = rows.accepted;
+    for (const e of rows.events) tx.put("resetReceipts", e.resetId, { accountName: e.accountName, oldIdentityId: e.oldIdentityId, newIdentityId: e.newIdentityId, receiptHash: hashes.find((h) => h) ?? "" });
+    for (const r of rows.retired) tx.put("retiredIdentities", r, { identityId: r });
   }
 
   private async persistTrust(): Promise<void> {
-    const rows = this.trust.toRows();
-    await this.store.transaction((tx) => {
-      if (rows.list) tx.put("resetList", "list", rows.list);
-      tx.put("clock", "clock", rows.clock);
-      const hashes = rows.accepted;
-      for (const e of rows.events) tx.put("resetReceipts", e.resetId, { accountName: e.accountName, oldIdentityId: e.oldIdentityId, newIdentityId: e.newIdentityId, receiptHash: hashes.find((h) => h) ?? "" });
-      for (const r of rows.retired) tx.put("retiredIdentities", r, { identityId: r });
-    });
+    await this.store.transaction((tx) => this.persistTrustIn(tx));
   }
 
   private async onLeft(c: CircleState): Promise<void> {
@@ -1053,8 +1066,20 @@ class ClientImpl implements Client {
         continue;
       }
       const state = rowToCircle(row);
+      if (state.status === "closed") return { revision: state.revision };
       const successor = successorSnapshot(state, change, { identityId: pin.identityId, accountSecretKey: account.account.secretKey });
-      if (!successor) return { revision: state.revision };
+      if (!successor) {
+        if (!("close" in change)) return { revision: state.revision };
+        // Nobody but the owner to tell: the close is local, and the vault entry goes with it.
+        await this.store.transaction((tx) => {
+          const r = tx.get("circles", toHex(circleId));
+          if (r) tx.put("circles", toHex(circleId), { ...r, status: "closed", enabled: false, pending: undefined });
+          t3ApplyChange(tx, { kind: "leave", circleId });
+        });
+        this.emit({ kind: "circleChanged", circleId, revision: state.revision, status: "closed" });
+        await this.vaultUpdate((entries) => removeEntry(entries, circleId));
+        return { revision: state.revision };
+      }
       await this.store.transaction((tx) => t8OwnerSnapshot(tx, circleId, successor, state.revision + 1n, "close" in change));
       const published = await this.publishPendingSnapshot(circleId);
       if (published === "COMMITTED") return { revision: await this.store.read((tx) => unbig(tx.get("circles", toHex(circleId))?.revision ?? "0")) };
@@ -1082,8 +1107,12 @@ class ClientImpl implements Client {
     if (outcome.status === "COMMITTED" || outcome.status === "ALREADY_COMMITTED") {
       const accepted = acceptSnapshot(state, successor, pin.accountKey, pin.identityId, this.now());
       if (accepted.outcome !== "ACCEPTED" && accepted.outcome !== "DUPLICATE") throw new KavachError("STORAGE_FAILURE", stage, "the successor was refused locally");
-      const next = pending.close ? { ...accepted.state, status: "closed" as const } : accepted.state;
+      let next = pending.close ? { ...accepted.state, status: "closed" as const } : accepted.state;
       await this.store.transaction((tx) => {
+        // The row may have moved while the publication was in flight (sharing disabled, the
+        // circle closed): the host's answer settles membership, never the user's newer preference.
+        const live = tx.get("circles", toHex(circleId));
+        if (live) next = { ...next, enabled: live.enabled, status: live.status === "closed" ? "closed" : next.status };
         tx.put("circles", toHex(circleId), { ...circleToRow(next), pending: undefined });
         t3ApplyChange(tx, { kind: "snapshot", circleId, revision: next.revision });
       });
@@ -1094,6 +1123,7 @@ class ClientImpl implements Client {
         if (!stillElsewhere) await forgetAuthor(this.store, m);
       }
       this.emit({ kind: "circleChanged", circleId, revision: next.revision, status: next.status });
+      if (pending.close) await this.vaultUpdate((entries) => removeEntry(entries, circleId));
       return "COMMITTED";
     }
     if (outcome.status === "CONFLICT" && outcome.current) {
@@ -1158,12 +1188,9 @@ class ClientImpl implements Client {
     await this.vaultUpdate((entries) => entries.map((e) => (equalBytes(e.circleId, circleId) ? { ...e, sharingEnabled: enabled } : e)));
   }
 
+  /** Close: the successor names only the owner; its publication forgets the members and removes the vault entry. */
   private async closeCircle(circleId: Uint8Array): Promise<void> {
     await this.changeMembership(circleId, { close: true });
-    const members = await this.store.read((tx) => tx.get("circles", toHex(circleId))?.members ?? []);
-    const { pin } = this.requireAccount("close");
-    for (const m of members) if (m !== toHex(pin.identityId)) await forgetAuthor(this.store, fromHex(m));
-    await this.vaultUpdate((entries) => removeEntry(entries, circleId));
   }
 
   // Reset -----------------------------------------------------------------------------------------
@@ -1172,6 +1199,7 @@ class ClientImpl implements Client {
     const stage = "resetAccount";
     if (!options.confirmed) throw new KavachError("NOT_AUTHORIZED", stage, "reset requires confirmation");
     const { pin } = this.requireAccount(stage);
+    if (await this.store.read((tx) => tx.get("pendingReset", "pending"))) return this.resumeReset(stage, options.reauthProof);
     const accountSeed = newAccountSeed();
     const account = openAccount(this.accountName, accountSeed);
     const device = newDevice();
@@ -1180,19 +1208,42 @@ class ClientImpl implements Client {
     const recoveryKey = newRecoveryKey();
     const vault = buildVault({ accountName: this.accountName, accountKey: account.account.publicKey, vaultRevision: 1n }, { accountSeed, lastDeviceGeneration: 1n, lastCertificateHash: newPin.certificateHash, entries: [] }, recoveryKey);
     const resetId = randomBytes(16);
-    const outcome = await this.transport.directory.resetAccount({ accountName: this.accountName, expectedOldIdentityId: pin.identityId, newCertificate: certificate, newVault: vault.wire, resetId, reauthProof: options.reauthProof ?? new Uint8Array() });
+    const instanceId = randomBytes(16);
+    // Persisted before it is sent: the host may commit the new identity and the response be lost,
+    // and the only keys that can continue are these. Roots in the secret store, wires in the store.
+    await this.secrets.set("pendingReset", concat(accountSeed, device.deviceSeed, recoveryKey, instanceId, device.deviceId));
+    await this.store.transaction((tx) => tx.put("pendingReset", "pending", { resetId: toHex(resetId), oldIdentityId: toHex(pin.identityId), certificate: toHex(certificate), vault: toHex(vault.wire), vaultHash: toHex(vault.hash) }));
+    return this.resumeReset(stage, options.reauthProof);
+  }
+
+  /** Send (or re-send) the persisted reset with its own reset id, and finish locally once the host holds it. */
+  private async resumeReset(stage: string, reauthProof?: Uint8Array): Promise<{ identityId: Uint8Array }> {
+    const row = await this.store.read((tx) => tx.get("pendingReset", "pending"));
+    const roots = await this.secrets.get("pendingReset");
+    if (!row || !roots || roots.length !== 32 * 3 + 16 + 16) throw new KavachError("RECOVERY_REQUIRED", stage, "reset pending without its roots");
+    const accountSeed = roots.subarray(0, 32);
+    const deviceSeed = roots.subarray(32, 64);
+    const recoveryKey = roots.subarray(64, 96);
+    const instanceId = roots.subarray(96, 112);
+    const deviceId = roots.subarray(112, 128);
+    const account = openAccount(this.accountName, accountSeed);
+    const device = deviceFromSeed(deviceSeed, deviceId);
+    const certificate = fromHex(row.certificate);
+    const newPin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage));
+    const vaultWire = fromHex(row.vault);
+    const outcome = await this.transport.directory.resetAccount({ accountName: this.accountName, expectedOldIdentityId: fromHex(row.oldIdentityId), newCertificate: certificate, newVault: vaultWire, resetId: fromHex(row.resetId), reauthProof: reauthProof ?? new Uint8Array() });
     if ((outcome.status !== "COMMITTED" && outcome.status !== "ALREADY_COMMITTED") || !outcome.receipt) throw new KavachError("NOT_AUTHORIZED", stage, `host refused reset: ${outcome.status}`);
     // A new identity: a new store under it. Nothing of the old identity's keys survives.
-    const instanceId = randomBytes(16);
-    await t1Secrets(this.secrets, { accountSeed, deviceSeed: device.deviceSeed, recoveryKey, instanceId });
+    await t1Secrets(this.secrets, { accountSeed, deviceSeed, recoveryKey, instanceId });
     await this.store.transaction((tx) => {
-      for (const table of ["meta", "self", "pins", "certificates", "quarantine", "circles", "revision", "vault", "epochs", "stream", "outbox", "history", "livePins", "readerEpochs", "subscriptions", "unresolved", "activation"] as const) {
+      for (const table of ["meta", "self", "pins", "certificates", "quarantine", "circles", "revision", "vault", "epochs", "stream", "outbox", "history", "livePins", "readerEpochs", "subscriptions", "unresolved", "activation", "pendingReset"] as const) {
         for (const [k] of tx.list(table)) tx.delete(table, k);
       }
       t1Header(tx, { account, device, certificate, instanceId, generation: 1n });
-      t9Vault(tx, { revision: "1", hash: toHex(vault.hash), wire: toHex(vault.wire), pending: false });
+      t9Vault(tx, { revision: "1", hash: row.vaultHash, wire: row.vault, pending: false });
       t1Activate(tx);
     });
+    await this.secrets.delete("pendingReset");
     this.account = account;
     this.device = device;
     this.selfPin = newPin;

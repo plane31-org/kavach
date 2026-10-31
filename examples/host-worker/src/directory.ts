@@ -241,11 +241,13 @@ export class Directory {
   }
 
   async reset(input: { accountName: string; expectedOldIdentityId: string; newCertificate: string; newVault: string; resetId: string }): Promise<Outcome> {
+    // The reset id answers first: a device retrying after a lost response finds the account
+    // already under its new identity and must get its receipt, not UNAUTHORIZED.
+    const existing = await this.receipt(input.resetId);
+    if (existing) return { status: "ALREADY_COMMITTED", receipt: existing };
     const a = await this.account(input.accountName);
     if (!a || a.identity_id !== input.expectedOldIdentityId) return { status: "UNAUTHORIZED" };
     if (!this.env.RESET_OPERATIONAL_SEED || !this.env.RESET_KEY_ID) return { status: "PERMANENT_FAILURE" };
-    const existing = await this.receipt(input.resetId);
-    if (existing) return { status: "ALREADY_COMMITTED", receipt: existing };
     const doc = expectType<AccountDevice>(verifyDocument(unhex(input.newCertificate, "newCertificate")), DocumentType.AccountDevice);
     if (doc.accountName !== a.account_name) return { status: "UNAUTHORIZED" };
     const newIid = identityId(doc.accountName, doc.accountKey);

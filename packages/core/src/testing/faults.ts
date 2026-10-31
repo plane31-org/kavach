@@ -108,6 +108,8 @@ export interface MaliciousKnobs {
   readonly loseResponseOf: Set<MutationName>;
   /** Mutations whose next call fails before reaching the host (each name is consumed once). */
   readonly refuse: Set<MutationName>;
+  /** Mutations whose next response waits for the given promise after the host committed (consumed once). */
+  readonly hold: Map<MutationName, Promise<void>>;
   /** Reads that answer "nothing" while present. */
   readonly withhold: Set<"snapshots" | "epochs" | "records" | "requests" | "currentEpoch" | "keyList" | "certificates">;
   /** Older documents served instead of the current ones. */
@@ -136,6 +138,7 @@ export function emptyKnobs(): MaliciousKnobs {
   return {
     loseResponseOf: new Set(),
     refuse: new Set(),
+    hold: new Map(),
     withhold: new Set(),
     replay: { snapshots: new Map() },
     fork: { snapshots: new Map(), manifests: new Map(), records: new Map(), certificates: new Map() },
@@ -185,6 +188,11 @@ export class MaliciousTransport implements Transport {
       throw new Error("network unreachable");
     }
     const result = await call();
+    const gate = this.knobs.hold.get(name);
+    if (gate) {
+      this.knobs.hold.delete(name);
+      await gate;
+    }
     if (this.knobs.loseResponseOf.has(name)) {
       this.knobs.loseResponseOf.delete(name);
       this.losses.push(name);

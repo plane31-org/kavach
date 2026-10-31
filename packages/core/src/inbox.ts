@@ -383,12 +383,14 @@ export async function purgeHistory(store: Store, policy: RetentionPolicy, now: b
 
 /** Clear a removed author's live pin and keys; history already received stays. */
 export async function forgetAuthor(store: Store, authorIdentityId: Uint8Array): Promise<void> {
-  await store.transaction((tx) => {
-    tx.delete("livePins", toHex(authorIdentityId));
-    for (const [key, c] of tx.list("certificates")) {
-      if (c.identityId !== toHex(authorIdentityId)) continue;
-      for (const [k] of tx.list("readerEpochs", c.streamId + ":")) tx.delete("readerEpochs", k);
-      void key;
-    }
-  });
+  await store.transaction((tx) => forgetAuthorIn(tx, authorIdentityId));
+}
+
+/** The same, inside a caller's transaction. */
+export function forgetAuthorIn(tx: Tx, authorIdentityId: Uint8Array): void {
+  tx.delete("livePins", toHex(authorIdentityId));
+  for (const [, c] of tx.list("certificates")) {
+    if (c.identityId !== toHex(authorIdentityId)) continue;
+    for (const [k] of tx.list("readerEpochs", c.streamId + ":")) tx.delete("readerEpochs", k);
+  }
 }

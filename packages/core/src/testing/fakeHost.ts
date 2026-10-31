@@ -325,10 +325,12 @@ export class FakeHost {
         return host.receipts.get(toHex(resetId));
       },
       async resetAccount(input) {
-        const a = host.accounts.get(input.accountName);
-        if (!a || a.identityId !== toHex(input.expectedOldIdentityId) || !host.resetSigner) return { status: "UNAUTHORIZED" as const };
+        // The reset id answers first: a device whose response was lost retries after the account
+        // already carries the new identity, and must get its receipt, not UNAUTHORIZED.
         const existing = host.receipts.get(toHex(input.resetId));
         if (existing) return { status: "ALREADY_COMMITTED" as const, receipt: existing };
+        const a = host.accounts.get(input.accountName);
+        if (!a || a.identityId !== toHex(input.expectedOldIdentityId) || !host.resetSigner) return { status: "UNAUTHORIZED" as const };
         const doc = expectType<AccountDevice>(verifyDocument(input.newCertificate), DocumentType.AccountDevice);
         const newIid = identityId(doc.accountName, doc.accountKey);
         const receipt = buildResetReceipt(
