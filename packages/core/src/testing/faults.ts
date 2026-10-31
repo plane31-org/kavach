@@ -7,7 +7,7 @@
  */
 import { equalBytes, toHex } from "../bytes.js";
 import { KavachError } from "../errors.js";
-import type { Store, Tx } from "../store.js";
+import { invokeSync, type Store, type Tx } from "../store.js";
 import type { AppendOutcome, Directory, EpochBundle, MutationOutcome, ReadRecordsResult, Relay, Transport } from "../transport.js";
 
 // Crashes ------------------------------------------------------------------------------------------
@@ -63,12 +63,12 @@ export class FaultyStore implements Store {
     return this.process.transactions;
   }
 
-  async transaction<R>(fn: (tx: Tx) => R | Promise<R>): Promise<R> {
+  async transaction<R>(fn: (tx: Tx) => R): Promise<R> {
     this.alive();
     const n = ++this.process.transactions;
     const plan = this.process.plan;
-    const result = await this.inner.transaction(async (tx) => {
-      const r = await fn(tx);
+    const result = await this.inner.transaction((tx) => {
+      const r = invokeSync(fn, tx);
       if (plan && plan.phase === "beforeCommit" && plan.at === n) throw this.die(n, "beforeCommit");
       return r;
     });

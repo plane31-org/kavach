@@ -4,14 +4,14 @@
  * One table holds every logical table as JSON rows. Every write runs inside `BEGIN IMMEDIATE`,
  * so SQLite's file lock serialises writers across the foreground app, the background location
  * task and any headless context; a writer that cannot take the lock within the busy timeout
- * gets `LOCKED`. The transaction callback may initiate a transport send before commit through
- * `tx.handoff` (T6h). Reads outside a transaction wait for the transaction in flight and see
- * committed state only.
+ * gets `LOCKED`. The transaction callback is synchronous, so begin, callback and commit run in
+ * one turn of the event loop; it may initiate a transport send before commit through
+ * `tx.handoff` (T6h). Reads outside a transaction therefore see committed state only.
  *
  * The adapter speaks to the database through `SqlDriver`, a three-method surface that
  * `expo-sqlite`'s synchronous API and Node's `node:sqlite` both satisfy.
  */
-import { KavachError, type Store, type TableName, type Tables, type Tx } from "@kavach/core/adapters";
+import { KavachError, invokeSync, type Store, type TableName, type Tables, type Tx } from "@kavach/core/adapters";
 
 export type SqlValue = string | number | null;
 
@@ -57,7 +57,7 @@ export class SqliteStore implements Store {
     return new SqliteStore(db);
   }
 
-  async transaction<R>(fn: (tx: Tx) => R | Promise<R>): Promise<R> {
+  async transaction<R>(fn: (tx: Tx) => R): Promise<R> {
     const release = await this.acquire();
     try {
       try {
@@ -68,7 +68,7 @@ export class SqliteStore implements Store {
       const tx = new SqliteTx(this.db);
       let result: R;
       try {
-        result = await fn(tx);
+        result = invokeSync(fn, tx);
       } catch (e) {
         this.rollback();
         throw e;
@@ -87,8 +87,11 @@ export class SqliteStore implements Store {
 
   /**
    * Reads share the one connection with writers, and a connection sees its own uncommitted
-   * writes, so a read waits for the transaction in flight: it then sees committed state only.
-   * (A read awaited from inside a transaction callback would wait on itself; core never does that.)
+   * writes. Because the transaction callback is synchronous, BEGIN, the callback and COMMIT (or
+   * ROLLBACK) run without yielding, so no read can observe the connection mid-transaction: by the
+   * time this method runs its callback the connection holds no open transaction, and the read
+   * sees committed state only. The in-process chain is kept for ordering, so a read issued after
+   * a transaction call observes that transaction's outcome.
    */
   async read<R>(fn: (tx: Omit<Tx, "put" | "delete" | "handoff">) => R): Promise<R> {
     const release = await this.acquire();

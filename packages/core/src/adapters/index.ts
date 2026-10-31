@@ -41,6 +41,7 @@ export {
 export {
   MemorySecretStore,
   MemoryStore,
+  invokeSync,
   type ActivationRow,
   type CertificateRow,
   type CircleRow,

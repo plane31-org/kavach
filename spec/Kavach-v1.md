@@ -598,7 +598,7 @@ Delivery deadlines use the relay's acceptance time plus the window; the Worker e
 
 One SQLite database opened through Expo SQLite with SQLCipher, keyed by the hex `storageKey`, in WAL mode with `synchronous = FULL`. SQLCipher gives encryption at rest for every row, so there is no second per-value encryption layer. The `meta` row binds schema version 1, the store instance id, `identityId` and the current `certificateHash`, as the protocol requires.
 
-Every SDK write runs inside `BEGIN IMMEDIATE`. SQLite's file lock then serialises writers across the foreground app, the background location task and any headless context, without a native module. The adapter's `transaction(fn)` lets the callback start the transport's `send` before the transaction commits, which is what the protocol's handoff rule (T6h) needs; the callback never awaits the response inside. The busy timeout is finite, and a writer that cannot acquire the lock returns `RETRYABLE`.
+Every SDK write runs inside `BEGIN IMMEDIATE`. SQLite's file lock then serialises writers across the foreground app, the background location task and any headless context, without a native module. The adapter's `transaction(fn)` lets the callback start the transport's `send` before the transaction commits, which is what the protocol's handoff rule (T6h) needs; the callback is synchronous and never awaits the response inside. The busy timeout is finite, and a writer that cannot acquire the lock returns `RETRYABLE`.
 
 #### Recovery providers
 
