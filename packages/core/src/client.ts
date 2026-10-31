@@ -994,7 +994,6 @@ class ClientImpl implements Client {
       let revision = 0n;
       let hash: Uint8Array | undefined;
       if (row) {
-        const { openVault } = await import("./codec.js");
         const opened = openVault(fromHex(row.wire), recoveryKey, this.accountName, account.account.publicKey);
         entries = opened.entries;
         revision = unbig(row.revision);
