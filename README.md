@@ -3,7 +3,7 @@
 End-to-end encrypted, relayed, durable records between a person's devices and the devices of the people they share with, for circles of up to 100 accounts, through a server that stores only what it cannot open and deletes each record once every reader has it. The SDK is product-agnostic: a product declares its record kinds and keeps its payload codecs in its own profile.
 
 - `spec/Kavach-v1.md`: the protocol specification, which names no product concept. Revision 8, wire version 5.
-- `spec/Profile-template.md`: what an implementation profile must decide; `spec/Kavach-v1-Moyo-profile.md` is the first product's profile, kept here until it moves to Moyo's repository.
+- `spec/Profile-template.md`: what an implementation profile must decide; a product keeps its profile in its own repository.
 - `Kavach-v1-Build-Sequence.md`: the order in which this repository is built, one tested module at a time.
 - `packages/core`: the protocol in pure TypeScript.
 - `packages/expo`: Expo adapters.

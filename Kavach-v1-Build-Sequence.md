@@ -1,6 +1,6 @@
 # Kavach v1: build sequence for a new repository
 
-One module at a time: write it, test it against the frozen vectors or a scenario, then move on. Nothing in the existing Moyo repository changes until step 18. The protocol is `spec/Kavach-v1.md` (protocol revision 8, wire version 5, formerly SealedStream SS5); Moyo's choices are its own profile, `spec/Kavach-v1-Moyo-profile.md`. The vectors are `spec/vectors.json` with `spec/verify_vectors.py`: the SS5 revision 2 package (kept unchanged in `spec/vectors-rev2/`) regenerated once for revision 4: K19 at 30 days, the maximum-size record re-derived with flag bit 0 reserved, type 5 retired, the 49-byte vault entry. The wire labels keep the `SealedStream/5/` prefix on purpose.
+One module at a time: write it, test it against the frozen vectors or a scenario, then move on. The protocol is `spec/Kavach-v1.md` (protocol revision 8, wire version 5); a product's choices are its own implementation profile (`spec/Profile-template.md`), kept in the product's repository. The vectors are `spec/vectors.json` with `spec/verify_vectors.py`: the SS5 revision 2 package (kept unchanged in `spec/vectors-rev2/`) regenerated once for revision 4: K19 at 30 days, the maximum-size record re-derived with flag bit 0 reserved, type 5 retired, the 49-byte vault entry. The wire labels keep the `SealedStream/5/` prefix on purpose.
 
 Packages: `@plane31/blind-relay` (protocol, pure TypeScript, no platform imports) and `@plane31/blind-relay-expo` (SecureStore, SQLite with SQLCipher, Keychain and Block Store recovery providers, clock, background task glue). A reference host lives in `examples/host-worker` and is not published.
 
@@ -128,7 +128,7 @@ Next: the reference host.
 
 ## Step 15: reference host (an SDK example, not published)
 
-Why it is in the SDK repository: the SDK ships no server, but its cursor, deletion, checkpoint and fence rules are only promises until a relay executes them. The reference host makes the directory and relay contract of protocol section 13 executable, so the SDK repository can run its own end-to-end tests, and it is the template the Moyo Worker is built from in step 18. It is a test fixture and a pattern, never a product; Moyo's production Worker lives in the Moyo repository.
+Why it is in the SDK repository: the SDK ships no server, but its cursor, deletion, checkpoint and fence rules are only promises until a relay executes them.
 
 Write: `examples/host-worker`: directory tables with compare-and-swap on certificate hash, snapshot revision and vault revision; the current reset-key list and a receipt signer using an operational key from the environment; a per-author relay object holding retained records by `deliverySeq` with acceptance times, one subscription row per reader device with its `ackCursor`, the `expiredThrough` watermark, the per-stream high-water pair and last-append outcome, subscription-filtered reads, the epoch material of every epoch that is current or referenced by a retained record, deletion in the same transaction as a cursor advance and an alarm that advances the expiry prefix; a notification hook that emits a visible notification for a join request (to the owner) and a check-in append (to each recipient) and a silent wake-up otherwise; an activation hint to every circle of the account. The in-memory host in `packages/core/src/testing` is the behavioural reference it must match.
 
@@ -142,24 +142,16 @@ Write: a test harness that injects time, randomness, dropped responses after com
 
 Test: every crash outcome in protocol section 11 holds against the real SQLCipher database on a device; every malicious-transport case ends in the typed error the protocol names and never in a plaintext fallback or a silent reset; the lost-device scenario runs with the attacker holding the complete old-device state.
 
-Done, with these notes. Time is injected through `now`; randomness is not, because every check compares the bytes the store holds with the bytes the host holds, which is stronger than replaying a random stream. The crash sweep runs on the in-memory store and on SQLite files in Node (real `BEGIN IMMEDIATE`, WAL, `synchronous = FULL`); the same sweep on SQLCipher on a phone is Moyo's durable-state gate in step 18, since it needs the development build. The sweep found and fixed four client gaps: an enrollment interrupted after the host registered the account could not resume (the retry got a conflict and gave up); a replacement interrupted after the host activated the device allocated a third device on retry; a process that died between activation and the provider's save left the account unbacked with nothing retrying; and a record whose epoch the host served tampered was discarded instead of held as key-pending with the error named. Equivocation by the author (two signed bodies for one record id, two snapshots at one revision) is covered at module level in the inbox and circle tests; the transport-level fork knobs cover what a host can do alone.
+Done, with these notes. Time is injected through `now`; randomness is not, because every check compares the bytes the store holds with the bytes the host holds, which is stronger than replaying a random stream. The sweep found and fixed four client gaps: an enrollment interrupted after the host registered the account could not resume (the retry got a conflict and gave up); a replacement interrupted after the host activated the device allocated a third device on retry; a process that died between activation and the provider's save left the account unbacked with nothing retrying; and a record whose epoch the host served tampered was discarded instead of held as key-pending with the error named. Equivocation by the author (two signed bodies for one record id, two snapshots at one revision) is covered at module level in the inbox and circle tests; the transport-level fork knobs cover what a host can do alone.
 
 Next: measurement.
 
 ## Step 17: SDK benchmarks
 
-What belongs here is what the SDK claims for itself: the cost of a full 100-account rotation (key, wraps, manifest, signature), a 100-person receiving load (verify, open the epoch, decrypt, store), storage growth at one record a minute per author for a day, and the time of one `enqueue` and one `receive`. Cold start, activation, time to a full map, memory and battery depend on the app's screens and scheduling and are measured by Moyo in step 18.
+What belongs here is what the SDK claims for itself: the cost of a full 100-account rotation (key, wraps, manifest, signature), a 100-person receiving load (verify, open the epoch, decrypt, store), storage growth at one record a minute per author for a day, and the time of one `enqueue` and one `receive`.
 
 Write: `packages/core/bench`: the four measurements above on Node against the in-memory store and the SQLite store, printing p50 and p95; and a small screen in the Expo example app that runs the same four on a device.
 
 Test: numbers exist on Node and on one mid-range iOS and one mid-range Android device before any speed claim is written down. None of them appears in the specification or the README without the device, OS and date next to it.
 
-Next: Moyo.
-
-## Step 18: Moyo integration
-
-Write: in the Moyo repository, replace `packages/sealed` with `@plane31/blind-relay` and `@plane31/blind-relay-expo`; implement the directory, relay, notification, key-list and reset endpoints in the Worker on the pattern of the reference host (`UserDO` becomes the per-author relay, `CircleDO` keeps presence and wake-ups only); send the join-request and check-in notifications as visible pushes with the app's generic wording; remove the server-side trail, R2 history, device lists, pending devices, key requests, archives and circle log tables; generate the management key offline and two operational keys, pin the management public key and minimum list version in `app.config.ts`, hold the active operational key as a Worker secret, and schedule the 14-day list signing; wire the recovery providers and the retention policy from the profile; add the Account settings entries for recovery status and the recovery code.
-
-Test: `pnpm typecheck`, `pnpm test`, the Maestro flows for create, join with the owner's notification, approve, phone replacement on a second emulator with per-person waiting pins that fill in, removal and a check-in notification. The app-level measurements of the profile's performance gate (cold start, activation, time to a full map with five authors online, memory and battery) are taken here, on one mid-range iOS and one mid-range Android device.
-
-Next: the external review named in protocol section 16.
+Next: the product, in its own repository, following its profile.

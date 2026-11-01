@@ -215,7 +215,7 @@ describe("openKavach", () => {
 
   it("names and validates", () => {
     expect(databaseFileName("alice")).toBe("kavach-alice.db");
-    expect(databaseFileName("alice", "moyo")).toBe("moyo-alice.db");
+    expect(databaseFileName("alice", "acme")).toBe("acme-alice.db");
     expect(() => databaseFileName("../etc")).toThrow(expect.objectContaining({ code: "MALFORMED" }));
   });
 

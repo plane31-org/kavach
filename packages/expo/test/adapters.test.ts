@@ -26,7 +26,7 @@ describe("ExpoSecretStore", () => {
       }
     };
     const THIS_DEVICE_ONLY = Symbol("WHEN_UNLOCKED_THIS_DEVICE_ONLY");
-    const store = new ExpoSecretStore(fake, { thisDeviceOnly: THIS_DEVICE_ONLY, keychainService: "app.getmoyo" });
+    const store = new ExpoSecretStore(fake, { thisDeviceOnly: THIS_DEVICE_ONLY, keychainService: "com.example.app" });
     const seed = randomBytes(32);
     await store.set("accountSeed", seed);
     expect(items.get("kavach.accountSeed")).toBe(toHex(seed));
@@ -37,7 +37,7 @@ describe("ExpoSecretStore", () => {
     for (const c of calls) {
       expect(c.options?.keychainAccessible).toBe(THIS_DEVICE_ONLY);
       expect(c.options?.requireAuthentication).toBe(false);
-      expect(c.options?.keychainService).toBe("app.getmoyo");
+      expect(c.options?.keychainService).toBe("com.example.app");
     }
   });
 });
@@ -78,7 +78,7 @@ describe("BlockStoreRecoveryProvider", () => {
     const loaded = await p.load("alice", iid);
     expect(loaded.status).toBe("available");
     expect(toHex(loaded.recoveryKey ?? new Uint8Array())).toBe(toHex(key));
-    // Wrong Moyo account for the same entry: unavailable, never a key.
+    // Wrong product account for the same entry: unavailable, never a key.
     expect((await p.load("bob", iid)).status).toBe("unavailable");
     expect((await p.status()).backupState).toBe("pending");
   });

@@ -1,6 +1,6 @@
 # Kavach v1: implementation profile template
 
-The protocol specification (`spec/Kavach-v1.md`) names no product concept. A product that ships on Kavach writes an implementation profile that decides everything the protocol leaves to it. Where a profile and the protocol disagree, the protocol wins. The first profile is Moyo's; this template lists what every profile must state.
+The protocol specification (`spec/Kavach-v1.md`) names no product concept. A product that ships on Kavach writes an implementation profile that decides everything the protocol leaves to it. Where a profile and the protocol disagree, the protocol wins. This template lists what every profile must state; a product keeps its profile in its own repository.
 
 ## 1. Record kinds
 

@@ -2,13 +2,13 @@
 
 End-to-end encrypted, relayed, durable records between a person's devices and the devices of the people they share with, for circles of up to 100 accounts, through a server that stores only what it cannot open and deletes each record once every reader has it. What a record means is the product's; the protocol carries bytes of a kind the product declares.
 
-Kavach v1, protocol revision 8, formerly SealedStream SS5. Wire version 5, unchanged since revision 2; revision 6 assigned a flag bit that was reserved, revision 7 changed no byte, and revision 8 puts an envelope in front of every record payload. October 2026. An implementation profile states a product's record kinds, payload codecs, platform, server and retention choices; the first is "Kavach v1: Moyo implementation profile", a separate document, and `spec/Profile-template.md` lists what a profile must decide.
+Kavach v1, protocol revision 8, formerly SealedStream SS5. Wire version 5, unchanged since revision 2; revision 6 assigned a flag bit that was reserved, revision 7 changed no byte, and revision 8 puts an envelope in front of every record payload. October 2026. An implementation profile states a product's record kinds, payload codecs, platform, server and retention choices; `spec/Profile-template.md` lists what a profile must decide, and each product keeps its profile in its own repository.
 
 > **How to read this**
 >
 > Sections 1 to 3 state the requirements, the terms and the cipher suite. Sections 4 to 12 are the protocol: accounts, recovery, membership, audience, epochs, records, delivery, durable state and reset. Sections 13 and 14 are the client contract and its results. Section 15 states what is and is not protected, 16 how conformance is shown, and 17 what we want a reviewer's opinion on. The appendix lists the scenario tests that gate release.
 >
-> This document names no platform library, server product, retention value or record kind. Those belong to an implementation profile; the Moyo profile is the first. Where a profile and this document disagree, this document wins.
+> This document names no platform library, server product, retention value or record kind. Those belong to a product's implementation profile (`spec/Profile-template.md`). Where a profile and this document disagree, this document wins.
 
 ## Protocol specification
 

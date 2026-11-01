@@ -1,6 +1,6 @@
 # @plane31/blind-relay-expo
 
-The adapters an Expo app supplies to `@plane31/blind-relay`, as the first implementation profile (`spec/Kavach-v1-Moyo-profile.md`, section 3) describes them; `spec/Profile-template.md` lists what any product's profile decides. Each adapter is written against a small structural interface so it can be tested in Node with a fake, and driven on a device by the real module.
+The adapters an Expo app supplies to `@plane31/blind-relay`, as a product's implementation profile describes them (`spec/Profile-template.md`, section 4, lists what a profile decides). Each adapter is written against a small structural interface so it can be tested in Node with a fake, and driven on a device by the real module.
 
 | Adapter | Over | Status |
 | --- | --- | --- |
@@ -26,7 +26,7 @@ const { client, databaseFileName } = await openKavach({
   recoveryProvider,   // BlockStoreRecoveryProvider on Android, AppleKeychainRecoveryProvider on iOS
   retentionPolicy,    // the global windows plus `kinds`: one { kind, retentionMs, queue, history, newest } per record kind the app uses
   resetTrust,
-  secrets: { secureStore: SecureStore, thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, keychainService: "app.getmoyo" },
+  secrets: { secureStore: SecureStore, thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, keychainService: "com.example.app" },
   database: SQLite,
   context: "foreground", // "background" in the location task
   getRandomValues: Crypto.getRandomValues, // Hermes has no Web Crypto; installed once, never a weaker fallback
@@ -54,7 +54,7 @@ import { randomBytes } from "@plane31/blind-relay/adapters";
 import { ExpoSecretStore, SqliteStore, expoSqliteDriver, installWebCrypto } from "@plane31/blind-relay-expo";
 
 installWebCrypto(Crypto.getRandomValues);
-const secretStore = new ExpoSecretStore(SecureStore, { thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, namespace: `kavach.${accountName}`, keychainService: "app.getmoyo" });
+const secretStore = new ExpoSecretStore(SecureStore, { thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, namespace: `kavach.${accountName}`, keychainService: "com.example.app" });
 let storageKey = await secretStore.get("storageKey");
 if (!storageKey) { storageKey = randomBytes(32); await secretStore.set("storageKey", storageKey); }
 const db = SQLite.openDatabaseSync(`kavach-${accountName}.db`, { useNewConnection: true });
@@ -70,4 +70,4 @@ Foreground and background tasks write concurrently without a shared counter and 
 
 `@plane31/blind-relay` runs on the portable backend (the noble libraries, pure JavaScript) unless told otherwise, which is what Hermes needs: it has no WebAssembly. On Node, `import { loadSodiumBackend } from "@plane31/blind-relay/sodium"` and `setCryptoBackend(await loadSodiumBackend())` before `open()` selects libsodium. Both backends pass the same vectors.
 
-`test/faults.sqlite.test.ts` runs the core's crash and lost-response sweeps over SQLite files on Node, as close to the phone's store as a test without the development build can get; the on-device run on SQLCipher is Moyo's gate.
+`test/faults.sqlite.test.ts` runs the core's crash and lost-response sweeps over SQLite files on Node, as close to the phone's store as a test without the development build can get; the on-device run on SQLCipher is the product's release gate.
