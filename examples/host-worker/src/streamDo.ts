@@ -191,12 +191,13 @@ export class StreamDO extends DurableObject<Env> {
       this.set("hwCounter", rec.counter);
       this.set("lastAppend", JSON.stringify({ recordId: b.recordId, hash, seq, at: acceptedAt.toString() }));
       if (required.length > 0) {
-        this.sql.exec("INSERT INTO records (seq, record_id, wire, accepted_at, epoch, counter, kind, required) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", seq, b.recordId, b.wire, acceptedAt.toString(), rec.epoch, rec.counter, rec.kind, JSON.stringify(required));
+        this.sql.exec("INSERT INTO records (seq, record_id, wire, accepted_at, epoch, counter, kind, required) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", seq, b.recordId, b.wire, acceptedAt.toString(), rec.epoch, rec.counter, rec.headerClass, JSON.stringify(required));
       }
     });
     void this.ctx.storage.setAlarm(Number(acceptedAt + BigInt(this.env.DELIVERY_WINDOW_MS)));
-    // A status (kind 2) carries no notification and needs no wake-up; readers pick it up on their next sync.
-    const notify = rec.kind === 2 ? [] : rows.filter((r) => r.identityId !== b.callerIdentityId).map((r) => ({ identityId: r.identityId, kind: rec.kind === 1 ? "checkIn" : "wake" }));
+    // By header class, the one thing the relay sees of a record's kind: the profile declares 1 as a
+    // visible notification, 2 as silent with no wake-up, and anything else as a wake-up.
+    const notify = rec.headerClass === 2 ? [] : rows.filter((r) => r.identityId !== b.callerIdentityId).map((r) => ({ identityId: r.identityId, kind: rec.headerClass === 1 ? "checkIn" : "wake" }));
     return { status: "ACCEPTED", deliverySeq: String(seq), notify };
   }
 

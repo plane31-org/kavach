@@ -2,7 +2,7 @@
 
 End-to-end encrypted location sharing and check-ins for circles of up to 100 accounts, through a server that stores only what it cannot open and deletes each record once every reader has it.
 
-- `spec/Kavach-v1.md`: the protocol specification (Part I) and the Moyo implementation profile (Part II). Revision 7, wire version 5.
+- `spec/Kavach-v1.md`: the protocol specification (Part I) and the Moyo implementation profile (Part II). Revision 8, wire version 5.
 - `Kavach-v1-Build-Sequence.md`: the order in which this repository is built, one tested module at a time.
 - `packages/core`: the protocol in pure TypeScript.
 - `packages/expo`: Expo adapters.

@@ -17,6 +17,8 @@ export interface KindDeclaration {
   readonly history: boolean;
   /** Whether one newest-per-author slot is kept, from the author's current device, ordered by event time. */
   readonly newest: boolean;
+  /** The two header bits the relay may see for this kind (0 to 3, 0 when absent), for routing and notifications without content. */
+  readonly headerClass: 0 | 1 | 2 | 3;
 }
 
 export interface RetentionPolicy {
@@ -29,8 +31,8 @@ export interface RetentionPolicy {
   readonly kinds: readonly KindDeclaration[];
 }
 
-/** The largest kind the current wire can carry: two header bits, both set being malformed. */
-export const MAX_WIRE_KIND = 2;
+/** The largest kind the envelope carries. */
+export const MAX_WIRE_KIND = 255;
 
 const FIELDS: readonly (keyof RetentionPolicy)[] = ["version", "deliveryWindowMs", "appendRetryWindowMs", "hygieneRotationMs", "maxOutboxRecords", "maxOutboxBytes", "kinds"];
 
@@ -60,7 +62,9 @@ export function validatePolicy(policy: unknown): RetentionPolicy {
     if (k.queue !== "keepAll" && k.queue !== "latestWins") throw new KavachError("MALFORMED", stage, `kinds[${i}].queue must be keepAll or latestWins`);
     if (typeof k.history !== "boolean" || typeof k.newest !== "boolean") throw new KavachError("MALFORMED", stage, `kinds[${i}].history and .newest must be booleans`);
     if (!k.history && !k.newest) throw new KavachError("MALFORMED", stage, `kinds[${i}] keeps nothing: declare history or newest`);
-    return { kind, retentionMs: big(`kinds[${i}].retentionMs`, k.retentionMs), queue: k.queue, history: k.history, newest: k.newest };
+    const headerClass = k.headerClass ?? 0;
+    if (headerClass !== 0 && headerClass !== 1 && headerClass !== 2 && headerClass !== 3) throw new KavachError("MALFORMED", stage, `kinds[${i}].headerClass must be 0 to 3`);
+    return { kind, retentionMs: big(`kinds[${i}].retentionMs`, k.retentionMs), queue: k.queue, history: k.history, newest: k.newest, headerClass };
   });
   return {
     version: int("version", p.version),

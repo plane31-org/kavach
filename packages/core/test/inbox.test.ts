@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { toHex } from "../src/bytes.js";
 import { createCircleSnapshot, newCircleId, successorSnapshot } from "../src/circle.js";
-import { buildEncryptedRecord, encodeLocation } from "../src/codec.js";
+import { buildRecordWire, encodeLocation } from "../src/codec.js";
 import { randomBytes, ready } from "../src/crypto.js";
 import { history, newestSlot, purgeHistory, receive, syncStream } from "../src/inbox.js";
 import { drain, enqueue } from "../src/outbox.js";
@@ -65,7 +65,7 @@ describe("receiving through sync", () => {
     const { clock, alice, bob } = await trio();
     const key = await alice.store.read((tx) => tx.get("epochs", "1")?.epochKey ?? "");
     const wireFor = (counter: number, lat: number): Uint8Array =>
-      buildEncryptedRecord({ streamId: alice.pin.streamId, epoch: 1, counter, sentAt: clock.now(), kind: 0 }, sample(clock, lat), Uint8Array.from(Buffer.from(key, "hex")), randomBytes(24), alice.device.signing.secretKey);
+      buildRecordWire({ streamId: alice.pin.streamId, epoch: 1, counter, sentAt: clock.now(), kind: 0, headerClass: 0 }, sample(clock, lat), Uint8Array.from(Buffer.from(key, "hex")), randomBytes(24), alice.device.signing.secretKey);
     // Bob needs the epoch key: one real delivery fetches it.
     await enqueue(alice.outbox, 0, sample(clock));
     await drain(alice.outbox);
@@ -128,7 +128,7 @@ describe("receiving through sync", () => {
     const cert2 = certify(alice.account, newPhone, 2n);
     await bob.know(cert2);
     const key = await alice.store.read((tx) => tx.get("epochs", "1")?.epochKey ?? "");
-    const late = buildEncryptedRecord({ streamId: alice.pin.streamId, epoch: 1, counter: 9, sentAt: clock.now(), kind: 0 }, sample(clock, 13), Uint8Array.from(Buffer.from(key, "hex")), randomBytes(24), alice.device.signing.secretKey);
+    const late = buildRecordWire({ streamId: alice.pin.streamId, epoch: 1, counter: 9, sentAt: clock.now(), kind: 0, headerClass: 0 }, sample(clock, 13), Uint8Array.from(Buffer.from(key, "hex")), randomBytes(24), alice.device.signing.secretKey);
     const r = await receive(bob.inbox, late);
     expect(r.result).toBe("history");
     const after = await newestSlot(bob.store, alice.pin.identityId, 0, clock.now());
@@ -146,7 +146,7 @@ describe("receiving through sync", () => {
     // Carol is a member of Bob's circle, so Bob is authorised, but the epoch does not address him.
     await carol.rotate();
     const own = await carol.store.read((tx) => tx.get("epochs", "1"));
-    const wire = buildEncryptedRecord({ streamId: carol.pin.streamId, epoch: 1, counter: 0, sentAt: clock.now(), kind: 0 }, sample(clock, 5), Uint8Array.from(Buffer.from(own?.epochKey ?? "", "hex")), randomBytes(24), carol.device.signing.secretKey);
+    const wire = buildRecordWire({ streamId: carol.pin.streamId, epoch: 1, counter: 0, sentAt: clock.now(), kind: 0, headerClass: 0 }, sample(clock, 5), Uint8Array.from(Buffer.from(own?.epochKey ?? "", "hex")), randomBytes(24), carol.device.signing.secretKey);
     const r = await receive(bob.inbox, wire);
     // Carol's epoch 1 names Bob (she joined the circle), so Bob fetches the key and opens it.
     expect(["updated", "keyPending"]).toContain(r.result);
@@ -154,11 +154,11 @@ describe("receiving through sync", () => {
     const stranger = await setupDevice(new FakeHost(), clock, "mallory");
     await stranger.rotate();
     const ek = await stranger.store.read((tx) => tx.get("epochs", "1")?.epochKey ?? "");
-    const foreign = buildEncryptedRecord({ streamId: stranger.pin.streamId, epoch: 1, counter: 0, sentAt: clock.now(), kind: 0 }, sample(clock), Uint8Array.from(Buffer.from(ek, "hex")), randomBytes(24), stranger.device.signing.secretKey);
+    const foreign = buildRecordWire({ streamId: stranger.pin.streamId, epoch: 1, counter: 0, sentAt: clock.now(), kind: 0, headerClass: 0 }, sample(clock), Uint8Array.from(Buffer.from(ek, "hex")), randomBytes(24), stranger.device.signing.secretKey);
     expect(await receive(bob.inbox, foreign)).toEqual({ result: "invalid", reason: "NOT_AUTHORIZED" });
     // Future skew is dropped, never stored.
     clock.advance(-600_000n);
-    const future = buildEncryptedRecord({ streamId: alice.pin.streamId, epoch: 1, counter: 50, sentAt: clock.now() + 600_000n, kind: 0 }, sample(clock), Uint8Array.from(Buffer.from((await alice.store.read((tx) => tx.get("epochs", "1")?.epochKey)) ?? "", "hex")), randomBytes(24), alice.device.signing.secretKey);
+    const future = buildRecordWire({ streamId: alice.pin.streamId, epoch: 1, counter: 50, sentAt: clock.now() + 600_000n, kind: 0, headerClass: 0 }, sample(clock), Uint8Array.from(Buffer.from((await alice.store.read((tx) => tx.get("epochs", "1")?.epochKey)) ?? "", "hex")), randomBytes(24), alice.device.signing.secretKey);
     expect(await receive(bob.inbox, future)).toEqual({ result: "expired", reason: "CLOCK_SKEW" });
   });
 

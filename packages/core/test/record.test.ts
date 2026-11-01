@@ -47,36 +47,34 @@ function code(fn: () => unknown): string {
 
 describe("sealing", () => {
   it("Vector D and the check-in fixture reproduce exactly with their nonces", () => {
-    const payload = hex(fixture.record.plaintext);
-    const d = sealRecord({ streamId: alicePin.streamId, epoch: 1, nextCounter: 0, kind: 0, payload, sentAt: now, epochKey, signingSecretKey: dsk, nonce: hex(str(fixture.inputs["record_nonce"] ?? "")) });
+    const payload = hex((fixture.record as { payload: string }).payload);
+    const d = sealRecord({ streamId: alicePin.streamId, epoch: 1, nextCounter: 0, kind: 0, eventTime: now - 123n, headerClass: 0, payload, sentAt: now, epochKey, signingSecretKey: dsk, nonce: hex(str(fixture.inputs["record_nonce"] ?? "")) });
     expect(toHex(d.wire)).toBe(fixture.documents["record"]?.wire);
     expect(toHex(d.recordId)).toBe(fixture.record.record_id);
-    const c = sealRecord({ streamId: alicePin.streamId, epoch: 1, nextCounter: 1, kind: 1, payload, sentAt: now + 1n, epochKey, signingSecretKey: dsk, nonce: range(144, 168) });
+    const c = sealRecord({ streamId: alicePin.streamId, epoch: 1, nextCounter: 1, kind: 1, headerClass: 1, payload, sentAt: now + 1n, epochKey, signingSecretKey: dsk, nonce: range(144, 168) });
     expect(toHex(c.wire)).toBe(fx.durable_events.checkin_wire);
-    const l = sealRecord({ streamId: alicePin.streamId, epoch: 1, nextCounter: 2, kind: 0, payload, sentAt: now + 2n, epochKey, signingSecretKey: dsk, nonce: range(168, 192) });
+    const l = sealRecord({ streamId: alicePin.streamId, epoch: 1, nextCounter: 2, kind: 0, eventTime: now - 123n, headerClass: 0, payload, sentAt: now + 2n, epochKey, signingSecretKey: dsk, nonce: range(168, 192) });
     expect(toHex(l.wire)).toBe(fx.durable_events.following_location_wire);
     // A check-in followed by two locations: three distinct ids on one counter.
     expect(new Set([d, c, l].map((r) => toHex(r.recordId))).size).toBe(3);
   });
 
   it("S14 and S15: the final counter is allocated, the next is exhaustion; an oversize payload is refused", () => {
-    const base = { streamId: alicePin.streamId, epoch: 3, kind: 0 as const, payload: new Uint8Array(1), sentAt: now, epochKey, signingSecretKey: dsk };
+    const base = { streamId: alicePin.streamId, epoch: 3, kind: 0, headerClass: 0 as const, payload: new Uint8Array(1), sentAt: now, epochKey, signingSecretKey: dsk };
     expect(sealRecord({ ...base, nextCounter: MAX_COUNTER }).counter).toBe(MAX_COUNTER);
     expect(code(() => sealRecord({ ...base, nextCounter: MAX_COUNTER + 1 }))).toBe("COUNTER_EXHAUSTED");
     expect(code(() => sealRecord({ ...base, nextCounter: 0, payload: new Uint8Array(4097) }))).toBe("SIZE_LIMIT");
-    expect(sealRecord({ ...base, nextCounter: 0, payload: new Uint8Array(0) }).wire.length).toBe(159);
+    expect(sealRecord({ ...base, nextCounter: 0, payload: new Uint8Array(0) }).wire.length).toBe(169); // 159 without the 10-byte envelope
   });
 });
 
 describe("opening", () => {
   it("opens the fixture record and the check-in, with ids and kinds", () => {
     const r = openRecordWire(hex(fixture.documents["record"]?.wire ?? ""), view(alicePin), keyFor(epochKey));
-    expect(toHex(r.plaintext)).toBe(fixture.record.plaintext);
-    expect(toHex(r.recordId)).toBe(fixture.record.record_id);
-    expect(r.superseded).toBe(false);
+    expect(toHex(r.payload)).toBe((fixture.record as { payload: string }).payload);
+    expect([r.kind, r.eventTime, toHex(r.recordId), r.superseded]).toEqual([0, now - 123n, fixture.record.record_id, false]);
     const c = openRecordWire(hex(fx.durable_events.checkin_wire), view(alicePin), keyFor(epochKey));
-    expect(c.record.kind).toBe(1);
-    expect(c.record.counter).toBe(1);
+    expect([c.kind, c.eventTime, c.record.headerClass, c.record.counter]).toEqual([1, undefined, 1, 1]);
   });
 
   it("negative vectors through the opening path", () => {
@@ -110,8 +108,8 @@ describe("opening", () => {
 describe("location helpers", () => {
   it("converts degrees and metres to the codec and back", () => {
     const l = locationFromDegrees(37.7749, -122.4194, 5, now - 123n);
-    expect(toHex(require_encode(l))).toBe(fixture.record.plaintext);
-    const back = locationToDegrees(decodeLocation(hex(fixture.record.plaintext)));
+    expect(toHex(require_encode(l))).toBe((fixture.record as { payload: string }).payload);
+    const back = locationToDegrees(decodeLocation(hex((fixture.record as { payload: string }).payload)));
     expect(back.latitude).toBeCloseTo(37.7749, 7);
     expect(back.longitude).toBeCloseTo(-122.4194, 7);
     expect(back.accuracyMetres).toBe(5);

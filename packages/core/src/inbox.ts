@@ -11,7 +11,7 @@ import { authorPrefix, indexHistory, padTime, timelinePrefix, unindexHistory } f
 import { historyKinds, kindOf, type RetentionPolicy } from "./policy.js";
 import { openRecordWire } from "./record.js";
 import { big, unbig } from "./rows.js";
-import { eventTimeOf, slotKey, takeSlot } from "./slots.js";
+import { clampEventTime, slotKey, takeSlot } from "./slots.js";
 import type { HistoryRow, KeyRange, Store, SubscriptionRow, Tx } from "./store.js";
 import type { ReadRecordsResult, Relay } from "./transport.js";
 
@@ -119,22 +119,23 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   const hash = toHex(bodyHash(opened.record.body));
   const cert = [...author.view.certificates.values()].find((c) => equalBytes(c.streamId, parsed.streamId));
   const generation = unbig(tx.list("certificates").find(([, c]) => c.streamId === toHex(parsed.streamId))?.[1].generation ?? "0");
-  const base = { recordId: opened.recordId, authorIdentityId: author.identityId, kind: parsed.kind };
-  const declared = kindOf(deps.policy, parsed.kind);
+  const kind = opened.kind;
+  const base = { recordId: opened.recordId, authorIdentityId: author.identityId, kind };
+  const declared = kindOf(deps.policy, kind);
   if (!declared) return { result: "invalid", reason: "BAD_PAYLOAD" }; // a kind this product did not declare
   const authorHex = toHex(author.identityId);
   const fromCurrentDevice = !opened.superseded && !!cert?.current;
-  const candidate = { generation, eventTime: eventTimeOf(opened.plaintext, parsed.sentAt), epoch: parsed.epoch, counter: parsed.counter, recordId: id, bodyHash: hash, sentAt: parsed.sentAt, receivedAt: now, payload: opened.plaintext };
+  const candidate = { generation, eventTime: clampEventTime(opened.eventTime, parsed.sentAt), epoch: parsed.epoch, counter: parsed.counter, recordId: id, bodyHash: hash, sentAt: parsed.sentAt, receivedAt: now, payload: opened.payload };
   if (!declared.history) {
     // A slot-only kind is the author's current state, not an event: one row per author, the newest
     // from the current device wins. An older or superseded one changes nothing.
-    const current = tx.get("newest", slotKey(authorHex, parsed.kind));
+    const current = tx.get("newest", slotKey(authorHex, kind));
     if (current?.recordId === id) {
       if (current.bodyHash === hash) return { result: "duplicate", recordId: opened.recordId };
       return { result: "invalid", reason: "EQUIVOCATION" };
     }
     if (!fromCurrentDevice) return { result: "history", ...base };
-    return takeSlot(tx, authorHex, parsed.kind, candidate, toHex) ? { result: "updated", ...base } : { result: "history", ...base };
+    return takeSlot(tx, authorHex, kind, candidate, toHex) ? { result: "updated", ...base } : { result: "history", ...base };
   }
   const existing = tx.get("history", id);
   if (existing) {
@@ -148,18 +149,19 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
     generation: big(generation),
     epoch: parsed.epoch,
     counter: parsed.counter,
-    kind: parsed.kind,
+    kind,
     sentAt: big(parsed.sentAt),
     receivedAt: big(now),
-    plaintext: toHex(opened.plaintext),
+    plaintext: toHex(opened.payload),
     superseded: opened.superseded || !cert?.current,
     own: false,
-    bodyHash: hash
+    bodyHash: hash,
+    ...(opened.eventTime === undefined ? {} : { eventTime: big(opened.eventTime) })
   };
   tx.put("history", id, row);
   indexHistory(tx, row);
   // A kind with a slot is news when it takes the slot; a kind without one is news every time.
-  const took = declared.newest && fromCurrentDevice ? takeSlot(tx, authorHex, parsed.kind, candidate, toHex) : false;
+  const took = declared.newest && fromCurrentDevice ? takeSlot(tx, authorHex, kind, candidate, toHex) : false;
   return took || !declared.newest ? { result: "updated", ...base } : { result: "history", ...base };
 }
 
@@ -338,6 +340,8 @@ export interface HistoryEntry {
   readonly recordId: Uint8Array;
   readonly authorIdentityId: Uint8Array;
   readonly kind: RecordKind;
+  /** The sender's event time for the record, when it gave one. */
+  readonly eventTime: bigint | undefined;
   readonly sentAt: bigint;
   readonly receivedAt: bigint;
   readonly plaintext: Uint8Array;
@@ -376,6 +380,7 @@ function toEntry(r: HistoryRow): HistoryEntry {
     recordId: fromHex(r.recordId),
     authorIdentityId: fromHex(r.authorIdentityId),
     kind: r.kind,
+    eventTime: r.eventTime === undefined ? undefined : unbig(r.eventTime),
     sentAt: unbig(r.sentAt),
     receivedAt: unbig(r.receivedAt),
     plaintext: fromHex(r.plaintext),
@@ -484,7 +489,7 @@ export async function ensureSlots(store: Store, policy: RetentionPolicy): Promis
     for (const [, r] of tx.list("history")) {
       if (r.superseded || !kindOf(policy, r.kind)?.newest) continue;
       const payload = fromHex(r.plaintext);
-      takeSlot(tx, r.authorIdentityId, r.kind, { generation: unbig(r.generation), eventTime: eventTimeOf(payload, unbig(r.sentAt)), epoch: r.epoch, counter: r.counter, recordId: r.recordId, bodyHash: r.bodyHash ?? "", sentAt: unbig(r.sentAt), receivedAt: unbig(r.receivedAt), payload }, toHex);
+      takeSlot(tx, r.authorIdentityId, r.kind, { generation: unbig(r.generation), eventTime: clampEventTime(r.eventTime === undefined ? undefined : unbig(r.eventTime), unbig(r.sentAt)), epoch: r.epoch, counter: r.counter, recordId: r.recordId, bodyHash: r.bodyHash ?? "", sentAt: unbig(r.sentAt), receivedAt: unbig(r.receivedAt), payload }, toHex);
     }
     tx.put("meta", "meta", { ...meta, newest: 1 });
     return true;

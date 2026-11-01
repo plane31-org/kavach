@@ -5,7 +5,8 @@
 import { equalBytes, toHex } from "./bytes.js";
 import {
   DocumentType,
-  buildEncryptedRecord,
+  buildRecordWire,
+  decodeEnvelope,
   decodeLocation,
   encodeLocation,
   expectType,
@@ -13,6 +14,7 @@ import {
   parseDocument,
   verifyDocument,
   type EncryptedRecord,
+  type HeaderClass,
   type Location,
   type LocationStatus,
   type Parsed,
@@ -36,6 +38,10 @@ export function sealRecord(input: {
   readonly epoch: number;
   readonly nextCounter: number;
   readonly kind: RecordKind;
+  /** The product's event time for the record, carried in the envelope; absent when the kind has none. */
+  readonly eventTime?: bigint | undefined;
+  /** The declared header class of the kind, the one thing the relay sees of it. */
+  readonly headerClass: HeaderClass;
   readonly payload: Uint8Array;
   readonly sentAt: bigint;
   readonly epochKey: Uint8Array;
@@ -44,8 +50,8 @@ export function sealRecord(input: {
 }): SealedRecord {
   if (input.nextCounter > MAX_COUNTER) throw new KavachError("COUNTER_EXHAUSTED", "sealRecord");
   const nonce = input.nonce ?? randomBytes(NONCE_BYTES);
-  const wire = buildEncryptedRecord(
-    { streamId: input.streamId, epoch: input.epoch, counter: input.nextCounter, sentAt: input.sentAt, kind: input.kind },
+  const wire = buildRecordWire(
+    { streamId: input.streamId, epoch: input.epoch, counter: input.nextCounter, sentAt: input.sentAt, headerClass: input.headerClass, kind: input.kind, eventTime: input.eventTime },
     input.payload,
     input.epochKey,
     nonce,
@@ -57,7 +63,10 @@ export function sealRecord(input: {
 export interface OpenedRecord {
   readonly record: Parsed<EncryptedRecord>;
   readonly recordId: Uint8Array;
-  readonly plaintext: Uint8Array;
+  /** From the envelope: the kind, the event time if the sender gave one, and the payload. */
+  readonly kind: RecordKind;
+  readonly eventTime: bigint | undefined;
+  readonly payload: Uint8Array;
   /** The record comes from a device of the author that is no longer current: history only. */
   readonly superseded: boolean;
 }
@@ -79,8 +88,8 @@ export function openRecordWire(
   const record = expectType<EncryptedRecord>(verifyDocument(wire, cert.signingKey), DocumentType.EncryptedRecord, stage);
   const key = epochKeyFor(record.streamId, record.epoch);
   if (!key) throw new KavachError("KEY_PENDING", stage, `no key for epoch ${record.epoch}`);
-  const plaintext = openRecordBody(record, key);
-  return { record, recordId: recordId(record.streamId, record.epoch, record.counter), plaintext, superseded: !cert.current };
+  const envelope = decodeEnvelope(openRecordBody(record, key));
+  return { record, recordId: recordId(record.streamId, record.epoch, record.counter), kind: envelope.kind, eventTime: envelope.eventTime, payload: envelope.payload, superseded: !cert.current };
 }
 
 /** (generation, epoch, counter) ordering for the live pin. */

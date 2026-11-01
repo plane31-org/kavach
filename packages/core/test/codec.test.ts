@@ -2,7 +2,6 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { compareBytes, concat, fromHex, toHex } from "../src/bytes.js";
 import {
   DocumentType,
-  FLAG_KIND,
   buildAccountDevice,
   buildCircleSnapshot,
   buildEncryptedRecord,
@@ -24,7 +23,7 @@ import {
   type EncryptedRecord,
   type EpochManifest,
   type ResetKeyList,
-  type AccountResetReceipt, encodeRecordHeader } from "../src/codec.js";
+  type AccountResetReceipt, decodeEnvelope, encodeRecordHeader, type HeaderClass } from "../src/codec.js";
 import { accountKeypair, deviceSigningKeypair, identityId, ready, signingKeypairFromSeed, wrapHash, keyCommitment, type SigningKeypair } from "../src/crypto.js";
 import { KavachError } from "../src/errors.js";
 import { fixture, hex, str } from "./fixture.js";
@@ -47,7 +46,8 @@ interface Extra {
   account_reset: { authority_seed: string; authority_public: string; authority_key_id: string; new_account_certificate: string; receipt_wire: string };
   recovery_vault: { recovery_code: string; empty_vault: string; sharing_disabled_vault: string; recovery_key: string; nonce: string; plaintext: string; aad: string; wire: string };
   durable_events: { checkin_wire: string; following_location_wire: string };
-  record: { decoded: { latitude_e7: number; longitude_e7: number; accuracy_mm: number; captured_at_ms: number; status: number } };
+  record: { payload: string; kind: number; event_time_ms: number; header_class: number; decoded: { latitude_e7: number; longitude_e7: number; accuracy_mm: number; captured_at_ms: number; status: number } };
+  status_record: { wire: string; record_id: string; epoch_key: string; payload: string; plaintext: string; expected: { kind: number; header_class: number; flags: number; epoch: number; counter: number; event_time_ms: number | null } };
   boundary_100: { epoch_key: string; snapshot_wire: string; manifest_wire: string; wraps: Record<string, string>; maximum_record_wire: string; accounts: string[] };
   phone_replacement: { device_rejections: { wire: string; expected: string }[]; new_certificate: string; next_owner_snapshot: string; new_manifest: string; new_record: string };
 }
@@ -139,36 +139,47 @@ describe("Vectors B to E rebuild byte for byte", () => {
     expect(doc.counter).toBe(0);
     expect(doc.sentAt).toBe(now);
     expect(doc.flags).toBe(0);
-    expect(doc.kind).toBe(0);
+    expect(doc.headerClass).toBe(0);
     expect(doc.header.length).toBe(51);
     expect(toHex(concat(hex("5365616c656453747265616d2f352f7265636f72642d61616400"), doc.header))).toBe(fixture.record.aad);
     expect(toHex(doc.ciphertext)).toBe(fixture.record.ciphertext_and_tag);
     const plaintext = openRecord(doc, epochKey);
     expect(toHex(plaintext)).toBe(fixture.record.plaintext);
+    // The envelope: version 1, the kind, the event time (the fix time), then the payload.
+    const envelope = decodeEnvelope(plaintext);
+    expect([envelope.kind, envelope.eventTime, toHex(envelope.payload)]).toEqual([fx.record.kind, BigInt(fx.record.event_time_ms), fx.record.payload]);
     const rebuilt = buildEncryptedRecord(doc, plaintext, epochKey, hex(str(fixture.inputs["record_nonce"] ?? "")), aliceDsk.secretKey);
     expect(toHex(rebuilt)).toBe(toHex(wire));
-    expect(wire.length).toBe(159 + 22);
+    expect(wire.length).toBe(159 + 10 + 22);
     expect(() => openRecord(doc, new Uint8Array(32))).toThrow(expect.objectContaining({ code: "DECRYPT_FAILED" }));
   });
 });
 
-describe("status records (revision 6)", () => {
-  it("S: the status vector parses as kind 2, decrypts to the profile payload and rebuilds byte for byte", () => {
-    const v = fixture.status_record;
+describe("slot-only records and header classes (revisions 6 and 8)", () => {
+  it("S: the status vector shows header class 2, opens to kind 2 with no event time and the profile payload, and rebuilds byte for byte", () => {
+    const v = fx.status_record;
     const wire = hex(v.wire);
     const doc = expectType<EncryptedRecord>(verifyDocument(wire, aliceDsk.publicKey), DocumentType.EncryptedRecord);
-    expect([doc.kind, doc.flags, doc.epoch, doc.counter]).toEqual([v.expected.kind, v.expected.flags, v.expected.epoch, v.expected.counter]);
-    expect(toHex(openRecord(doc, hex(v.epoch_key)))).toBe(v.payload);
-    const rebuilt = buildEncryptedRecord(doc, hex(v.payload), hex(v.epoch_key), doc.nonce, aliceDsk.secretKey);
+    expect([doc.headerClass, doc.flags, doc.epoch, doc.counter]).toEqual([v.expected.header_class, v.expected.flags, v.expected.epoch, v.expected.counter]);
+    const plaintext = openRecord(doc, hex(v.epoch_key));
+    expect(toHex(plaintext)).toBe(v.plaintext);
+    const envelope = decodeEnvelope(plaintext);
+    expect([envelope.kind, envelope.eventTime, toHex(envelope.payload)]).toEqual([v.expected.kind, undefined, v.payload]);
+    const rebuilt = buildEncryptedRecord(doc, plaintext, hex(v.epoch_key), doc.nonce, aliceDsk.secretKey);
     expect(toHex(rebuilt)).toBe(v.wire);
   });
 
-  it("a header carries exactly one kind: 0, 1 or 2, and the two kind bits together are malformed", () => {
+  it("the header carries a class of 0 to 3 in bits 1 and 2, nothing else, and the kind only inside the envelope", () => {
     const base = { streamId: hex(alice.stream_id), epoch: 1, counter: 0, sentAt: now };
-    expect([0, 1, 2].map((kind) => encodeRecordHeader({ ...base, kind: kind as 0 | 1 | 2 })[50])).toEqual([0, 2, 4]);
-    const both = hex(fixture.status_record.wire);
+    expect([0, 1, 2, 3].map((c) => encodeRecordHeader({ ...base, headerClass: c as HeaderClass })[50])).toEqual([0, 2, 4, 6]);
+    const both = hex(fx.status_record.wire);
     both[50] = 6;
+    expect(code(() => parseDocument(both))).toBe("ACCEPTED"); // class 3 is a legal declaration since revision 8
+    both[50] = 8;
     expect(code(() => parseDocument(both))).toBe("MALFORMED");
+    expect(code(() => decodeEnvelope(new Uint8Array(9)))).toBe("MALFORMED");
+    expect(code(() => decodeEnvelope(concat(fromHex("02"), new Uint8Array(9))))).toBe("MALFORMED");
+    expect(decodeEnvelope(concat(fromHex("01ff"), new Uint8Array(8))).kind).toBe(255);
   });
 });
 
@@ -181,6 +192,8 @@ describe("all 22 negative vectors", () => {
       if (n.operation === "verify") actual = code(() => verifyDocument(wire, key));
       else if (n.operation === "decrypt") {
         actual = code(() => openRecord(expectType<EncryptedRecord>(verifyDocument(wire, key), DocumentType.EncryptedRecord), epochKey));
+      } else if (n.operation === "open") {
+        actual = code(() => decodeEnvelope(openRecord(expectType<EncryptedRecord>(verifyDocument(wire, key), DocumentType.EncryptedRecord), epochKey)));
       } else if (n.operation === "payload") actual = code(() => decodeLocation(wire));
       else throw new Error(n.operation);
       expect(actual).toBe(n.expected);
@@ -217,12 +230,11 @@ describe("100-account boundary", () => {
       expect(row && toHex(row.wrapHash)).toBe(toHex(wrapHash(hex(w))));
     }
     const max = hex(fx.boundary_100.maximum_record_wire);
-    expect(max.length).toBe(4255);
+    expect(max.length).toBe(4265);
     const r = expectType<EncryptedRecord>(verifyDocument(max, aliceDsk.publicKey), DocumentType.EncryptedRecord);
-    expect(r.kind).toBe(1);
-    expect(r.flags).toBe(FLAG_KIND);
-    expect(r.counter).toBe(0xffffffff);
-    expect(openRecord(r, hex(fx.boundary_100.epoch_key)).length).toBe(4096);
+    expect([r.headerClass, r.flags, r.counter]).toEqual([1, 2, 0xffffffff]);
+    const opened = decodeEnvelope(openRecord(r, hex(fx.boundary_100.epoch_key)));
+    expect([opened.kind, opened.payload.length]).toEqual([1, 4096]);
     // Every one of the 100 certificates is self-contained and verifies under the key it carries.
     for (const a of fx.boundary_100.accounts) verifyDocument(hex(a));
     // The audience rows are in strict identity order.
@@ -307,27 +319,28 @@ describe("durable events", () => {
   it("a check-in is kind 1 and a later location is kind 0, on one counter", () => {
     const c = expectType<EncryptedRecord>(verifyDocument(hex(fx.durable_events.checkin_wire), aliceDsk.publicKey), DocumentType.EncryptedRecord);
     const l = expectType<EncryptedRecord>(verifyDocument(hex(fx.durable_events.following_location_wire), aliceDsk.publicKey), DocumentType.EncryptedRecord);
-    expect([c.kind, c.counter, l.kind, l.counter]).toEqual([1, 1, 0, 2]);
+    expect([c.headerClass, c.counter, l.headerClass, l.counter]).toEqual([1, 1, 0, 2]);
+    expect([decodeEnvelope(openRecord(c, epochKey)).kind, decodeEnvelope(openRecord(l, epochKey)).kind]).toEqual([1, 0]);
   });
 });
 
 describe("location codec", () => {
   it("decodes the fixture plaintext and round-trips", () => {
-    const l = decodeLocation(hex(fixture.record.plaintext));
+    const l = decodeLocation(hex(fx.record.payload));
     const d = fx.record.decoded;
     expect(l).toEqual({ latitudeE7: d.latitude_e7, longitudeE7: d.longitude_e7, accuracyMm: d.accuracy_mm, capturedAt: BigInt(d.captured_at_ms), status: d.status });
-    expect(toHex(encodeLocation(l))).toBe(fixture.record.plaintext);
+    expect(toHex(encodeLocation(l))).toBe(fx.record.payload);
     expect(encodeLocation({ latitudeE7: 0, longitudeE7: 0, accuracyMm: 0, capturedAt: 0n, status: 2 }).length).toBe(22);
   });
 
   it("rejects out-of-range and inconsistent values", () => {
-    const base = decodeLocation(hex(fixture.record.plaintext));
+    const base = decodeLocation(hex(fx.record.payload));
     expect(code(() => encodeLocation({ ...base, latitudeE7: 900_000_001 }))).toBe("BAD_PAYLOAD");
     expect(code(() => encodeLocation({ ...base, longitudeE7: -1_800_000_001 }))).toBe("BAD_PAYLOAD");
     expect(code(() => encodeLocation({ ...base, accuracyMm: 100_000_001 }))).toBe("BAD_PAYLOAD");
     expect(code(() => encodeLocation({ ...base, status: 2 }))).toBe("BAD_PAYLOAD");
-    expect(code(() => decodeLocation(concat(fromHex("02"), hex(fixture.record.plaintext).subarray(1))))).toBe("BAD_PAYLOAD");
-    expect(code(() => decodeLocation(hex(fixture.record.plaintext).subarray(0, 21)))).toBe("BAD_PAYLOAD");
+    expect(code(() => decodeLocation(concat(fromHex("02"), hex(fx.record.payload).subarray(1))))).toBe("BAD_PAYLOAD");
+    expect(code(() => decodeLocation(hex(fx.record.payload).subarray(0, 21)))).toBe("BAD_PAYLOAD");
   });
 });
 

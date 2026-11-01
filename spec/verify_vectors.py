@@ -78,10 +78,10 @@ def parse(wire):
         if ids!=sorted(set(ids)) or d['author'] not in ids: raise Bad('MALFORMED')
     elif t==4:
         d.update(stream=r.take(32),epoch=r.n(4),counter=r.n(4),sent=r.n(8),flags=r.n(1))
-        if d['epoch']==0 or d['flags']&~6 or d['flags']&6==6: raise Bad('MALFORMED')
-        d['kind']=2 if d['flags']&4 else 1 if d['flags']&2 else 0
+        if d['epoch']==0 or d['flags']&~6: raise Bad('MALFORMED')
+        d['header_class']=(d['flags']>>1)&3  # revision 8: the kind is inside the envelope; the header shows only the declared class
         d['header']=wire[:r.i]; d['nonce']=r.take(24); n=r.n(4)
-        if not 16<=n<=4112: raise Bad('SIZE_LIMIT')
+        if not 26<=n<=4122: raise Bad('SIZE_LIMIT')
         d['ciphertext']=r.take(n)
     elif t==7:
         name=r.take(r.n(1))
@@ -184,13 +184,23 @@ def manifest(author,epoch,created,key,wraps,recipients):
     body=b'\x05\x03'+stream+author['iid']+doc_hash(author['wire'][:-64])+U32(epoch)+U64(created)+commit+U16(len(wraps))+rows
     return sign(author['d'],'epoch-sig',body)
 
-def record(author,epoch,counter,sent,flags,nonce,key,payload):
+def envelope(kind,event,payload):
+    """Revision 8: u8(1) || u8(kind) || u64(eventTime or 0) || payload, the plaintext under the AEAD."""
     if len(payload)>4096: raise Bad('SIZE_LIMIT')
-    header=b'\x05\x04'+stream_id(author['iid'],author['device_id'])+U32(epoch)+U32(counter)+U64(sent)+U8(flags)
+    return U8(1)+U8(kind)+U64(event or 0)+payload
+
+def open_envelope(plaintext):
+    if len(plaintext)<10 or plaintext[0]!=1: raise Bad('MALFORMED')
+    kind=plaintext[1]; event=int.from_bytes(plaintext[2:10],'big')
+    return kind,(event or None),plaintext[10:]
+
+def record(author,epoch,counter,sent,header_class,nonce,key,payload,kind=0,event=None,plaintext=None):
+    plaintext=envelope(kind,event,payload) if plaintext is None else plaintext
+    header=b'\x05\x04'+stream_id(author['iid'],author['device_id'])+U32(epoch)+U32(counter)+U64(sent)+U8(header_class<<1)
     aad=C('record-aad')+header
-    ct=sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(payload,aad,nonce,key)
+    ct=sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(plaintext,aad,nonce,key)
     independent=ChaCha20_Poly1305.new(key=key,nonce=nonce); independent.update(aad)
-    ct2,tag2=independent.encrypt_and_digest(payload)
+    ct2,tag2=independent.encrypt_and_digest(plaintext)
     assert ct==ct2+tag2
     body=header+nonce+U32(len(ct))+ct
     wire=sign(author['d'],'record-sig',body)
@@ -352,7 +362,8 @@ def build():
     mf=manifest(alice,1,now,key,wraps,{p['iid']:p for p in identities})
     for recipient in identities: assert open_epoch(mf,alice,recipient,wraps[recipient['iid']])==key
     payload=location(377749000,-1224194000,5000,now-123,0)
-    rec,aad,rid=record(alice,1,0,now,0,bytes(range(24)),key,payload)
+    rec,aad,rid=record(alice,1,0,now,0,bytes(range(24)),key,payload,kind=0,event=now-123)  # the event time is the fix time
+    plaintext=envelope(0,now-123,payload)
     retired=retired_intent_wire(bob,alice,circle,bytes(range(16,32)),now-1000,now+3600000)
     docs=[('alice_account',alice['wire'],alice['a']),('bob_account',bob['wire'],bob['a']),('snapshot',ss,alice['a']),('manifest',mf,alice['d']),('record',rec,alice['d'])]
     for name,wire,sk in docs:
@@ -365,15 +376,16 @@ def build():
         assert X25519PrivateKey.from_private_bytes(who['esk']).public_key().public_bytes(Encoding.Raw,PublicFormat.Raw)==who['epk']
     rp=verify(rec,bytes(alice['d'].verify_key))
     opened=sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(rp['ciphertext'],aad,rp['nonce'],key)
-    assert opened==payload; assert parse_location(payload)==(377749000,-1224194000,5000,now-123,0)
+    assert opened==plaintext and open_envelope(opened)==(0,now-123,payload); assert parse_location(payload)==(377749000,-1224194000,5000,now-123,0)
     negatives=[]
     def negative(name,wire,pk,expected,action='verify'):
         try:
             if action=='verify': verify(wire,pk)
-            elif action=='decrypt':
+            elif action in('decrypt','open'):
                 p=verify(wire,pk)
-                try: sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(p['ciphertext'],C('record-aad')+p['header'],p['nonce'],key)
+                try: pt=sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(p['ciphertext'],C('record-aad')+p['header'],p['nonce'],key)
                 except CryptoError: raise Bad('DECRYPT_FAILED')
+                if action=='open': open_envelope(pt)
             elif action=='payload': parse_location(wire)
             raise AssertionError(name+' unexpectedly accepted')
         except Bad as exc: assert str(exc)==expected,(name,str(exc),expected)
@@ -386,7 +398,7 @@ def build():
     negative('N05_reserved_flag',rec[:50]+b'\x08'+rec[51:],pk,'MALFORMED')  # bit 3: bit 2 is the status kind since revision 6
     negative('N06_changed_ciphertext',rec[:79]+bytes([rec[79]^1])+rec[80:],pk,'BAD_SIGNATURE')
     negative('N07_wrong_signer',rec,bytes(bob['d'].verify_key),'BAD_SIGNATURE')
-    negative('N08_excessive_length',rec[:75]+U32(4113)+rec[79:],pk,'SIZE_LIMIT')
+    negative('N08_excessive_length',rec[:75]+U32(4123)+rec[79:],pk,'SIZE_LIMIT')
     negative('N09_epoch_zero',rec[:34]+U32(0)+rec[38:],pk,'MALFORMED')
     negative('N10_duplicate_member',snapshot(alice,circle,2,[alice['iid'],alice['iid']]),bytes(alice['a'].verify_key),'MALFORMED')
     negative('N11_missing_owner',snapshot(alice,circle,2,[bob['iid']]),bytes(alice['a'].verify_key),'MALFORMED')
@@ -407,7 +419,9 @@ def build():
     negative('N19_header_aad_binding',sign(alice['d'],'record-sig',bytes(altered)),pk,'DECRYPT_FAILED','decrypt')
     negative('N20_retired_type5',retired,bytes(bob['a'].verify_key),'UNSUPPORTED_TYPE')
     negative('N21_reserved_bit0',rec[:50]+b'\x01'+rec[51:],pk,'MALFORMED')
-    negative('N22_two_kind_bits',rec[:50]+b'\x06'+rec[51:],pk,'MALFORMED')
+    # Revision 8: both header bits are class 3, which is legal; the envelope version is checked after decryption.
+    bad_envelope,_,_=record(alice,1,0,now,0,bytes(range(24)),key,payload,plaintext=b'\x02'+plaintext[1:])
+    negative('N22_envelope_version',bad_envelope,pk,'MALFORMED','open')
     kchecks=[]
     def reject_box(name,box,recipient,expected):
         try: sodium.crypto_box_seal_open(box,recipient['epk'],recipient['esk']); raise AssertionError(name)
@@ -425,7 +439,7 @@ def build():
       'identities':[dict(account=p['name'],account_public=bytes(p['a'].verify_key).hex(),device_sign_seed=D(bytes(range(32,64)) if p['name']=='alice' else bytes(range(96,128)),'device-sign').hex(),device_sign_public=bytes(p['d'].verify_key).hex(),device_box_seed=D(bytes(range(32,64)) if p['name']=='alice' else bytes(range(96,128)),'device-box').hex(),device_box_public=p['epk'].hex(),device_box_secret=p['esk'].hex(),identity_id=p['iid'].hex(),device_id=p['device_id'].hex(),generation=p['generation'],certificate_hash=doc_hash(p['wire'][:-64]).hex(),stream_id=stream_id(p['iid'],p['device_id']).hex()) for p in identities],
       'documents':{name:dict(wire=wire.hex(),body_hash=doc_hash(wire[:-64]).hex(),signature=wire[-64:].hex(),verification_key=bytes(sk.verify_key).hex()) for name,wire,sk in docs},
       'wraps':wrap_detail,
-      'record':dict(plaintext=payload.hex(),aad=aad.hex(),ciphertext_and_tag=rp['ciphertext'].hex(),record_id=rid.hex(),decoded=dict(latitude_e7=377749000,longitude_e7=-1224194000,accuracy_mm=5000,captured_at_ms=now-123,status=0)),
+      'record':dict(plaintext=plaintext.hex(),envelope='u8(1) || u8(kind) || u64(eventTime or 0) || payload',kind=0,event_time_ms=now-123,header_class=0,payload=payload.hex(),aad=aad.hex(),ciphertext_and_tag=rp['ciphertext'].hex(),record_id=rid.hex(),decoded=dict(latitude_e7=377749000,longitude_e7=-1224194000,accuracy_mm=5000,captured_at_ms=now-123,status=0)),
       'negative_vectors':negatives,'wrap_checks':kchecks,'state_vectors':run_state_tests(),
       'cross_checks':['Ed25519: libsodium signatures exactly equal OpenSSL cryptography signatures for all 5 documents','XChaCha20-Poly1305: libsodium ciphertext/tag exactly equal PyCryptodome','X25519: libsodium public keys exactly equal OpenSSL cryptography public keys','Sealed-box construction: libsodium crypto_box output accepted by libsodium crypto_box_seal_open (same backend, not independent)']}
     # Boundary audience: Alice plus 99 deterministic identities, including a wrap to self.
@@ -441,23 +455,23 @@ def build():
     verify(gs,bytes(alice['a'].verify_key)); verify_manifest_current(gm,alice)
     for recipient in group: assert open_epoch(gm,alice,recipient,group_wraps[recipient['iid']])==group_key
     # Max-size plaintext is an additional independent AEAD comparison.
-    max_record,_,_=record(alice,2,0xffffffff,now,2,bytes(range(24,48)),group_key,bytes(4096))  # kind 1 (check-in) with an opaque 4096-byte payload; bit 0 is reserved
-    assert len(max_record)==4255
+    max_record,_,_=record(alice,2,0xffffffff,now,1,bytes(range(24,48)),group_key,bytes(4096),kind=1)  # kind 1 with header class 1 and an opaque 4096-byte payload; bit 0 is reserved
+    assert len(max_record)==4265
     verify(max_record,pk)
-    # Revision 6: a status (kind 2, flag bit 2) with the profile's 4-byte payload; it parses as kind 2 and never pins.
+    # A slot-only kind (2, header class 2) with the first profile's 4-byte payload and no event time.
     status_payload=bytes([1,73,0b1001,3])
-    status_record,_,status_rid=record(alice,2,7,now,4,bytes(range(48,72)),group_key,status_payload)
-    assert parse(status_record)['kind']==2
+    status_record,_,status_rid=record(alice,2,7,now,2,bytes(range(48,72)),group_key,status_payload,kind=2)
+    assert parse(status_record)['header_class']==2
     verify(status_record,pk)
-    vectors['status_record']={'wire':status_record.hex(),'record_id':status_rid.hex(),'epoch_key':group_key.hex(),'payload':status_payload.hex(),
-        'expected':{'kind':2,'flags':4,'epoch':2,'counter':7,'pins':False,'notifies':False}}
+    vectors['status_record']={'wire':status_record.hex(),'record_id':status_rid.hex(),'epoch_key':group_key.hex(),'payload':status_payload.hex(),'plaintext':envelope(2,None,status_payload).hex(),
+        'expected':{'kind':2,'header_class':2,'flags':4,'epoch':2,'counter':7,'event_time_ms':None,'pins':False,'notifies':False}}
     vectors['boundary_100']={
         'seed_rule':'For i=1..99: accountSeed=H(C("fixture-account")||u32(i)); deviceSeed=H(C("fixture-device")||u32(i)); ephemeral seed for all i=0..99: H(C("fixture-ephemeral")||u32(i)). i=0 is Alice. DeviceId=H(C("fixture-device-id")||deviceSeed)[:16]. TEST ONLY.',
         'epoch_key':group_key.hex(),'accounts':[x['wire'].hex() for x in group],
         'snapshot_wire':gs.hex(),'manifest_wire':gm.hex(),
         'wraps':{k.hex():v.hex() for k,v in sorted(group_wraps.items())},
         'expected':{'members':100,'audience':100,'snapshot_bytes':3324,'manifest_bytes':9808,'wrap_bytes':8000},
-        'maximum_record_wire':max_record.hex(),'maximum_record_bytes':4255}
+        'maximum_record_wire':max_record.hex(),'maximum_record_bytes':4265}
     skey=bytes(range(128,160)); snonce=bytes(range(24,48)); dbid=bytes(range(240,256))
     stored_plain=b'{"schema":1,"identityId":"'+alice['iid'].hex().encode()+b'","currentCertificateHash":"'+doc_hash(alice['wire'][:-64]).hex().encode()+b'"}'
     saad=C('storage-aad')+ID('meta')+U32(6)+b'header'+U32(1)+dbid
@@ -514,15 +528,16 @@ def build():
     assert open_vault(disabled,rk,'alice',bytes(alice['a'].verify_key))[3][0][2]==0
     assert len(vault_wire)==43+5+24+4+90+49 and len(empty)==43+5+24+4+90
     vectors['recovery_vault']={'recovery_code':rcode,'empty_vault':empty.hex(),'sharing_disabled_vault':disabled.hex(),'recovery_key':rk.hex(),'nonce':vn.hex(),'plaintext':vplain.hex(),'aad':vaad.hex(),'wire':vault_wire.hex(),'entry_bytes':49,'checks':['account seed recovered','Circle pin and sharing preference recovered','admitted or waiting is read from the current snapshot, not the vault','wrong recovery code rejected']}
-    checkin,_,_=record(alice,1,1,now+1,2,bytes(range(144,168)),key,payload)
-    next_location,_,_=record(alice,1,2,now+2,0,bytes(range(168,192)),key,payload)
+    checkin,_,_=record(alice,1,1,now+1,1,bytes(range(144,168)),key,payload,kind=1)
+    next_location,_,_=record(alice,1,2,now+2,0,bytes(range(168,192)),key,payload,kind=0,event=now-123)
     archive={};pin=None
     for wire in [rec,checkin,next_location,checkin]:
         q=verify(wire,pk);slot=(q['stream'],q['epoch'],q['counter'])
         h=doc_hash(q['body'])
         if slot in archive:assert archive[slot]==h
         archive[slot]=h
-        if not q['flags']&6 and (pin is None or q['counter']>pin):pin=q['counter']
+        kind,_,_=open_envelope(sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(q['ciphertext'],C('record-aad')+q['header'],q['nonce'],key))
+        if kind==0 and (pin is None or q['counter']>pin):pin=q['counter']
     assert len(archive)==3 and pin==2
     authority=SigningKey(H(C('fixture-reset-authority')));authority_id=bytes(range(16))
     reset_account=identity('alice',H(C('fixture-reset-account')),H(C('fixture-reset-device')))

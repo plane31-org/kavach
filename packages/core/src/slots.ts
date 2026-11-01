@@ -6,7 +6,6 @@
  * equal event times by (epoch, counter). The slot outlives its payload: expiry drops the payload
  * and keeps the order, so an older record replayed later cannot become current.
  */
-import { decodeLocation } from "./codec.js";
 import { compareSlots } from "./record.js";
 import { big, unbig } from "./rows.js";
 import type { NewestRow, Tx } from "./store.js";
@@ -24,17 +23,9 @@ export function compareSlotOrder(a: SlotOrder, b: SlotOrder): number {
   return compareSlots(a, b);
 }
 
-/**
- * The event time of a record until revision 8 carries it in the envelope: the location codec's
- * `capturedAt` when the payload is one, never later than `sentAt`; `sentAt` otherwise.
- */
-export function eventTimeOf(plaintext: Uint8Array, sentAt: bigint): bigint {
-  try {
-    const captured = decodeLocation(plaintext).capturedAt;
-    return captured < sentAt ? captured : sentAt;
-  } catch {
-    return sentAt;
-  }
+/** The event time a slot orders by: the envelope's, never later than `sentAt`; `sentAt` when the sender gave none. */
+export function clampEventTime(eventTime: bigint | undefined, sentAt: bigint): bigint {
+  return eventTime === undefined || eventTime > sentAt ? sentAt : eventTime;
 }
 
 export function slotKey(authorIdentityId: string, kind: number): string {

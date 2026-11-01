@@ -523,6 +523,43 @@ describe("feedback findings", () => {
     expect([rd.inbox.stored, rd.inbox.invalid]).toEqual([0, 1]);
     expect(d.events.some((e) => e.kind === "securityError" && e.code === "BAD_PAYLOAD")).toBe(true);
   });
+
+  it("24: the envelope carries the kind and the event time, the slot orders by it, and the host sees only the declared header class", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    const t = w.clock.now();
+    // A byte payload with an event time: the reader orders by it and reports it; without one, it orders at sentAt.
+    const older = await a.client.enqueueCheckIn(Uint8Array.of(1), { eventTime: t - 5_000n });
+    await a.client.enqueueCheckIn(Uint8Array.of(2));
+    await w.sync(a);
+    await w.sync(b);
+    const entries = await b.client.history({ authorIdentityId: aliceId, kind: 1 });
+    expect(entries.map((h) => [toHex(h.recordId) === toHex(older.recordId), h.eventTime])).toEqual([[true, t - 5_000n], [false, undefined]]);
+    // An event time ahead of the send time is clamped: the slot never trusts it past sentAt.
+    const ahead = await a.client.enqueueLocation(locationFromDegrees(1, 2, 3, t + 999_999n));
+    await w.sync(a);
+    await w.sync(b);
+    const pin = await b.client.latest(aliceId);
+    expect([toHex(pin?.recordId ?? new Uint8Array()), pin?.eventTime]).toEqual([toHex(ahead.recordId), pin?.sentAt]);
+    // The relay notifies by header class, never by kind: the same kind 1 declared with class 0 is a plain wake-up.
+    const hidden = { ...testPolicy, kinds: testPolicy.kinds.map((k) => (k.kind === 1 ? { ...k, headerClass: 0 as const } : k)) };
+    const c = await w.device("carol", undefined, undefined, undefined, hidden);
+    await c.client.initializeAccount();
+    const { circleId } = await c.client.circles.create();
+    const carolId = (await c.client.inspect()).identityId ?? new Uint8Array();
+    await b.client.circles.requestJoin(circleId, carolId);
+    await w.sync(c);
+    await c.client.circles.approve(circleId, "bob");
+    await w.sync(c);
+    await w.sync(b);
+    await w.sync(c);
+    const before = w.host.notifications.length;
+    await a.client.enqueueCheckIn(Uint8Array.of(3));
+    await c.client.enqueueCheckIn(Uint8Array.of(4));
+    await w.sync(a);
+    await w.sync(c);
+    expect(w.host.notifications.slice(before).filter((n) => n.to === "bob").map((n) => n.kind).sort()).toEqual(["checkIn", "wake"]);
+  });
 });
 
 /** Carol: a third author who shares with Bob through a circle of her own. */

@@ -159,6 +159,8 @@ export interface HistoryRow {
   own: boolean;
   /** Body hash of the wire, for duplicate and equivocation detection. */
   bodyHash?: string;
+  /** The envelope's event time, when the sender gave one. */
+  eventTime?: string;
 }
 
 /**

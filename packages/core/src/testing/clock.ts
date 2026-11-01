@@ -13,9 +13,9 @@ export const testPolicy: RetentionPolicy = {
   maxOutboxRecords: 2000,
   maxOutboxBytes: 4 << 20,
   kinds: [
-    { kind: 0, retentionMs: 86_400_000n, queue: "keepAll", history: true, newest: true },
-    { kind: 1, retentionMs: 2_592_000_000n, queue: "keepAll", history: true, newest: false },
-    { kind: 2, retentionMs: 86_400_000n, queue: "latestWins", history: false, newest: true }
+    { kind: 0, retentionMs: 86_400_000n, queue: "keepAll", history: true, newest: true, headerClass: 0 },
+    { kind: 1, retentionMs: 2_592_000_000n, queue: "keepAll", history: true, newest: false, headerClass: 1 },
+    { kind: 2, retentionMs: 86_400_000n, queue: "latestWins", history: false, newest: true, headerClass: 2 }
   ]
 };
 

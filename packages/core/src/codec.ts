@@ -43,15 +43,20 @@ import { KavachError } from "./errors.js";
 export const MAX_MEMBERS = 100;
 export const MAX_RESET_KEYS = 8;
 export const MAX_RESET_KEY_LIST_LIFETIME_MS = 2_592_000_000n; // 30 days
-export const MIN_RECORD_CIPHERTEXT = TAG_BYTES;
-export const MAX_RECORD_CIPHERTEXT = MAX_PAYLOAD_BYTES + TAG_BYTES;
+/** The encrypted envelope in front of every payload (revision 8): version, kind, event time. */
+export const ENVELOPE_VERSION = 1;
+export const ENVELOPE_BYTES = 1 + 1 + 8;
+export const MIN_RECORD_CIPHERTEXT = ENVELOPE_BYTES + TAG_BYTES;
+export const MAX_RECORD_CIPHERTEXT = ENVELOPE_BYTES + MAX_PAYLOAD_BYTES + TAG_BYTES;
 export const MIN_VAULT_CIPHERTEXT = 90;
 export const MAX_VAULT_CIPHERTEXT = 4_990;
 export const VAULT_ENTRY_BYTES = 49;
 export const RECORD_HEADER_BYTES = 51;
-export const FLAG_KIND = 0x02;
-export const FLAG_STATUS = 0x04;
-const RESERVED_FLAGS = ~(FLAG_KIND | FLAG_STATUS) & 0xff;
+/** Header flags: bits 1 and 2 carry the record's header class (0 to 3), the one thing about a record the relay may see; bit 0 and bits 3 to 7 are reserved. */
+export const HEADER_CLASS_SHIFT = 1;
+export const HEADER_CLASS_MASK = 0x06;
+const RESERVED_FLAGS = ~HEADER_CLASS_MASK & 0xff;
+export type HeaderClass = 0 | 1 | 2 | 3;
 
 export enum DocumentType {
   AccountDevice = 1,
@@ -63,7 +68,9 @@ export enum DocumentType {
   ResetKeyList = 8
 }
 
-export type RecordKind = 0 | 1 | 2; // 0 location, 1 check-in, 2 status
+/** A record kind: an opaque small integer the product declares (section 9). It travels inside the encrypted envelope. */
+export type RecordKind = number;
+export const MAX_KIND = 255;
 
 export interface AccountDevice {
   readonly type: DocumentType.AccountDevice;
@@ -107,7 +114,8 @@ export interface EncryptedRecord {
   readonly counter: number;
   readonly sentAt: bigint;
   readonly flags: number;
-  readonly kind: RecordKind;
+  /** What the relay may see of the record's kind: the product's declared header class, or 0. */
+  readonly headerClass: HeaderClass;
   /** The 51-byte header, which the AEAD authenticates as `C("record-aad") || header`. */
   readonly header: Uint8Array;
   readonly nonce: Uint8Array;
@@ -235,7 +243,6 @@ export function parseDocument(wire: Uint8Array): Parsed {
       const flags = r.u8();
       if (epoch === 0) throw malformed(stage, "epoch zero");
       if ((flags & RESERVED_FLAGS) !== 0) throw malformed(stage, "reserved flag bit set");
-      if ((flags & FLAG_KIND) !== 0 && (flags & FLAG_STATUS) !== 0) throw malformed(stage, "check-in and status bits both set");
       const header = r.consumed();
       const nonce = r.take(NONCE_BYTES);
       const length = r.u32();
@@ -243,7 +250,7 @@ export function parseDocument(wire: Uint8Array): Parsed {
         throw new KavachError("SIZE_LIMIT", stage, "record ciphertext length");
       }
       const ciphertext = r.take(length);
-      fields = { type, streamId, epoch, counter, sentAt, flags, kind: (flags & FLAG_STATUS) !== 0 ? 2 : (flags & FLAG_KIND) !== 0 ? 1 : 0, header, nonce, ciphertext };
+      fields = { type, streamId, epoch, counter, sentAt, flags, headerClass: ((flags & HEADER_CLASS_MASK) >> HEADER_CLASS_SHIFT) as HeaderClass, header, nonce, ciphertext };
       break;
     }
     case DocumentType.AccountResetReceipt: {
@@ -370,7 +377,15 @@ export function buildEpochManifest(f: Omit<EpochManifest, "type">, deviceSigning
   return signed(encodeEpochManifestBody(f), "epoch-sig", deviceSigningSecretKey);
 }
 
-export function encodeRecordHeader(f: { streamId: Uint8Array; epoch: number; counter: number; sentAt: bigint; kind: RecordKind }): Uint8Array {
+export interface RecordHeaderFields {
+  readonly streamId: Uint8Array;
+  readonly epoch: number;
+  readonly counter: number;
+  readonly sentAt: bigint;
+  readonly headerClass: HeaderClass;
+}
+
+export function encodeRecordHeader(f: RecordHeaderFields): Uint8Array {
   if (f.epoch === 0) throw malformed("encode", "epoch zero");
   return new Writer()
     .u8(WIRE_VERSION)
@@ -379,30 +394,55 @@ export function encodeRecordHeader(f: { streamId: Uint8Array; epoch: number; cou
     .u32(f.epoch)
     .u32(f.counter)
     .u64(f.sentAt)
-    .u8(f.kind === 2 ? FLAG_STATUS : f.kind === 1 ? FLAG_KIND : 0)
+    .u8((f.headerClass << HEADER_CLASS_SHIFT) & HEADER_CLASS_MASK)
     .finish();
+}
+
+/** What the envelope carries about a record, readable only by a holder of the epoch key. */
+export interface Envelope {
+  readonly kind: RecordKind;
+  /** The event time the product supplied, if any; a reader clamps it to `sentAt` before ordering by it. */
+  readonly eventTime?: bigint | undefined;
+}
+
+/** `u8(1) || u8(kind) || u64(eventTime or 0) || payload`: the plaintext under the AEAD. */
+export function encodeEnvelope(e: Envelope, payload: Uint8Array): Uint8Array {
+  if (!Number.isInteger(e.kind) || e.kind < 0 || e.kind > MAX_KIND) throw malformed("encode", "kind out of range");
+  if (payload.length > MAX_PAYLOAD_BYTES) throw new KavachError("SIZE_LIMIT", "encode", "payload over 4,096 bytes");
+  return new Writer().u8(ENVELOPE_VERSION).u8(e.kind).u64(e.eventTime ?? 0n).bytes(payload).finish();
+}
+
+export function decodeEnvelope(plaintext: Uint8Array): Envelope & { readonly payload: Uint8Array } {
+  const stage = "envelope";
+  if (plaintext.length < ENVELOPE_BYTES) throw malformed(stage, "envelope too short");
+  const r = new Reader(plaintext, stage);
+  if (r.u8() !== ENVELOPE_VERSION) throw malformed(stage, "envelope version");
+  const kind = r.u8();
+  const t = r.u64();
+  const payload = plaintext.subarray(ENVELOPE_BYTES);
+  if (payload.length > MAX_PAYLOAD_BYTES) throw new KavachError("SIZE_LIMIT", stage, "payload over 4,096 bytes");
+  return { kind, eventTime: t === 0n ? undefined : t, payload };
 }
 
 export function recordAad(header: Uint8Array): Uint8Array {
   return concat(C("record-aad"), header);
 }
 
-/** Encrypt and sign one record. The caller supplies a fresh random nonce and never reuses it. */
-export function buildEncryptedRecord(
-  f: { streamId: Uint8Array; epoch: number; counter: number; sentAt: bigint; kind: RecordKind },
-  plaintext: Uint8Array,
-  epochKey: Uint8Array,
-  nonce: Uint8Array,
-  deviceSigningSecretKey: Uint8Array
-): Uint8Array {
-  if (plaintext.length > MAX_PAYLOAD_BYTES) throw new KavachError("SIZE_LIMIT", "encode", "payload over 4,096 bytes");
+/** Encrypt and sign one record from its complete plaintext (the envelope with the payload). The caller supplies a fresh random nonce and never reuses it. */
+export function buildEncryptedRecord(f: RecordHeaderFields, plaintext: Uint8Array, epochKey: Uint8Array, nonce: Uint8Array, deviceSigningSecretKey: Uint8Array): Uint8Array {
+  if (plaintext.length < ENVELOPE_BYTES || plaintext.length > ENVELOPE_BYTES + MAX_PAYLOAD_BYTES) throw new KavachError("SIZE_LIMIT", "encode", "record plaintext length");
   const header = encodeRecordHeader(f);
   const ciphertext = aeadSeal(epochKey, nonce, recordAad(header), plaintext);
   const body = concat(header, nonce, u32(ciphertext.length), ciphertext);
   return signed(body, "record-sig", deviceSigningSecretKey);
 }
 
-/** Decrypt a parsed record under its epoch key. Verify the signature first; this does not. */
+/** The same from a kind, an optional event time and a payload: the envelope is encoded here. */
+export function buildRecordWire(f: RecordHeaderFields & Envelope, payload: Uint8Array, epochKey: Uint8Array, nonce: Uint8Array, deviceSigningSecretKey: Uint8Array): Uint8Array {
+  return buildEncryptedRecord(f, encodeEnvelope(f, payload), epochKey, nonce, deviceSigningSecretKey);
+}
+
+/** Decrypt a parsed record under its epoch key to its plaintext (the envelope with the payload). Verify the signature first; this does not. */
 export function openRecord(record: EncryptedRecord, epochKey: Uint8Array): Uint8Array {
   return aeadOpen(epochKey, record.nonce, recordAad(record.header), record.ciphertext);
 }

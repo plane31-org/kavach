@@ -411,15 +411,16 @@ export class FakeHost {
           const acceptedAt = host.now() > s.lastAcceptedAt ? host.now() : s.lastAcceptedAt;
           s.lastAcceptedAt = acceptedAt;
           const required = new Set(epoch.rows.filter((r) => r.identityId !== a.identityId).map((r) => r.certificateHash));
-          s.records.set(seq, { recordId: id, wire, acceptedAt, epoch: rec.epoch, counter: rec.counter, kind: rec.kind, required });
+          s.records.set(seq, { recordId: id, wire, acceptedAt, epoch: rec.epoch, counter: rec.counter, kind: rec.headerClass, required });
           s.highWater = { epoch: rec.epoch, counter: rec.counter };
           const outcome: AppendOutcome = { status: "ACCEPTED", deliverySeq: seq };
           s.lastAppend = { recordId: id, hash, seq, at: acceptedAt, outcome };
           for (const r of epoch.rows) {
             if (r.identityId === a.identityId) continue;
             const to = host.accountByIdentity(r.identityId)?.accountName ?? r.identityId;
-            // A status (kind 2) carries no notification and needs no wake-up.
-            if (rec.kind !== 2) host.notifications.push({ kind: rec.kind === 1 ? "checkIn" : "wake", to, from: a.accountName });
+            // By header class, as the test profile declares them: 1 is a visible notification, 2 is
+            // silent and needs no wake-up, anything else is a wake-up. The host never sees the kind.
+            if (rec.headerClass !== 2) host.notifications.push({ kind: rec.headerClass === 1 ? "checkIn" : "wake", to, from: a.accountName });
           }
           if (required.size === 0) s.records.delete(seq);
           return outcome;

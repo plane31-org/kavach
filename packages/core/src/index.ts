@@ -7,7 +7,7 @@
  * `@kavach/core/sodium`. Everything else is internal and reachable only by relative import.
  */
 export const PROTOCOL_NAME = "Kavach";
-export const PROTOCOL_REVISION = 7;
+export const PROTOCOL_REVISION = 8;
 
 // The client ---------------------------------------------------------------------------------------
 export {

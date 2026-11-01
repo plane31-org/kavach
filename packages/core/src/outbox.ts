@@ -7,7 +7,7 @@ import { bodyHash } from "./crypto.js";
 import { KavachError } from "./errors.js";
 import { indexHistory } from "./historyIndex.js";
 import { kindOf, type RetentionPolicy } from "./policy.js";
-import { eventTimeOf, takeSlot } from "./slots.js";
+import { clampEventTime, takeSlot } from "./slots.js";
 import { sealRecord } from "./record.js";
 import { big, unbig } from "./rows.js";
 import type { HistoryRow, OutboxRow, Store, Tx } from "./store.js";
@@ -52,6 +52,12 @@ export interface EnqueueOptions {
    * a rotation, which the `cancelled` event reports as for any record. Up to 128 characters.
    */
   readonly idempotencyKey?: string;
+  /**
+   * The event time of what the record describes (a fix time, say), carried in the encrypted
+   * envelope. A reader orders the kind's newest slot by it, clamped to the send time. Absent for a
+   * kind with no natural event time; the slot then orders by send time.
+   */
+  readonly eventTime?: bigint;
 }
 
 export interface Enqueued {
@@ -122,6 +128,8 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
       epoch: epoch.epoch,
       nextCounter: epoch.nextCounter,
       kind,
+      eventTime: options.eventTime,
+      headerClass: declared.headerClass,
       payload,
       sentAt: now,
       epochKey: fromHex(epoch.epochKey),
@@ -145,7 +153,7 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
     // keeps it, and the own newest slot when the kind has one, so `newest` answers for self.
     const self = toHex(a.identityId);
     const hash = toHex(bodyHash(sealed.wire.subarray(0, sealed.wire.length - 64)));
-    const own = declared.newest ? takeSlot(tx, self, kind, { generation: a.generation, eventTime: eventTimeOf(payload, now), epoch: epoch.epoch, counter: sealed.counter, recordId: id, bodyHash: hash, sentAt: now, receivedAt: now, payload }, toHex) : false;
+    const own = declared.newest ? takeSlot(tx, self, kind, { generation: a.generation, eventTime: clampEventTime(options.eventTime, now), epoch: epoch.epoch, counter: sealed.counter, recordId: id, bodyHash: hash, sentAt: now, receivedAt: now, payload }, toHex) : false;
     if (declared.history) {
       const ownRow: HistoryRow = {
         recordId: id,
@@ -159,7 +167,8 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
         receivedAt: big(now),
         plaintext: toHex(payload),
         superseded: false,
-        own: true
+        own: true,
+        ...(options.eventTime === undefined ? {} : { eventTime: big(options.eventTime) })
       };
       tx.put("history", id, ownRow);
       indexHistory(tx, ownRow);

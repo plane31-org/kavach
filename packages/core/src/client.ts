@@ -627,11 +627,11 @@ class ClientImpl implements Client {
   // Sending ---------------------------------------------------------------------------------------
 
   async enqueueLocation(location: Location, options?: EnqueueOptions): Promise<EnqueueResult> {
-    return this.enqueueKind(0, encodeLocation(location), options);
+    return this.enqueueKind(0, encodeLocation(location), { eventTime: location.capturedAt, ...options });
   }
 
   async enqueueCheckIn(payload: Location | Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult> {
-    return this.enqueueKind(1, payload instanceof Uint8Array ? payload : encodeLocation(payload), options);
+    return payload instanceof Uint8Array ? this.enqueueKind(1, payload, options) : this.enqueueKind(1, encodeLocation(payload), { eventTime: payload.capturedAt, ...options });
   }
 
   async enqueueStatus(payload: Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult> {
