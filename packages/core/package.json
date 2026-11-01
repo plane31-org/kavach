@@ -5,12 +5,12 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tritt234-cell/kavach.git",
+    "url": "git+https://github.com/plane31-org/kavach.git",
     "directory": "packages/core"
   },
-  "homepage": "https://github.com/tritt234-cell/kavach#readme",
+  "homepage": "https://github.com/plane31-org/kavach#readme",
   "bugs": {
-    "url": "https://github.com/tritt234-cell/kavach/issues"
+    "url": "https://github.com/plane31-org/kavach/issues"
   },
   "keywords": [
     "end-to-end-encryption",
