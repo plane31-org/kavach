@@ -1,20 +1,18 @@
 # Kavach v1
 
-End-to-end encrypted location sharing and check-ins for circles of up to 100 accounts, through a server that stores only what it cannot open and deletes each record once every reader has it.
+End-to-end encrypted, relayed, durable records between a person's devices and the devices of the people they share with, for circles of up to 100 accounts, through a server that stores only what it cannot open and deletes each record once every reader has it. What a record means is the product's; the protocol carries bytes of a kind the product declares.
 
-Kavach v1, protocol revision 8, formerly SealedStream SS5. Wire version 5, unchanged since revision 2; revision 6 assigned a flag bit that was reserved, revision 7 changed no byte, and revision 8 puts an envelope in front of every record payload. October 2026. The companion document "Kavach v1: Moyo implementation profile" holds the platform, server and retention choices of the first host.
+Kavach v1, protocol revision 8, formerly SealedStream SS5. Wire version 5, unchanged since revision 2; revision 6 assigned a flag bit that was reserved, revision 7 changed no byte, and revision 8 puts an envelope in front of every record payload. October 2026. An implementation profile states a product's record kinds, payload codecs, platform, server and retention choices; the first is "Kavach v1: Moyo implementation profile", a separate document, and `spec/Profile-template.md` lists what a profile must decide.
 
 > **How to read this**
 >
 > Sections 1 to 3 state the requirements, the terms and the cipher suite. Sections 4 to 12 are the protocol: accounts, recovery, membership, audience, epochs, records, delivery, durable state and reset. Sections 13 and 14 are the client contract and its results. Section 15 states what is and is not protected, 16 how conformance is shown, and 17 what we want a reviewer's opinion on. The appendix lists the scenario tests that gate release.
 >
-> This document names no platform library, server product or retention value. Those belong to an implementation profile; the Moyo profile is the first.
->
-> Part I is the protocol specification, profile-neutral and normative. Part II is the Moyo implementation profile: the platform, server and retention choices of the first host. Where the two disagree, Part I wins.
+> This document names no platform library, server product, retention value or record kind. Those belong to an implementation profile; the Moyo profile is the first. Where a profile and this document disagree, this document wins.
 
-## Part I: Protocol specification
+## Protocol specification
 
-Protocol specification. End-to-end encrypted location sharing and check-ins for circles of up to 100 accounts, through a server that stores only what it cannot open and deletes each record once every reader has it.
+End-to-end encrypted, relayed, durable records between a person's devices and the devices of the people they share with, for circles of up to 100 accounts, through a server that stores only what it cannot open and deletes each record once every reader has it.
 
 **Contents**
 
@@ -26,7 +24,7 @@ Protocol specification. End-to-end encrypted location sharing and check-ins for 
 - 6. Circle membership and owner approval
 - 7. Audience and reconciliation
 - 8. Epoch manifest and addressed wraps
-- 9. Records: locations, check-ins and statuses
+- 9. Records and kinds
 - 10. Delivery and deletion
 - 11. Durable state
 - 12. Last-resort account reset and the reset keys
@@ -39,7 +37,7 @@ Protocol specification. End-to-end encrypted location sharing and check-ins for 
 
 ### 1. Scope and requirements
 
-Kavach carries a person's location and check-ins to a small circle of people they chose, through a server that cannot read any of it. One account is one person. Each account has one active device, keeps its memberships when the device changes, and can own circles. The server authenticates accounts, stores opaque documents and ciphertext, forwards records, and deletes each record as soon as every recipient has acknowledged it.
+Kavach carries a person's records, of whatever kinds the product declares (a position, an event, a state), to a small circle of people they chose, through a server that cannot read any of it. One account is one person. Each account has one active device, keeps its memberships when the device changes, and can own circles. The server authenticates accounts, stores opaque documents and ciphertext, forwards records, and deletes each record as soon as every recipient has acknowledged it.
 
 This document is normative for Kavach v1. MUST and MUST NOT are requirements, SHOULD is a strong recommendation, MAY is optional. It is an implementation proposal, not an independently audited protocol. The machine-readable vectors described in section 16 travel with it.
 
@@ -49,12 +47,12 @@ This document is normative for Kavach v1. MUST and MUST NOT are requirements, SH
 | --- | --- |
 | Membership belongs to the account | A circle lists stable account identities, never devices. The identity key survives a device replacement, so memberships and ownership do. |
 | Owner continuity | The owner keeps the same account key and circle id on a new device. Replacing the owner's device never closes a circle or removes a member. |
-| A new device keeps its circles, not its keys | Each device has its own encryption key. A replacement device recovers the account, publishes a new certificate, and receives new epoch keys as each author syncs. Membership continuity is guaranteed; an instant map is not. Replacement is also what cuts the old device off. |
+| A new device keeps its circles, not its keys | Each device has its own encryption key. A replacement device recovers the account, publishes a new certificate, and receives new epoch keys as each author syncs. Membership continuity is guaranteed; an instant view is not. Replacement is also what cuts the old device off. |
 | Owner approval only | A participant requests admission; the owner approves that account once. No invitation secret, no other-member signatures, no second ceremony. |
 | History lives on devices | Devices keep what they received under the host's retention policy. A replacement device never imports old keys or history. The server keeps a record only until every recipient has it. |
 | Recovery first, reset last | A new device recovers the account through a platform recovery provider or a saved recovery code. An explicit destructive reset exists for the case where both fail. |
-| Check-ins are durable events | A check-in is a record kind with its own id. Location updates never overwrite it, and the host notifies recipients of it visibly. |
-| Statuses are current state | A status is a record kind for the sender's small current state (battery, charging, permissions). Only the newest matters: latest wins in the outbox, newest per author on the reader, no pin movement, no history, no notification. |
+| Kinds are the product's | A record carries a kind the product declares, with the behaviour it declares: how long a reader keeps it, whether a newer queued one replaces it, whether it is kept in history, whether one newest-per-author slot is kept for it, and what the relay may see of it in the header. The protocol gives a kind no meaning and never reads a payload. |
+| Durable events and current state | A kind declared with history and no slot keeps every record under its own id; nothing overwrites it, and the host may notify recipients of it visibly by its header class. A kind declared with a slot keeps the newest per author from the author's current device, ordered by the event time the sender gives; a kind declared latest-wins yields in the queue to a newer one. |
 | Client-only SDK | The SDK owns cryptography and local security state. The host supplies authenticated login, a directory, an opaque relay, notifications and the interface. The SDK ships no server. |
 
 #### Fixed limits
@@ -81,7 +79,7 @@ Multiple simultaneous devices per account, delegated owners, ownership transfer,
 | Epoch | A span of an author's stream encrypted under one random key `SK`. |
 | Manifest | The signed EpochManifest (type 3): the epoch's audience as (identity, certificate hash, wrap hash) rows plus a key commitment. |
 | Wrap | A libsodium sealed box of `SK` to one recipient device's `DEK`: 80 bytes, unsigned, bound to the manifest by its hash. |
-| Record | An EncryptedRecord (type 4): one location or one check-in, encrypted under `SK`, signed by `DSK`. |
+| Record | An EncryptedRecord (type 4): one record of a product-declared kind, encrypted under `SK`, signed by `DSK`. |
 | Audience | The identities an author encrypts to: itself plus every member of every circle it has joined and enabled, each at its current device. |
 | Desired revision | A local u64 the author increments on every change that should alter its audience. An epoch prepared under an older value is obsolete. |
 | Delivery window | The profile's configured time after the relay accepted a record during which it keeps it for readers that have not acknowledged it. After it, the record is deleted whether or not it was delivered. |
@@ -168,7 +166,7 @@ Per known account the SDK persists the greatest accepted `deviceGeneration` and 
 2. Generate a fresh `deviceSeed`, `deviceId` and local store. Fetch the current certificate by the hash the vault pins and the snapshots of the vault's circles; verify them against the recovered pins.
 3. Prepare the new certificate at generation plus one and a vault at its next revision. Persist both as exact bytes (T2), then call `activateDevice` with the expected current certificate hash and vault revision. A lost response is retried with identical bytes, never regenerated.
 4. On commit the host moves the account's current-device pointer, fences the old device from all writes, and hints every circle the account belongs to. The new device starts epoch 1, counter 0 in its new stream once its audience is resolved and its first manifest is published.
-5. Each author rotates to the new `DEK` on its next sync. Until an author rotates, every record it sends is sealed to the old certificate and never reaches the new device's subscription; the new device sees that the author's current manifest has no row for it, and the host's interface shows that person as waiting rather than a blank map. Nothing waits on the circle owner.
+5. Each author rotates to the new `DEK` on its next sync. Until an author rotates, every record it sends is sealed to the old certificate and never reaches the new device's subscription; the new device sees that the author's current manifest has no row for it, and the host's interface shows that person as waiting rather than nothing. Nothing waits on the circle owner.
 
 Activation changes only the current-device pointer, the vault checkpoint and the transport fence. Nothing from the old device is copied: no outbox, no `SK`, no counters, no `deviceSeed`, no history. A missing or corrupt local store is handled by the same procedure under the preserved account, never by account reset.
 
@@ -189,7 +187,7 @@ plaintext = accountSeed[32] || lastDeviceGeneration:u64 || lastCertificateHash[3
 entry     = circleId[16] || ownerIdentityId[32] || sharingEnabled:u8
 ```
 
-Encrypt under `recoveryKey`. Revision is at least 1; ciphertext length is 90 to 4,990 bytes. Entries sort by `circleId` and are unique, count 0 to 100; `sharingEnabled` is 0 or 1. An entry pins a circle and the owner the user agreed to; whether the account is admitted or still waiting is read from the circle's current snapshot, never stored here. The vault holds no location, no `SK`, no `deviceSeed`, no `DEK`, no counters and no history: holding it with its recovery key authorises a device, and with it future access, but decrypts no history. After decryption, verify the account name and that `AK` derives from the recovered seed before trusting the entries.
+Encrypt under `recoveryKey`. Revision is at least 1; ciphertext length is 90 to 4,990 bytes. Entries sort by `circleId` and are unique, count 0 to 100; `sharingEnabled` is 0 or 1. An entry pins a circle and the owner the user agreed to; whether the account is admitted or still waiting is read from the circle's current snapshot, never stored here. The vault holds no record payload, no `SK`, no `deviceSeed`, no `DEK`, no counters and no history: holding it with its recovery key authorises a device, and with it future access, but decrypts no history. After decryption, verify the account name and that `AK` derives from the recovered seed before trusting the entries.
 
 #### Recovery order
 
@@ -261,7 +259,7 @@ wrap          = crypto_box_seal(SK, recipient DEK.public)        -- exactly 80 b
 wrapHash      = H(C("wrap") || wrap)
 ```
 
-Rows sort strictly by identity id, are unique, count 1 to 100, and include the author exactly once. A reader fetches the author's certificate by its hash, verifies it under the pinned `AK`, and requires that its derived identity id and stream id match the manifest and that it is the author's current certificate before using the epoch for a live location. The reader's own row must name its current certificate hash. Before storing `SK`, verify the manifest signature, the certificate bindings, the own row, the wrap hash, sealed-box authentication and the key commitment. Signing is required because every member knows `SK`.
+Rows sort strictly by identity id, are unique, count 1 to 100, and include the author exactly once. A reader fetches the author's certificate by its hash, verifies it under the pinned `AK`, and requires that its derived identity id and stream id match the manifest and that it is the author's current certificate before using the epoch for a newest slot. The reader's own row must name its current certificate hash. Before storing `SK`, verify the manifest signature, the certificate bindings, the own row, the wrap hash, sealed-box authentication and the key commitment. Signing is required because every member knows `SK`.
 
 #### Publication
 
@@ -277,7 +275,7 @@ Rows sort strictly by identity id, are unique, count 1 to 100, and include the a
 
 An epoch's manifest, wraps and author certificate stay on the host while an undelivered record references the epoch or the epoch is the author's current one; when neither holds the host deletes them. A reader keeps an opened `SK` until every record of that epoch it holds has been decrypted into local history or has expired. Generation and epoch checkpoints are persisted separately from key deletion. A replacement device never fetches old-device wraps or keys. An unexplained higher committed epoch for the local stream means local state was lost; the device replaces its stream under the same account rather than guessing counters. A self-wrap recovers `SK`, never a counter.
 
-### 9. Records: locations, check-ins and statuses
+### 9. Records and kinds
 
 #### Type 4: EncryptedRecord
 
@@ -290,35 +288,24 @@ body      = header || nonce[24] || ciphertextLength:u32 || ciphertextAndTag
 wire      = body || Ed25519(DSK, C("record-sig") || body)
 ```
 
-The record's kind travels inside the encryption, in the envelope: a version byte, the kind, and the event time the sender gave (0 when none). The header shows only the kind's declared header class, the one thing the relay may learn about a record's kind, for routing and notifications without content. Bit 0 carried an urgency flag in an earlier revision and stays reserved; before revision 8 the two class bits carried the kind itself (0 location, bit 1 check-in, bit 2 status, both set invalid) and the payload was the whole plaintext. One global counter spans every kind in an epoch. `sentAt` is the public send time in Unix milliseconds, not an authoritative capture time; `eventTime` is the sender's claim about what the record describes and a reader never trusts it past `sentAt`. Encrypt with the active `SK` and a fresh nonce; ciphertext length is plaintext length plus 16, between 26 and 4,122. The signature covers the entire body; the AAD covers the header. A retry resends the persisted bytes and never changes nonce, counter or `sentAt`.
+The record's kind travels inside the encryption, in the envelope: a version byte, the kind, and the event time the sender gave (0 when none). The header shows only the kind's declared header class, the one thing the relay may learn about a record's kind, for routing and notifications without content. Bit 0 carried an urgency flag in an earlier revision and stays reserved; before revision 8 the two class bits carried the kind itself (0 with neither bit, 1 with bit 1, 2 with bit 2, both set invalid) and the payload was the whole plaintext. One global counter spans every kind in an epoch. `sentAt` is the public send time in Unix milliseconds, not an authoritative capture time; `eventTime` is the sender's claim about what the record describes and a reader never trusts it past `sentAt`. Encrypt with the active `SK` and a fresh nonce; ciphertext length is plaintext length plus 16, between 26 and 4,122. The signature covers the entire body; the AAD covers the header. A retry resends the persisted bytes and never changes nonce, counter or `sentAt`.
 
-**Verification.** Resolve the author's current certificate and the manifest for (`streamId`, `epoch`); verify stream and certificate bindings, then the `DSK` signature, then decrypt, then read the envelope. Zero epoch, reserved flags, out-of-range lengths, trailing bytes and an envelope version other than 1 are invalid. A known superseded author device cannot supply a new live pin (`SUPERSEDED_DEVICE`); its previously accepted records may still be verified under the archived certificate and manifest and stored as history.
+**Verification.** Resolve the author's current certificate and the manifest for (`streamId`, `epoch`); verify stream and certificate bindings, then the `DSK` signature, then decrypt, then read the envelope. Zero epoch, reserved flags, out-of-range lengths, trailing bytes and an envelope version other than 1 are invalid. A known superseded author device cannot take a newest slot (`SUPERSEDED_DEVICE`); its previously accepted records may still be verified under the archived certificate and manifest and stored as history.
 
 #### Kinds are declared by the product
 
-The protocol carries a kind as a small integer and gives it no meaning. The product declares, in the retention policy it passes to `open()`, every kind it uses and how the SDK treats it: `retentionMs`, how long a reader keeps records of the kind and the payload of its newest slot, from `sentAt`; `queue`, `keepAll` (every queued record is sent) or `latestWins` (a newer queued record of the kind cancels the older one with reason `superseded`, never one already handed to the network); `history`, whether records are kept in indexed, pageable history; `newest`, whether one newest-per-author slot is kept (section 10); and `headerClass`, the two header bits the relay may see for the kind (0 to 3, 0 when absent). A kind must keep at least one of history and a slot. A record of a kind the reader did not declare is `invalid(BAD_PAYLOAD)` and is not stored; an enqueue of one is `MALFORMED`. The location, check-in and status rules below are the declarations of the first product, stated as that product's profile makes them: a position (history and a slot, kept a day), an event (history, no slot, kept thirty days, every one news) and a state (a slot only, latest wins while queued, kept a day), with header classes 0, 1 and 2. The envelope carries kinds 0 to 255.
+The protocol carries a kind as a small integer and gives it no meaning. The product declares, in the retention policy it passes to `open()`, every kind it uses and how the SDK treats it: `retentionMs`, how long a reader keeps records of the kind and the payload of its newest slot, from `sentAt`; `queue`, `keepAll` (every queued record is sent) or `latestWins` (a newer queued record of the kind cancels the older one with reason `superseded`, never one already handed to the network); `history`, whether records are kept in indexed, pageable history; `newest`, whether one newest-per-author slot is kept (section 10); and `headerClass`, the two header bits the relay may see for the kind (0 to 3, 0 when absent). A kind must keep at least one of history and a slot. A record of a kind the reader did not declare is `invalid(BAD_PAYLOAD)` and is not stored; an enqueue of one is `MALFORMED`. The envelope carries kinds 0 to 255. A product's declarations, with its payload codecs, are in its profile; the first profile declares a position (history and a slot), an event (history, no slot, every one news) and a state (a slot only, latest wins while queued).
 
-#### Location codec
+#### Payloads
 
-```
-plaintext = payloadVersion:u8 = 1 || latitudeE7:i32 || longitudeE7:i32 || accuracyMm:u32 || capturedAt:u64 || status:u8   -- 22 bytes
-```
+A payload is 0 to 4,096 opaque bytes the product defines and versions in its profile. The SDK never parses one: not to order it (the envelope's event time does that), not to notify about it (the header class does that), not to decide whether to keep it (the kind's declaration does that). A product that needs a kind to carry no names, addresses or device identifiers says so in its codec, where the protocol cannot.
 
-Latitude in -900,000,000 to 900,000,000; longitude in -1,800,000,000 to 1,800,000,000; accuracy 0 to 100,000,000 millimetres. `capturedAt` is the encrypted capture time, shown to the reader as fix age. Status 0 normal, 1 stale, 2 unavailable; unavailable requires all-zero coordinates and accuracy. Unknown versions or statuses and trailing bytes are `BAD_PAYLOAD`. The codec carries no names, addresses or device identifiers. The byte API accepts any opaque payload up to 4,096 bytes.
-
-#### Check-ins
-
-A check-in is a record with kind 1. Its `recordId` is its stable event id. It may carry the location codec or an application payload. Each accepted check-in is durably queued and retried until server acceptance, explicit security cancellation or configured expiry; a later location never replaces it, in the outbox, on the relay or on the reader. The host notifies each recipient of a check-in visibly, with no record content; the protocol does not promise that every person saw it.
-
-#### Statuses
-
-A status is a record with kind 2 and header class 2: the sender's small current state, in an application payload the host defines and versions, which the protocol does not parse. Only the newest matters, which gives it four properties. In the outbox, latest wins: a status still queued when a newer one is enqueued is cancelled with reason `superseded` and never sent; a status already handed to the network is not recalled, and a check-in is never dropped this way. On the reader, the newest status per author is kept, by (generation, epoch, counter) order, since a status carries no measurement time, and only from the author's current device; an older one changes nothing, and a different body under a retained status id is `EQUIVOCATION`. A status never moves the live pin, never counts as a check-in and is never history, on the sender or the reader: there is one slot per author, read as `newest(identityId, 2)`, replaced in place and dropped with the author's keys when the author leaves. It expires with its kind's `retentionMs` after `sentAt`: the payload is dropped and `newest` returns nothing, while the slot keeps its order so an older status replayed later cannot become current. A status carries no notification and needs no wake-up; readers pick it up on their next sync.
 
 ### 10. Delivery and deletion
 
 #### Publishing
 
-`enqueue(kind, payload, options)` runs inside one write transaction (T6): answer an idempotency key the caller gave before, otherwise require a usable active epoch whose `desiredRevision` equals current state, enforce the profile's queue limits, encrypt and sign once, insert the complete wire into the outbox, write the author's own history entry and its index entries (a status writes none) and the idempotency key when given, and increment `nextCounter`. In the same transaction the sender's own row follows the reader's rules: a record of a kind with a slot is offered to the sender's own slot by the order in Receiving below, and one of a kind with history is written there, so `newest(identityId, kind)` answers for the sender's own identity as for any author and `recordStored` fires for self. `queued(recordId)` is returned only after commit. A queued record of a `keepAll` kind is never coalesced or replaced; a queued record of a `latestWins` kind yields to a newer one of the same kind (section 9). `QUEUE_FULL` is explicit.
+`enqueue(kind, payload, options)` runs inside one write transaction (T6): answer an idempotency key the caller gave before, otherwise require a usable active epoch whose `desiredRevision` equals current state, enforce the profile's queue limits, encrypt and sign once, insert the complete wire into the outbox, write the author's own history entry and its index entries (a slot-only kind writes none) and the idempotency key when given, and increment `nextCounter`. In the same transaction the sender's own row follows the reader's rules: a record of a kind with a slot is offered to the sender's own slot by the order in Receiving below, and one of a kind with history is written there, so `newest(identityId, kind)` answers for the sender's own identity as for any author and `recordStored` fires for self. `queued(recordId)` is returned only after commit. A queued record of a `keepAll` kind is never coalesced or replaced; a queued record of a `latestWins` kind yields to a newer one of the same kind (section 9). `QUEUE_FULL` is explicit.
 
 A single serialised sender drains the outbox in (epoch, counter) order with one record in flight per stream: the next handoff waits until the previous outcome is durable, so accepted (epoch, counter) pairs reach the relay in strictly increasing order and the relay's append checkpoint below stays small. For each record it opens a write transaction, re-checks device status, epoch, `desiredRevision` and expiry, marks the row in flight, **initiates the handoff to the transport inside that transaction**, and commits; only awaiting the response happens outside (T6h). Because T3 needs the same lock, no authorization change can commit between the check and the handoff. A timeout retries the same bytes while still eligible. A known change cancels pending uploads sealed for the obsolete audience and emits `cancelled(recordId, reason)`. Old keys are never re-wrapped to newly admitted accounts to deliver a backlog.
 
@@ -332,18 +319,18 @@ A single serialised sender drains the outbox in (epoch, counter) order with one 
 4. **Acknowledge.** `ackThrough(streamId, cursor)` rejects a cursor above the tail with `CURSOR_OUT_OF_RANGE` and otherwise sets the subscription's cursor to max(stored, requested), authenticated to the exact reader device and subscription. An equal or older cursor is a successful no-op with no write. Success is reported only after durable commit. There is no per-record acknowledgement and no exception list.
 5. **Completion and immediate deletion.** A record's required readers are the rows of its epoch's manifest other than the author. When a cursor advances, the relay deletes every record whose sequence is now at or below the cursor of every required reader, in the same transaction as the cursor change. The minimum is taken over the epoch's audience, never over every subscriber the stream ever had. A self-only epoch's records complete on append. No copy survives on the server: record bodies are excluded from the host's logs, analytics, backups and dead-letter queues, which the deletion promise covers. Physical erasure of replicas is operational policy the client cannot prove.
 6. **Expiry.** One delivery window applies to every record of a stream. A record expires at its acceptance time plus the window; because acceptance times never decrease, expiry advances as a prefix. The relay keeps one monotonic `expiredThrough` watermark per stream, deletes the ciphertext of the expired prefix, and returns the watermark on every read so a reader can cross the prefix without asking for records that no longer exist. It never expires a newer record because an older one expired. The author's own history is then the only copy on the author's side; readers that already stored a record keep it. Expiry is an availability fact, never a receipt.
-7. **Append checkpoint.** The relay keeps per stream one high-water (epoch, counter) pair and the outcome of the last append (`recordId`, body hash, `deliverySeq`, acceptance time), updated atomically with each append. Within the profile's `appendRetryWindowMs`, a retry matching the last outcome returns it even after the ciphertext was deleted; a different body at that slot is `EQUIVOCATION`. An append at or below the high-water pair with no matching evidence is `STALE_APPEND`: nothing is reinserted and no success is invented. The client records that record as `acceptanceUnknown`, keeps its own history entry, stops retrying it and, for a location, asks for a fresh sample; it never re-creates a check-in on its own, which could duplicate the event. Appends for a retired device stream are refused by the certificate fence and never recreate deleted stream state.
+7. **Append checkpoint.** The relay keeps per stream one high-water (epoch, counter) pair and the outcome of the last append (`recordId`, body hash, `deliverySeq`, acceptance time), updated atomically with each append. Within the profile's `appendRetryWindowMs`, a retry matching the last outcome returns it even after the ciphertext was deleted; a different body at that slot is `EQUIVOCATION`. An append at or below the high-water pair with no matching evidence is `STALE_APPEND`: nothing is reinserted and no success is invented. The client records that record as `acceptanceUnknown`, keeps its own history entry, stops retrying it and, for a kind with a slot, emits `refresh`; it never re-creates a record on its own, which could duplicate an event. Appends for a retired device stream are refused by the certificate fence and never recreate deleted stream state.
 8. **Epoch material.** A manifest, its wraps and the author's certificate are retained while the epoch is current or any retained record references it, and deleted when neither holds; a certificate shared by several epochs or by trust state stays while any of them still needs it. The expiry watermark is one less than the sequence of the oldest retained record whose deadline has not passed, or the tail when nothing is retained, so records already deleted by acknowledgement need no timestamps of their own.
 9. Sequences, cursors and watermarks are transport state, never authorization. A missing record is `NOT_FOUND`, not proof that it never existed.
-10. The host decides notifications from the header class alone, by the product's declaration: in the first profile, class 1 (a check-in) notifies each recipient visibly, class 0 (a location) wakes the recipient silently, and class 2 (a status) does neither. The host never learns the kind, and no notification carries record content.
+10. The host decides notifications from the header class alone, by the product's declaration (the first profile maps class 1 to a visible notification to each recipient, class 0 to a silent wake-up, class 2 to nothing). The host never learns the kind, and no notification carries record content.
 
 #### Receiving
 
-Only accept authors currently admitted in a locally joined circle, or self. `receive(wire)` resolves the author's certificate and the manifest for (`streamId`, `epoch`), fetching the manifest and the reader's wrap through `getEpoch` when they are not local, verifies the complete record, and in one transaction (T7) inserts it by `recordId` into local history with its index entries when its kind keeps history, records a disposition, and, when its kind keeps a newest slot, takes the author's slot for that kind only if the record is from the author's current device and it orders after the slot's holder (the live pin is the slot of the position kind): a newer device generation first; within one generation the later event time, which is the envelope's `eventTime` clamped to the record's `sentAt`, so a phone clock set ahead cannot hold the slot against later honest records; equal event times by (epoch, counter). A record with no event time orders at its `sentAt`. The SDK never reads a payload to order it. Replays are harmless upserts; a different valid body for a retained `recordId` is `EQUIVOCATION`. There is no application-level acknowledgement: relay acknowledgement is internal to the SDK.
+Only accept authors currently admitted in a locally joined circle, or self. `receive(wire)` resolves the author's certificate and the manifest for (`streamId`, `epoch`), fetching the manifest and the reader's wrap through `getEpoch` when they are not local, verifies the complete record, and in one transaction (T7) inserts it by `recordId` into local history with its index entries when its kind keeps history, records a disposition, and, when its kind keeps a newest slot, takes the author's slot for that kind only if the record is from the author's current device and it orders after the slot's holder: a newer device generation first; within one generation the later event time, which is the envelope's `eventTime` clamped to the record's `sentAt`, so a device clock set ahead cannot hold the slot against later honest records; equal event times by (epoch, counter). A record with no event time orders at its `sentAt`. The SDK never reads a payload to order it. Replays are harmless upserts; a different valid body for a retained `recordId` is `EQUIVOCATION`. There is no application-level acknowledgement: relay acknowledgement is internal to the SDK.
 
 **Acknowledgement rule.** Per author stream the SDK keeps a local acknowledged prefix and advances it only across a contiguous run of sequences in which every record addressed to this device has been durably stored, or that the relay has declared expired. It sends at most one `ackThrough` per stream per processed batch, after T7 commits. A record it cannot open yet because it is offline and cannot fetch the epoch is `keyPending`: it is not stored, the prefix holds at it, and records beyond it are still read, verified and stored, so the next acknowledgement covers them. The relay returns only records addressed to this subscription; a returned record whose verified manifest nevertheless has no row for this device is `invalid(NOT_AUTHORIZED)` and does not hold the prefix, because this device is not among its required readers. Acknowledging a `keyPending` record early would let the relay delete the only copy of the key material, and a later rotation cannot recover an earlier epoch's random key. Crossing an expired prefix is queue progress, never a receipt.
 
-Records arrive out of counter order and that is normal: counter 6 after counter 7 is inserted into the trail and cannot move the live pin backward. Nor can a sample measured earlier but sent later under a higher counter, as when one runtime flushes a buffered batch after another sent a fresh fix: it joins the trail and the pin keeps the later measurement. The SDK never waits for contiguous counters. Records from a superseded device populate history when the receiver holds the original key; they cannot overwrite the current device's pin. Removing a member clears that member's live pin and keys; it does not erase history already received. No peer key requests exist: the only sources of a key are the author's manifest and the author's next rotation.
+Records arrive out of counter order and that is normal: counter 6 after counter 7 is inserted into the trail and cannot move a newest slot backward. Nor can a record with an earlier event time sent later under a higher counter, as when one runtime flushes a buffered batch after another sent a fresh record: it joins the trail and the slot keeps the later event. The SDK never waits for contiguous counters. Records from a superseded device populate history when the receiver holds the original key; they cannot overwrite the current device's slot. Removing a member clears that member's slots and keys; it does not erase history already received. No peer key requests exist: the only sources of a key are the author's manifest and the author's next rotation.
 
 | `receive` result | Meaning |
 | --- | --- |
@@ -355,7 +342,7 @@ Records arrive out of counter order and that is normal: counter 6 after counter 
 | `expired` | Inside the relay's expired prefix, or past `sentAt + 5 minutes` of future skew (`CLOCK_SKEW`). |
 | `invalid(reason)` | `BAD_SIGNATURE`, `DECRYPT_FAILED`, `SUPERSEDED_DEVICE`, `NOT_AUTHORIZED`, `EQUIVOCATION` or a parse error. Nothing is updated; the code is named to the app as `securityError`. |
 
-`newest(identityId, kind)` is a view over the kind's slot: the verified record, the event time it was chosen by and its age; a stale slot is never presented as live. A replacement device subscribes at its activation boundary and receives only records appended after it; its map fills as authors rotate, person by person.
+`newest(identityId, kind)` is a view over the kind's slot: the verified record, the event time it was chosen by and its age; a stale slot is never presented as live. A replacement device subscribes at its activation boundary and receives only records appended after it; its view fills as authors rotate, person by person.
 
 ### 11. Durable state
 
@@ -382,14 +369,14 @@ This section states what the local store must guarantee. Which database or secre
 | T5 | Epoch publication outcome and conditional promotion with `nextCounter = 0`. |
 | T6 | Outbound record into the outbox and local history with its index entries, the idempotency key when given, counter increment. |
 | T6h | Handoff: eligibility re-check, in-flight mark and the send call for one outbound record. |
-| T7 | Inbound record with its index entries, disposition, conditional live pin, and the acknowledgement cursor under the rule in section 10. |
+| T7 | Inbound record with its index entries, disposition, conditional newest slot, and the acknowledgement cursor under the rule in section 10. |
 | T8 | Owner snapshot: the successor revision and its hash, built from local state plus one change; kept pending until the host confirms it, and published again by every sync until then. |
 | T9 | A standalone vault update before publication, kept pending and published again by every sync until confirmed; or an accepted reset-key list; or an accepted reset receipt together with every effect it has: the closures, the rotation and the forgotten author. |
 | T10 | Own reset: the new account, device and recovery roots in the secret store and the exact new certificate, vault and `resetId` in the store, before the reset is sent. |
 
 #### Required crash outcomes
 
-Before T4 commits, no epoch is publishable; after T4 but before the network succeeds, restart publishes exactly the saved bytes; after remote commit but before T5, lookup finishes T5 without new randomness. Before T6 commits, no `recordId` is returned and nothing is sent; after T6, restart retries the exact wire or cancels it with a disposition, never decrementing the counter; a row marked in flight by T6h whose response was lost is resolved by lookup, never resent under a changed audience. After T7, restart reads history, the pin and the cursor even if callbacks were lost. Before activation commits, the new device stays `activationPending` and emits nothing; after remote activation but before local acknowledgement, lookup finishes that activation and never allocates another device; a pending activation whose prepared bytes the host refuses because the vault moved, while it still shows the expected certificate, is prepared again with the same device keys. Before T10 commits, no reset is sent; after T10, restart or the next sync sends the same `resetId` and finishes under the keys the host holds, never generating others. A receipt is never on record without its effects. Every retry sends exact persisted bytes, so a lost response, a refused call and a crash all converge on the next sync. These outcomes are tested against the real store, not only an in-memory model.
+Before T4 commits, no epoch is publishable; after T4 but before the network succeeds, restart publishes exactly the saved bytes; after remote commit but before T5, lookup finishes T5 without new randomness. Before T6 commits, no `recordId` is returned and nothing is sent; after T6, restart retries the exact wire or cancels it with a disposition, never decrementing the counter; a row marked in flight by T6h whose response was lost is resolved by lookup, never resent under a changed audience. After T7, restart reads history, the slots and the cursor even if callbacks were lost. Before activation commits, the new device stays `activationPending` and emits nothing; after remote activation but before local acknowledgement, lookup finishes that activation and never allocates another device; a pending activation whose prepared bytes the host refuses because the vault moved, while it still shows the expected certificate, is prepared again with the same device keys. Before T10 commits, no reset is sent; after T10, restart or the next sync sends the same `resetId` and finishes under the keys the host holds, never generating others. A receipt is never on record without its effects. Every retry sends exact persisted bytes, so a lost response, a refused call and a crash all converge on the next sync. These outcomes are tested against the real store, not only an in-memory model.
 
 ### 12. Last-resort account reset and the reset keys
 
@@ -407,7 +394,7 @@ wire = body || Ed25519(managementKey, C("reset-keys-sig") || body)
 
 Rows sort strictly by key id; ids and keys are unique, ids nonzero, keys valid points, count 0 to 8. Version starts at 1. `issuedAt < expiresAt` and the lifetime is at most 30 days; a profile renews well inside that. An empty list disables every new reset. Operational keys MUST differ from the management key and cannot sign lists. A retired id is never reused and a compromised key is never re-authorised.
 
-`getResetKeyList()` returns opaque bytes. Verify under the pinned management key; require version at least the packaged minimum and at least the durable highest version. Equal version with equal body hash is a duplicate; equal version with a different valid body is `EQUIVOCATION`; lower is `ROLLBACK`. A higher list fully replaces the allowed set. Persist the accepted bytes, version, hash and highest checked time atomically (T9). Freshness requires `issuedAt <= trustedNow < expiresAt`, where `trustedNow` is the platform clock under an explicit accurate-clock assumption, checked against a durable time high-water mark and monotonic elapsed time; rollback or an unknown clock gives `RESET_CLOCK_UNTRUSTED`. An expired or missing list gives `RESET_KEYS_REQUIRED`: refresh and defer unseen resets. None of this pauses location sharing or authorises a directory key change. The list is cached until expiry.
+`getResetKeyList()` returns opaque bytes. Verify under the pinned management key; require version at least the packaged minimum and at least the durable highest version. Equal version with equal body hash is a duplicate; equal version with a different valid body is `EQUIVOCATION`; lower is `ROLLBACK`. A higher list fully replaces the allowed set. Persist the accepted bytes, version, hash and highest checked time atomically (T9). Freshness requires `issuedAt <= trustedNow < expiresAt`, where `trustedNow` is the platform clock under an explicit accurate-clock assumption, checked against a durable time high-water mark and monotonic elapsed time; rollback or an unknown clock gives `RESET_CLOCK_UNTRUSTED`. An expired or missing list gives `RESET_KEYS_REQUIRED`: refresh and defer unseen resets. None of this pauses sharing or authorises a directory key change. The list is cached until expiry.
 
 #### Type 7: AccountResetReceipt
 
@@ -422,7 +409,7 @@ Old and new ids must differ. For an unseen receipt the SDK requires a fresh key 
 
 ### 13. Client contract
 
-`open({ accountName, retentionPolicy, recoveryProvider, resetTrust, secretStore, store, transport, events })` loads protected local state and returns one asynchronous client. `retentionPolicy` is the profile's versioned policy: the global windows `deliveryWindowMs`, `appendRetryWindowMs`, `hygieneRotationMs`, `maxOutboxRecords` and `maxOutboxBytes`, and `kinds`, one declaration per record kind the product uses (section 9: `kind`, `retentionMs`, `queue`, `history`, `newest`); a missing or incomplete policy is rejected and the SDK never substitutes defaults. `resetTrust` carries the pinned management key and minimum list version. Public operations return typed results, never plaintext fallbacks. Randomness is internal in production. Adapters pass opaque bytes through unchanged. The host owns login, notifications, positioning, OS permissions and the interface; no plaintext location ever enters the directory or relay API.
+`open({ accountName, retentionPolicy, recoveryProvider, resetTrust, secretStore, store, transport, events })` loads protected local state and returns one asynchronous client. `retentionPolicy` is the profile's versioned policy: the global windows `deliveryWindowMs`, `appendRetryWindowMs`, `hygieneRotationMs`, `maxOutboxRecords` and `maxOutboxBytes`, and `kinds`, one declaration per record kind the product uses (section 9: `kind`, `retentionMs`, `queue`, `history`, `newest`, `headerClass`); a missing or incomplete policy is rejected and the SDK never substitutes defaults. `resetTrust` carries the pinned management key and minimum list version. Public operations return typed results, never plaintext fallbacks. Randomness is internal in production. Adapters pass opaque bytes through unchanged. The host owns login, notifications, sensing, OS permissions and the interface; no plaintext payload ever enters the directory or relay API.
 
 #### Public surface
 
@@ -448,7 +435,7 @@ Mutation outcomes are `COMMITTED`, `ALREADY_COMMITTED` (same bytes), `CONFLICT` 
 
 **Error families.** Parsing: `SIZE_LIMIT`, `MALFORMED`, `UNSUPPORTED_VERSION`, `UNSUPPORTED_TYPE`, `BAD_PAYLOAD`. Authentication: `INVALID_KEY`, `BAD_SIGNATURE`, `DECRYPT_FAILED`, `WRAP_HASH_MISMATCH`, `KEY_COMMITMENT_MISMATCH`. Trust and state: `ACCOUNT_KEY_CHANGED`, `ACCOUNT_RECOVERY_REQUIRED`, `DEVICE_ROLLBACK`, `DEVICE_ID_REUSED`, `SUPERSEDED_DEVICE`, `VAULT_BINDING`, `RESET_BINDING`, `RESET_KEYS_REQUIRED`, `RESET_KEY_REVOKED`, `RESET_CLOCK_UNTRUSTED`, `ROLLBACK`, `EQUIVOCATION`, `METADATA_REQUIRED`, `KEY_PENDING`, `NOT_AUTHORIZED`, `ROTATION_REQUIRED`, `COUNTER_EXHAUSTED`, `RECIPIENT_LIMIT`. Delivery: `CLOCK_SKEW`, `EXPIRED`, `QUEUE_FULL`, `CURSOR_OUT_OF_RANGE`, `STALE_APPEND`. Storage and transport: `LOCKED`, `RECOVERY_REQUIRED`, `STORAGE_FAILURE`, `NETWORK` plus the mutation outcomes. A transport raises `NETWORK`, which is retryable, for every failure to reach the host or to get an answer in time (connection errors, timeouts, server errors), so the client can tell a temporary loss of connectivity from a programming error, which it reports as unexpected and not retryable. Each error carries a retryable flag and a safe stage name. A wrong recovery secret fails authentication and never triggers a reset.
 
-**Safe logs.** Allowed fields: a random operation id, stage and result code, recovery provider status and reason, reset-key list version and expiry, device generation, circle and vault revision, epoch and counter, counts, byte lengths, duration and retry count. Never log locations, plaintext, seeds, `SK`, recovery codes, store keys, session tokens or vault plaintext. Account, circle and record ids are identifying metadata: keep them local or pseudonymise per session. Ciphertext and diagnostic exports are never uploaded automatically. There is no flag that disables verification.
+**Safe logs.** Allowed fields: a random operation id, stage and result code, recovery provider status and reason, reset-key list version and expiry, device generation, circle and vault revision, epoch and counter, counts, byte lengths, duration and retry count. Never log payloads, plaintext, seeds, `SK`, recovery codes, store keys, session tokens or vault plaintext. Account, circle and record ids are identifying metadata: keep them local or pseudonymise per session. Ciphertext and diagnostic exports are never uploaded automatically. There is no flag that disables verification.
 
 ### 15. Security properties and limits
 
@@ -456,7 +443,7 @@ Mutation outcomes are `COMMITTED`, `ALREADY_COMMITTED` (same bytes), `CONFLICT` 
 
 | Attacker | Can | Cannot |
 | --- | --- | --- |
-| Honest-but-curious server | See who shares with whom, when, how often, record sizes, header classes and `sentAt`; infer approximate location from network metadata | Read coordinates, event times, kinds, statuses or check-in content |
+| Honest-but-curious server | See who shares with whom, when, how often, record sizes, header classes and `sentAt`; infer approximate whereabouts from network metadata | Read any payload, event time or kind |
 | Malicious server | Substitute a key at an account's first contact; withhold removals, snapshots, certificates, vaults, key lists or records indefinitely; replay an old vault to a recovering device or an unexpired key list for its remaining lifetime; fork views between members; show an owner a join request the named account never made | Produce a document that verifies under a pinned key; roll back a generation, revision, epoch or list version a client has seen; decrypt anything |
 | Removed member | Keep the plaintext and keys it already holds | Open any epoch published after the author learned of the removal |
 | Former device of a member | Keep its own old history; keep opening the epochs it already holds keys for until each author rotates to the new device | Open any wrap addressed to the replacement device; publish as the account after the new certificate is known |
@@ -473,17 +460,17 @@ Mutation outcomes are `COMMITTED`, `ALREADY_COMMITTED` (same bytes), `CONFLICT` 
 5. Recovery trusts the server's latest vault. An existing device detects a rolled-back vault from its checkpoints; a fresh device cannot. The vault holds no decryption key, so a rolled-back vault costs circle pins and preferences, not plaintext; a restored old sharing preference re-enables sharing only to members the owner admitted.
 6. The reset authority can deny service until a key is removed from the list; a client that never syncs never learns the removal. Compromise of the management key requires an app update.
 7. A whole-device backup restored on a device with no surviving freshness anchor cannot always be recognised as old. This is not anti-rollback protection.
-8. Metadata, authorised-device leaks, positioning truth and the screens of members are outside payload confidentiality.
+8. Metadata, authorised-device leaks, the truth of what a device senses and the screens of members are outside payload confidentiality.
 9. Deletion on the server is a conforming-host policy the client cannot verify; the client's own deletion is what it controls.
-10. Delivery and notifications are availability properties, not cryptographic ones. A withholding server can delay a check-in; it cannot forge one.
+10. Delivery and notifications are availability properties, not cryptographic ones. A withholding server can delay a record; it cannot forge one.
 
 **Audit status.** Primitives are libsodium's and audited; the composition is not yet independently reviewed. The vectors in section 16 are implementation evidence, not an audit.
 
 ### 16. Conformance
 
-The companion package is the SS5 revision 2 `vectors.json` plus `verify_vectors.py`: a reproducible reference codec and small state model, not a production SDK. The Kavach v1 fixture in `spec/` is regenerated once from it, by a checker derived from the same source, with four changes: the maximum key-list lifetime is 30 days instead of 24 hours, so case K19 is re-derived at 30 days plus one millisecond; record flag bit 0 is reserved rather than meaning urgent, which leaves the core record untouched and re-derives only the maximum-size record, whose flags move from 1 to 2 (a check-in carrying an opaque 4,096-byte payload), with a new negative vector for bit 0; type 5 is retired, so its document vector is dropped and its wire joins the negative set as `UNSUPPORTED_TYPE`; and the vault entry lost its snapshot pins, so the vault vectors are re-derived with the 49-byte entry and the transfer token is gone. Every other section applies byte for byte, including the two core sealed boxes, the 100-account set, the phone replacement set and the reset-key management cases other than K19. Revision 8 regenerates every record vector once more: the plaintext under the AEAD is the envelope followed by the payload, the header's class bits replace the kind bits, the maximum-size record grows to 4,265 bytes, the length negative moves to 4,123, and the two-kind-bits negative becomes an envelope-version negative checked after decryption. The storage-row fixture is informative only.
+The companion package is the SS5 revision 2 `vectors.json` plus `verify_vectors.py`: a reproducible reference codec and small state model, not a production SDK. The Kavach v1 fixture in `spec/` is regenerated once from it, by a checker derived from the same source, with four changes: the maximum key-list lifetime is 30 days instead of 24 hours, so case K19 is re-derived at 30 days plus one millisecond; record flag bit 0 is reserved rather than meaning urgent, which leaves the core record untouched and re-derives only the maximum-size record, whose flags move from 1 to 2 (a kind 1 record carrying an opaque 4,096-byte payload), with a new negative vector for bit 0; type 5 is retired, so its document vector is dropped and its wire joins the negative set as `UNSUPPORTED_TYPE`; and the vault entry lost its snapshot pins, so the vault vectors are re-derived with the 49-byte entry and the transfer token is gone. Every other section applies byte for byte, including the two core sealed boxes, the 100-account set, the device replacement set and the reset-key management cases other than K19. Revision 8 regenerates every record vector once more: the plaintext under the AEAD is the envelope followed by the payload, the header's class bits replace the kind bits, the maximum-size record grows to 4,265 bytes, the length negative moves to 4,123, and the two-kind-bits negative becomes an envelope-version negative checked after decryption. The storage-row fixture is informative only.
 
-**What the fixture contains.** Five core signed documents spanning types 1 to 4 and 7; two sealed key boxes with their wrap hashes; a record whose plaintext is the envelope (kind 0, the fix time as event time) and a 22-byte location payload, with its AAD, ciphertext, signature and record id; the 100-account boundary set (snapshot 3,324 bytes, manifest 9,808 bytes, wraps 8,000 bytes, maximum record 4,265 bytes); device replacement (generation 2 certificate, unchanged snapshot, continued owner snapshot, new manifest and record, the old device failing to open the new wrap, superseded manifest detection); vault encryption and wrong-key rejection; durable check-ins surviving a later location; a slot-only record with header class 2 and no event time; an account reset receipt; three key lists with 22 reset-key management cases; 22 negative byte vectors; 3 wrap and key checks; 17 state-model transitions. Ed25519 and X25519 outputs are cross-checked with OpenSSL, XChaCha20-Poly1305 with PyCryptodome; sealed boxes use libsodium on both sides and are not an independent cross-check.
+**What the fixture contains.** Five core signed documents spanning types 1 to 4 and 7; two sealed key boxes with their wrap hashes; a record whose plaintext is the envelope (kind 0, with an event time) and the first profile's 22-byte payload, with its AAD, ciphertext, signature and record id; the 100-account boundary set (snapshot 3,324 bytes, manifest 9,808 bytes, wraps 8,000 bytes, maximum record 4,265 bytes); device replacement (generation 2 certificate, unchanged snapshot, continued owner snapshot, new manifest and record, the old device failing to open the new wrap, superseded manifest detection); vault encryption and wrong-key rejection; durable event records surviving a later record of a slot kind; a slot-only record with header class 2 and no event time; an account reset receipt; three key lists with 22 reset-key management cases; 22 negative byte vectors; 3 wrap and key checks; 17 state-model transitions. Ed25519 and X25519 outputs are cross-checked with OpenSSL, XChaCha20-Poly1305 with PyCryptodome; sealed boxes use libsodium on both sides and are not an independent cross-check.
 
 #### Required tests beyond the checker
 
@@ -493,7 +480,7 @@ The companion package is the SS5 revision 2 `vectors.json` plus `verify_vectors.
 - The handoff race: an authorization change committed by one context while another is between eligibility check and send never results in an upload of obsolete ciphertext, tested with the real transport adapter.
 - Lost device, two tests. Device keys only: the attacker holds `deviceSeed` and the store but not the account root; after the new device activates and every author has rotated, it opens nothing new. Full state: the attacker also holds `accountSeed` or `recoveryKey` with the vault; the test shows it can still authorise a device of its own, so replacement is not a repair and only reset ends it.
 - Acknowledgement: a `keyPending` record never advances the prefix while later records still flow; the relay never deletes a record while a required reader's cursor is below it; an equal or older cursor causes no write; a cursor above the tail is rejected; a reader is returned only records addressed to its certificate.
-- Relay: deliver counters 7 then 6 and keep the pin at 7; the record disappears when the last required reader's cursor passes it and at the window without one; expiry advances as a prefix and never expires a newer record; a blocked stream never delays another stream; a retry inside the window returns the original outcome after deletion; an append below the checkpoint without evidence is `STALE_APPEND` and the client marks it `acceptanceUnknown` without re-creating a check-in; a new device's subscription starts at activation and excludes records sealed to the old certificate; every member gets a subscription when an author opens a new stream; epoch blobs disappear only when no record references them and the epoch is not current; a check-in survives a later location end to end.
+- Relay: deliver counters 7 then 6 and keep the slot at 7; the record disappears when the last required reader's cursor passes it and at the window without one; expiry advances as a prefix and never expires a newer record; a blocked stream never delays another stream; a retry inside the window returns the original outcome after deletion; an append below the checkpoint without evidence is `STALE_APPEND` and the client marks it `acceptanceUnknown` without re-creating the record; a new device's subscription starts at activation and excludes records sealed to the old certificate; every member gets a subscription when an author opens a new stream; epoch blobs disappear only when no record references them and the epoch is not current; an event record survives a later record of a slot kind end to end.
 - Client reports and queries: a download that fails for one stream is one entry of the sync report and the other streams are still read; the same idempotency key from a retry or a second runtime yields one record and a new key a new one; history pages read through the index keep their order and cursor while records arrive and expire, and a store from before the index reads the same after its backfill.
 - Reset: the 22 key-management cases against the real clock adapter, plus wrong key, revoked key with a backdated receipt, binding mismatch, duplicate, conflicting binding, receipt without a verified certificate, expired list deferring a reset without pausing sharing, and no closure on a bare directory key change.
 
@@ -505,15 +492,15 @@ Revision 5 changes no wire byte and no vector. It corrects the durable-state rul
 
 #### Revision 6
 
-Revision 6 assigns flag bit 2 of the record header, reserved until now, to a third record kind, the status (section 9), and changes nothing else on the wire. The fixture's reserved-flag negative moves to bit 3, a negative with bits 1 and 2 both set is added, and a status record vector is added; every other vector is unchanged. Readers adopt revision 6 before any sender emits a status, since a revision 5 reader rejects one as malformed. Revision 6 also states three client-contract rules (section 13) that need no wire change: a failed download is reported, not counted as a synced stream; history is read through a time-ordered index with stable cursors (section 11); and an enqueue may carry an idempotency key.
+Revision 6 assigns flag bit 2 of the record header, reserved until now, to a third record kind (the first profile's state kind), and changes nothing else on the wire. The fixture's reserved-flag negative moves to bit 3, a negative with bits 1 and 2 both set is added, and a slot-only record vector is added; every other vector is unchanged. Readers adopt revision 6 before any sender emits the new kind, since a revision 5 reader rejects it as malformed. Revision 6 also states three client-contract rules (section 13) that need no wire change: a failed download is reported, not counted as a synced stream; history is read through a time-ordered index with stable cursors (section 11); and an enqueue may carry an idempotency key.
 
 #### Revision 7
 
-Revision 7 changes no wire byte and no vector. It changes one receiver rule: the live pin is chosen by measurement time within a device generation (section 10), where revision 6 chose it by (epoch, counter), so a sample measured earlier but sent later no longer moves a person's position back in time. The fixture's state cases S11 to S13 and S16 still hold, since equal measurements are ordered by (epoch, counter) and S16's older sample is also the earlier measurement. It also bounds a sync's reading with a budget and `hasMore` (section 13), states the durability guarantee of a keyed enqueue, keeps the sender's own live pin and status under the reader's rules (section 10), and moves the behaviour of each record kind out of the protocol into the product's declaration (section 9): retention, queue semantics, history and the newest slot are per kind in the policy, the two named history windows are gone, and the live pin and the status row are one newest-slot table.
+Revision 7 changes no wire byte and no vector. It changes one receiver rule: the newest slot is chosen by event time within a device generation (section 10), where revision 6 chose it by (epoch, counter), so a record with an earlier event time sent later no longer moves an author's newest backward. The fixture's state cases S11 to S13 and S16 still hold, since equal event times are ordered by (epoch, counter) and S16's older record is also the earlier event. It also bounds a sync's reading with a budget and `hasMore` (section 13), states the durability guarantee of a keyed enqueue, keeps the sender's own slots under the reader's rules (section 10), and moves the behaviour of each record kind out of the protocol into the product's declaration (section 9): retention, queue semantics, history and the newest slot are per kind in the policy, the two named history windows are gone, and the slots of every kind are one table.
 
 #### Revision 8
 
-Revision 8 changes the record plaintext and regenerates the record vectors (section 16); the header bytes and every other document are unchanged. An envelope of ten bytes precedes the payload under the AEAD: a version, the kind, and the event time the sender gave. The kind therefore leaves the header, whose two bits now carry the kind's declared header class, so a product may use up to 256 kinds and show the relay only what it chooses; both class bits set is legal. The newest slot orders by the envelope's event time, clamped to `sentAt`, in place of the location codec's capture time, so the SDK no longer reads any payload. The payload maximum stays 4,096 bytes; the ciphertext bounds move to 26 and 4,122. A revision 7 reader cannot open a revision 8 record, so a deployment moves every device before any sender emits one.
+Revision 8 changes the record plaintext and regenerates the record vectors (section 16); the header bytes and every other document are unchanged. An envelope of ten bytes precedes the payload under the AEAD: a version, the kind, and the event time the sender gave. The kind therefore leaves the header, whose two bits now carry the kind's declared header class, so a product may use up to 256 kinds and show the relay only what it chooses; both class bits set is legal. The newest slot orders by the envelope's event time, clamped to `sentAt`, in place of a field of the first profile's payload, so the SDK no longer reads any payload. With this revision the specification names no record kind: the first product's kinds and codecs moved to its profile. The payload maximum stays 4,096 bytes; the ciphertext bounds move to 26 and 4,122. A revision 7 reader cannot open a revision 8 record, so a deployment moves every device before any sender emits one.
 
 ### 17. Questions for the reviewer
 
@@ -524,9 +511,9 @@ Revision 8 changes the record plaintext and regenerates the record vectors (sect
 5. Reset-key lists with a 30-day maximum lifetime: is the window between a key compromise and the next list a tolerable denial-of-service exposure, and is the trusted-clock assumption acceptable on phones?
 6. Deletion when the last required reader's cursor passes a record, with one expiry prefix per stream: any attack the cumulative cursors or the acceptance-time ordering expose?
 7. The acknowledgement rule holds the prefix at a `keyPending` record while newer records are stored, and the relay filters by subscription. Is there a sequence where a reader acknowledges and still lacks plaintext it needs?
-8. The live pin advances on (generation, epoch, counter) while history accepts out-of-order counters. Is there a replay that moves the pin forward illegitimately?
+8. A newest slot advances on (generation, event time, epoch, counter) while history accepts out-of-order counters. Is there a replay that moves a slot forward illegitimately?
 9. A cross-process lock with the send call initiated inside it as the only serialisation of the handoff: sufficient on both mobile platforms' background execution models, and is a send that fails synchronously handled safely?
-10. Check-ins share the record counter and differ by one authenticated bit. Should they have their own stream instead?
+10. Every kind shares the record counter and differs only inside the envelope, with two header bits of class. Should a product's event kinds have their own stream instead?
 11. What should the first external audit cover beyond the composition: the recovery flows, the host atomicity, or the platform adapters?
 
 ### Appendix. Scenario tests that gate release
@@ -552,157 +539,14 @@ Each scenario is an executable test against the real client with a fake host; th
 17. Membership changes while an epoch is in flight: the epoch commits obsolete; enqueue returns `ROTATION_REQUIRED`; the next epoch promotes.
 18. Crash after T6 and before send: restart retries the exact wire; crash after a membership change cancels it with a disposition.
 19. Handoff race: a membership change committed by a background context while the foreground sender is between its check and its send never produces an upload sealed for the old audience.
-20. Deliver counters 7 then 6: both in history, pin stays at 7.
+20. Deliver counters 7 then 6: both in history, the slot stays at 7.
 21. Record arrives while offline before its epoch could be fetched: `keyPending`, the acknowledged prefix holds, later records are stored, the epoch is fetched on the next sync and the record is read again and opened; the relay still held it.
 22. Last recipient acknowledges: the record is gone from the relay; the epoch blobs are gone once the epoch is not current and nothing references it.
 23. A recipient stays away past the window: the record is deleted unacknowledged; the author's history still has it.
-24. Check-in, then two locations: three records delivered; the check-in survives on relay and reader; the pin is the last location; recipients were notified of the check-in visibly and of the locations silently.
+24. A record of an event kind, then two of a slot kind: three records delivered; the event survives on relay and reader; the slot holds the last record; recipients were notified by header class, visibly for the event and silently for the others.
 25. Two execution contexts enqueue concurrently: counters are unique and the outbox order is preserved.
 26. Hygiene rotation at the configured interval and counter exhaustion: both produce a new epoch and `refresh`.
-27. Superseded device sends after its replacement activated: the relay refuses; a reader that receives it anyway stores history only and keeps the pin.
+27. Superseded device sends after its replacement activated: the relay refuses; a reader that receives it anyway stores history only and keeps the slot.
 28. An approval whose publication completes after the user disabled sharing: sharing stays disabled and the next epoch names no member.
-29. A removal, close, preference change or reset whose publication failed or whose response was lost: the next sync completes it, and a replacement phone restores the result, vault included.
+29. A removal, close, preference change or reset whose publication failed or whose response was lost: the next sync completes it, and a replacement device restores the result, vault included.
 30. A peer that dies between accepting a reset receipt and acting on it: after restart the circles the old identity owned are closed and its pin is gone.
-
-## Part II: Moyo implementation profile
-
-How Moyo's Expo app and Cloudflare Worker implement the Kavach v1 protocol: platform adapters, server mapping, retention values, product behaviour and release gates.
-
-**Contents**
-
-- 1. What this profile decides
-- 2. Retention policy
-- 3. Client adapters (Expo)
-- 4. Server (Cloudflare Worker)
-- 5. Product behaviour the protocol depends on
-- 6. Release gates and device tests
-- 7. Build order
-
-### 1. What this profile decides
-
-The protocol specification states requirements and leaves the host to choose how to meet them. Moyo's choices are:
-
-| Decision left to the host | Moyo's choice |
-| --- | --- |
-| Protected secret store | Expo SecureStore with device-only accessibility for `accountSeed`, `deviceSeed`, `recoveryKey`, `storageKey` and the store instance id. |
-| Encrypted transactional store | Expo SQLite with SQLCipher, keyed by `storageKey`, WAL, `synchronous = FULL`. Write transactions use `BEGIN IMMEDIATE`; the outbound handoff is initiated inside the transaction. |
-| Cross-process writer lock | SQLite's own file lock under `BEGIN IMMEDIATE`. No native lock module. |
-| Platform recovery provider | Apple synced Keychain on iOS. Android Block Store with the end-to-end encryption check on Android, required for release. |
-| Directory and relay | A Cloudflare Worker: D1 for the directory, one `UserDO` per author as the relay, `CircleDO` for presence and wake-ups. |
-| Notifications | Expo push. Visible for a join request (to the owner) and a check-in (to each recipient); silent otherwise. |
-| Reset authority | An operational key as a Worker secret; a management key kept offline that signs a new key list every 14 days with a 30-day lifetime. |
-| Retention | The values in section 2, supplied to `open()` as a versioned policy. |
-| Sync interval | 60 seconds while the app is online and running, plus hints and background wake-ups. |
-
-Everything the protocol forbids remains forbidden here. Where this document and the protocol disagree, the protocol wins and this document has a bug.
-
-### 2. Retention policy
-
-Moyo passes the following `RetentionPolicy` to `open()`. The values are proposals to confirm before release; the shape is fixed by the protocol.
-
-| Field | Proposed value | Meaning |
-| --- | --- | --- |
-| `deliveryWindowMs` | 24 hours | How long the relay keeps a record for readers that have not acknowledged it, from acceptance. One window for locations and check-ins keeps expiry a prefix per stream. A reader away longer returns to an empty trail until the next update, which arrives within a minute from an online author. The phone also remembers an enqueue idempotency key for this long. |
-| `appendRetryWindowMs` | 7 days | How long the relay keeps the last-append outcome per stream, so a phone that was offline can finish an uncertain upload with the original result. |
-| `hygieneRotationMs` | 30 days | Rotate an epoch that nothing else has rotated. Daily was rejected: a re-wrap to every recipient every day for no realistic threat. |
-| `maxOutboxRecords` | 2,000 | Backpressure on the outbox. |
-| `maxOutboxBytes` | 4 MiB | Backpressure on the outbox. |
-
-And the three kinds Moyo declares in the same policy:
-
-| Kind | Number | `retentionMs` | `queue` | `history` | `newest` |
-| --- | --- | --- | --- | --- | --- |
-| Location | 0 | 24 hours | `keepAll` | yes | yes (the live pin) |
-| Check-in | 1 | 30 days | `keepAll` | yes | no: every check-in is news |
-| Status | 2 | 24 hours | `latestWins` | no | yes |
-
-Delivery deadlines use the relay's acceptance time plus the window; the Worker enforces it. History retention counts from `sentAt`; the encrypted `capturedAt` is what the user sees and what chooses the live pin within a device generation. The pin is the location kind's newest slot, so a pin older than the location kind's `retentionMs` leaves the map and the person shows as last seen with no position. Acknowledgements are coalesced: at most one `ackThrough` per stream per fetch batch, delayed at most 60 seconds, which is a Moyo setting and not a policy field. Changing the policy purges only data outside the new windows, with an explicit disposition for undelivered records. Past days in R2 and the server-side trail in the user's Durable Object disappear from Moyo's backend; the trail a reader sees is the one its own phone received.
-
-### 3. Client adapters (Expo)
-
-#### Secrets
-
-`accountSeed`, `deviceSeed`, `recoveryKey`, `storageKey` and the 16-byte store instance id live in Expo SecureStore with device-only accessibility. Only the `recoveryKey` is ever placed in a synced platform item, through the recovery provider below. Only the foreground app creates the `storageKey` on first run, and one creation at a time per account; a background context that finds none stops with `LOCKED` and tries again on its next wake, so two contexts can never key one database differently. The database file, device seed, counters and outbox are excluded from iCloud backup and Android Auto Backup.
-
-#### Store
-
-One SQLite database opened through Expo SQLite with SQLCipher, keyed by the hex `storageKey`, in WAL mode with `synchronous = FULL`. SQLCipher gives encryption at rest for every row, so there is no second per-value encryption layer. The `meta` row binds schema version 1, the store instance id, `identityId` and the current `certificateHash`, as the protocol requires, and marks the history index as built; a database from before the index is indexed once on open. Every logical table is a key-value table of JSON rows, and the ordered key range the protocol's bounded reads need is one indexed SQL query with a limit.
-
-Every SDK write runs inside `BEGIN IMMEDIATE`. SQLite's file lock then serialises writers across the foreground app, the background location task and any headless context, without a native module. The adapter's `transaction(fn)` lets the callback start the transport's `send` before the transaction commits, which is what the protocol's handoff rule (T6h) needs; the callback is synchronous and never awaits the response inside. The busy timeout is finite, and a writer that cannot acquire the lock fails with `LOCKED`, which is retryable.
-
-#### Recovery providers
-
-**iOS.** A native Keychain generic-password item with `kSecAttrSynchronizable` true, `kSecAttrAccessibleWhenUnlocked` and the app's access group, keyed by account name plus identity id, holding the 32-byte `recoveryKey`, through a small config plugin. Ordinary Expo SecureStore does not establish iCloud sync. Logout erases local access without deleting the shared item; `eraseLocalAccess()` never means delete the cloud entry. Reset saves a new entry under the new identity id.
-
-**Android.** A native Block Store provider, required before the Android release. The entry is named `"ss5.recovery." || hex(identityId)` with value `u8(1) || B(accountName) || identityId[32] || recoveryKey[32]`. Before enabling cloud backup, await `isEndToEndEncryptionAvailable()`; only `true` permits `storeBytes` with cloud backup. On false, error or absent services the existing entry is left untouched and a visible reason is returned; never retry by writing the same entry without cloud backup, which can delete a prior cloud copy. A successful store reports `backupState = pending`. The provider never advertises Keystore or SecureStore as synced recovery and never places the secret in unprotected Auto Backup.
-
-#### Clock, background work and transport
-
-Randomness is the Web Crypto global, which Hermes lacks: the app passes `expo-crypto`'s `getRandomValues` to the setup helper, which installs it once and never substitutes a weaker source; without one, opening fails before any key is made. A clock adapter keeps a durable time high-water mark and monotonic elapsed time for the reset-key list rules. The background location task, Moyo's own code on top of `enqueue`, sends each new sample as kind 0 with its fix time as the event time and an idempotency key derived from the sample's timestamp so a batch the OS redelivers to a fresh process makes no second record, and then `sync` under the SDK's default budget of 500 records and 5 seconds; while the report says `hasMore`, the app syncs again at once, in the background task as in the foreground. A sync report's `errors` are logged by operation and code, never by content. The transport is Moyo's authenticated fetch and sockets; its `send` queues the bytes synchronously and returns a promise, so it can be initiated inside T6h. Connectivity and push hints stay in the app, which calls `sync` when they arrive.
-
-### 4. Server (Cloudflare Worker)
-
-| Component | Responsibility |
-| --- | --- |
-| Directory (D1) | Accounts keyed by `accountName` with the current certificate pointer and generation; immutable certificates by hash; snapshots by `circleId` with compare-and-swap on revision and hash; vaults by account with compare-and-swap on revision and hash; pending join and leave requests by circle and account, expiring after 7 days; reset receipts by `resetId`; the current reset-key list. Sessions authenticate the account and its current device; a superseded device is refused every write. Activation emits a metadata hint to every circle the account is in. `registerAccount` answers `ALREADY_COMMITTED` for a name that already carries exactly the submitted certificate, and `resetAccount` checks the `resetId` before the identity. |
-| Relay (`UserDO`) | One Durable Object per author: current epoch and fence; the author's retained records keyed by `deliverySeq` with their acceptance time; one subscription row per reader device with its `ackCursor`; the `expiredThrough` watermark; the manifests and wraps of every epoch that is current or still referenced by a retained record; the per-stream high-water (epoch, counter) pair and last-append outcome. `readRecords` filters by the subscription's certificate. `appendRecord`, `readRecords` and `ackThrough` run here. Deletion on a cursor advance runs inline in the same transaction; the expiry prefix advances on an alarm. The Durable Object's single-threaded storage transaction gives the serialisation the protocol requires without extra locking. |
-| Fan-out (`CircleDO`) | Presence and wake-ups only: on append, notify each recipient's socket that its mailbox has new sequence numbers. It stores no record. |
-| Notifications | Silent pushes wake a closed app for locations and key handoffs; a status append sends nothing. Two events are visible notifications through Expo push: a join request, sent to the owner with the requester's name, and a check-in, sent to each recipient with the sender's name and the app's generic wording. Neither carries a coordinate or a payload. Notification permission is asked for these two and the app's own alerts. |
-| Reset authority | An endpoint that, after fresh re-authentication, signs the type 7 receipt with the active operational key held as a Worker secret. The management key signs a new type 8 list offline every 14 days with a 30-day lifetime; `app.config.ts` pins the management public key and the minimum list version. A standby operational key stays offline until the active one is retired by a new list. |
-| Removed | The server-side trail in the user's Durable Object, past days in R2, device lists, pending devices, key requests, archives and the circle log tables. The Worker keeps no location after delivery. |
-
-`./scripts/seed.sh` creates two accounts and a circle against the local Worker. The reference host in the SDK repository's `examples/host-worker` is the pattern for these endpoints and is tested in workerd.
-
-### 5. Product behaviour the protocol depends on
-
-- **Signup never asks for the recovery code.** The account is created, the provider saves the key, and the Account screen shows a recovery status from `backupState`: backed up to iCloud, backed up to Google, or not backed up yet. Only in the last case does the app later prompt, gently, to save the code. The code is always available in settings behind local authentication.
-- **A new phone shows people as they arrive.** After `restoreAccount`, the map shows each circle member as "waiting for their phone" while that author's current epoch has no key for the new device, until the author's next sync delivers one. Online authors arrive within a minute; offline ones when they wake. The app never shows a blank map or a stale pin as live.
-- **A pin older than a day leaves the map.** With a 24-hour history and a 24-hour delivery window, a person silent for a day shows as last seen with no position rather than a day-old dot. A reader back after a weekend sees each person again on their next update.
-- **Join requests notify the owner.** The owner's approval screen opens from the notification. Approval is one tap; the requester starts sharing on approval unless they turned that off when requesting.
-- **Check-ins notify recipients visibly.** The notification carries the sender's name and generic wording; the app decrypts the check-in when opened. Locations and statuses never notify.
-- **Phone facts travel as statuses.** Battery, charging, Low Power Mode, mock location and location permission are a status record (kind 2) with the payload and send rules below, shown next to the person's pin with its age. A reader who just joined sees them with the first location after admission, because the app sends a status whenever the SDK asks it for a fresh location.
-
-#### Status payload and send rules
-
-```
-payload = version:u8 = 1 || batteryPercent:u8 (0-100, 255 unknown) || flags:u8 || permission:u8   -- 4 bytes
-flags   : bit 0 charging, bit 1 Low Power Mode, bit 2 mock location, bit 3 precise location; bits 4-7 zero
-permission : 0 unknown, 1 denied, 2 while in use, 3 always
-```
-
-Unknown versions are shown as "no details" and never rejected: the SDK does not parse the payload, and a newer phone's status must not break an older reader. The app sends on change, with thresholds that make change rare, and a slow floor so a fresh reader is never left with nothing:
-
-| Trigger | When |
-| --- | --- |
-| Battery level | When it crosses a 5 percent step, and immediately at 20 and 10 percent |
-| Charging started or stopped | Immediately |
-| Low Power Mode on or off | Immediately |
-| Location permission or precision changed | Immediately, since it explains a dot that stops moving |
-| The SDK asks for fresh records (`refresh`) | With the next location, so a new member or a new epoch starts with the phone facts |
-| Floor | Once per app start, and at most every 6 hours if nothing changed |
-| Ceiling | Never more than one per minute; the outbox collapses bursts anyway |
-
-That is five to fifteen statuses per phone per day against a few hundred locations.
-- **Leaving a circle takes effect locally at once.** The leaver stops sending and stops seeing that circle's members immediately; the owner's removal follows when the owner is next online.
-- **One active phone.** Setting up the app on a second phone retires the first. The settings screen says so before activation.
-- **Reset is a last resort with a warning.** The reset screen states that circles owned by this account will close and that every other circle will need to re-admit the account.
-
-### 6. Release gates and device tests
-
-These tests are in addition to the protocol's conformance package and scenario list. Each is run on real devices and its result recorded with device, OS and Play services versions.
-
-| Gate | Evidence required |
-| --- | --- |
-| Android recovery | Restore the Play-distributed app and its Block Store entry to a second supported Android device through cloud restore, with no old phone and no code. Decrypt the vault, preserve owner and member identity, activate fresh device keys, receive future updates. Also exercise end-to-end check false and error, absent Play services, no screen lock, backup disabled or delayed, wrong Google account, wrong Moyo account, missing entry, capacity exhaustion, process death during save, and retirement without deleting the shared entry. |
-| iOS recovery | The same restore through synced Keychain to a second iPhone, with iCloud Keychain off and delayed, wrong Apple account, app reinstall and biometric changes. |
-| Durable state | The SDK's crash and lost-response sweeps (`@kavach/core/testing`) against the real SQLCipher database on both platforms, so the protocol's crash outcomes hold there. Race the foreground app and the background location task through `BEGIN IMMEDIATE`. The handoff race with the real transport adapter: an authorization change committed by one context while the other is between its check and its send never produces an upload sealed for the old audience. |
-| Lost phone | With the complete old-phone state in the attacker's hands, after activation and every author's rotation the attacker opens nothing new. |
-| Relay | In workerd: a record is deleted when the last required reader's cursor passes it and at the window without one; an equal or older cursor writes nothing; expiry advances as a prefix; a retried append inside the window returns the original outcome after deletion; a stale append is refused without reinsertion; a cursor above the tail is rejected; a replacement device's subscription excludes records sealed to the old certificate; members get subscriptions when an author opens a new stream; epoch blobs go only when no record references them and the epoch is not current; a check-in survives a later location; a join request and a check-in each produce exactly one visible notification with no coordinate. Measured: Durable Object writes per delivered record at 1, 10 and 100 readers, recorded before and after acknowledgement coalescing. |
-| Performance | On one mid-range iOS and one mid-range Android device: full 100-account rotation, 100-person receiving load, cold start, activation and time to a full map with five authors online, storage growth, memory and battery, p50 and p95 recorded. No unmeasured speed claim appears in release notes. |
-| End to end | Maestro flows for create, join with the owner's notification, approve, phone replacement on a second emulator with per-person waiting pins that fill in, removal and a check-in notification. |
-
-An independent review of the composed protocol, the recovery flows, the store binding, the handoff serialisation and the Worker's atomicity precedes production.
-
-### 7. Build order
-
-The build sequence document lists nineteen steps from primitives to Moyo integration, each with what to write, what to test and what comes next. The order is: primitives and codec against the vectors; identity, vault, membership and audience; epochs, records, the store and the two sides of delivery; reset; the client; the Expo adapters; the reference host; the fault harness; benchmarks; and finally the Moyo integration, which replaces `packages/sealed`, reshapes `UserDO` and `CircleDO`, removes the server-side history, and adds the Account settings entries for recovery status and the recovery code.

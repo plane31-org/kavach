@@ -1,6 +1,6 @@
 # Kavach reference host
 
-A Cloudflare Worker that implements the directory and relay contract of the Kavach v1 protocol (Part I, section 13) so the SDK repository can run its own end-to-end tests, and so the first production host can be built from a working pattern. It is an example, not a product: it is not published, it has no real login, and it records notifications instead of sending them.
+A Cloudflare Worker that implements the directory and relay contract of the Kavach v1 protocol (`spec/Kavach-v1.md`, section 13) so the SDK repository can run its own end-to-end tests, and so the first production host can be built from a working pattern. It is an example, not a product: it is not published, it has no real login, and it records notifications instead of sending them.
 
 | Part | Where | What it holds |
 | --- | --- | --- |

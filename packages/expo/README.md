@@ -1,6 +1,6 @@
 # @kavach/expo
 
-The adapters an Expo app supplies to `@kavach/core`, as the Moyo implementation profile (Part II of `spec/Kavach-v1.md`, section 3) describes them. Each adapter is written against a small structural interface so it can be tested in Node with a fake, and driven on a device by the real module.
+The adapters an Expo app supplies to `@kavach/core`, as the first implementation profile (`spec/Kavach-v1-Moyo-profile.md`, section 3) describes them; `spec/Profile-template.md` lists what any product's profile decides. Each adapter is written against a small structural interface so it can be tested in Node with a fake, and driven on a device by the real module.
 
 | Adapter | Over | Status |
 | --- | --- | --- |
