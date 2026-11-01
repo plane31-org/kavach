@@ -70,7 +70,7 @@ describe("BlockStoreRecoveryProvider", () => {
     expect(value.length).toBe(1 + 1 + 5 + 32 + 32);
     expect(value[0]).toBe(1);
     expect(decodeBlockStoreValue(value)?.accountName).toBe("alice");
-    expect(blockStoreKey(iid)).toBe("ss5.recovery." + toHex(iid));
+    expect(blockStoreKey(iid)).toBe("kavach.recovery." + toHex(iid));
     const bs = fake(true);
     const p = new BlockStoreRecoveryProvider(bs);
     expect(await p.save("alice", iid, key)).toEqual({ status: "available", backupState: "pending" });

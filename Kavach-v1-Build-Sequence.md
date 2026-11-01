@@ -40,7 +40,7 @@ Next: the vault.
 
 ## Step 4: vault and recovery code
 
-Write: `core/src/vault.ts`: build and open the type 6 vault, entry sort and uniqueness, the revision rule, `SS5R-` code encode and decode with strict base64url. A `RecoveryProvider` interface with the five statuses and `backupState`. The recovery order: provider, code, then `ACCOUNT_RECOVERY_REQUIRED`.
+Write: `core/src/vault.ts`: build and open the type 6 vault, entry sort and uniqueness, the revision rule, `KV1R-` code encode and decode with strict base64url. A `RecoveryProvider` interface with the five statuses and `backupState`. The recovery order: provider, code, then `ACCOUNT_RECOVERY_REQUIRED`.
 
 Test: the recovery fixture opens with the right key and fails with the wrong key as `DECRYPT_FAILED`; the code is 48 characters; an in-memory provider drives the recovery order; opening the vault yields no encryption key.
 

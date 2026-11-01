@@ -102,7 +102,7 @@ All integers are big-endian and fixed width: u8, u16, u32, u64 unsigned, i32 two
 | Records, vaults | XChaCha20-Poly1305 with a 32-byte key, a fresh random 24-byte nonce and the 16-byte tag appended. |
 | Key wraps | libsodium `crypto_box_seal`: 32-byte `SK` becomes an 80-byte box. The nonce inside is BLAKE2b with 24-byte output over the ephemeral and recipient public keys, as libsodium defines it. |
 
-The label prefix `SealedStream/5/`, the wire version byte 5 and the `SS5R-` recovery-code prefix keep the protocol's earlier name on purpose: Kavach v1 renames the SDK and the documents, not the wire, so every revision 2 vector still applies byte for byte.
+The label prefix `SealedStream/5/` and the wire version byte 5 keep the protocol's earlier name on purpose: the prefix is hashed into every signature and every encryption's associated data, so Kavach v1 renames the SDK and the documents, not the wire, and every revision 2 vector still applies byte for byte. Names outside the wire carry Kavach's: the recovery code starts with `KV1R-` and a platform recovery entry with `kavach.recovery.` (revision 8; they were `SS5R-` and `ss5.recovery.` before).
 
 #### Keys
 
@@ -192,7 +192,7 @@ Encrypt under `recoveryKey`. Revision is at least 1; ciphertext length is 90 to 
 #### Recovery order
 
 1. **Platform recovery provider.** The platform's synced secret store hands back the `recoveryKey` for this account on a new device signed into the same platform account. No code, no old device.
-2. **Saved recovery code.** `"SS5R-" || base64url(recoveryKey)`, 48 characters, available on demand after local authentication. It opens the latest vault the server returns and has no freshness anchor.
+2. **Saved recovery code.** `"KV1R-" || base64url(recoveryKey)`, 48 characters, available on demand after local authentication. It opens the latest vault the server returns and has no freshness anchor.
 3. **Explicit destructive reset** (section 12), only when the user confirms, never automatically.
 
 Every path yields the same account key, circles and preferences, and fresh device keys. When both recovery paths fail the SDK returns `ACCOUNT_RECOVERY_REQUIRED` and preserves the circle state it cannot use. It never manufactures replacement identity keys. Enrollment never blocks on the recovery code: the SDK saves the key through the provider and returns; the code is offered later as the way to complete recovery when the provider cannot.

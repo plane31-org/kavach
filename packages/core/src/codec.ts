@@ -626,7 +626,7 @@ function unbase64url(text: string): Uint8Array | undefined {
   return Uint8Array.from(out);
 }
 
-/** `"SS5R-" || base64url(recoveryKey)`, 48 characters, no padding. */
+/** `"KV1R-" || base64url(recoveryKey)`, 48 characters, no padding. */
 export function encodeRecoveryCode(recoveryKey: Uint8Array): string {
   if (recoveryKey.length !== KEY_BYTES) throw new KavachError("INVALID_KEY", "recoveryCode");
   return RECOVERY_CODE_PREFIX + base64url(recoveryKey);

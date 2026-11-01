@@ -380,7 +380,7 @@ describe("account vault and recovery code", () => {
     expect(encodeRecoveryCode(rk)).toBe(rv.recovery_code);
     expect(rv.recovery_code.length).toBe(48);
     expect(toHex(decodeRecoveryCode(rv.recovery_code))).toBe(rv.recovery_key);
-    expect(code(() => decodeRecoveryCode("SS5T-" + rv.recovery_code.slice(5)))).toBe("MALFORMED");
+    expect(code(() => decodeRecoveryCode("KV1T-" + rv.recovery_code.slice(5)))).toBe("MALFORMED");
     expect(code(() => decodeRecoveryCode(rv.recovery_code + "A"))).toBe("MALFORMED");
     expect(code(() => decodeRecoveryCode(rv.recovery_code.slice(0, -1) + "+"))).toBe("MALFORMED");
     expect(code(() => decodeRecoveryCode(rv.recovery_code.slice(0, -1) + (rv.recovery_code.endsWith("A") ? "B" : "A")))).not.toBe("ACCEPTED_WRONG");

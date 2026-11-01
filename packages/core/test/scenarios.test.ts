@@ -281,7 +281,7 @@ describe("scenarios 8 to 10: enrollment and recovery", () => {
     expect((await a.client.recoveryStatus()).backupState).toBe("unavailable");
     await enqueueLocation(a.client, loc(w.clock));
     expect((await a.client.sync()).outbox.accepted).toBe(1);
-    expect((await a.client.recoveryCode()).startsWith("SS5R-")).toBe(true);
+    expect((await a.client.recoveryCode()).startsWith("KV1R-")).toBe(true);
   });
 
   it("9 and 10: platform recovery to a second device; a wrong platform account yields unavailable; both paths failing preserves circles", async () => {
@@ -291,7 +291,7 @@ describe("scenarios 8 to 10: enrollment and recovery", () => {
     expect(await code(() => wrong.client.restoreAccount())).toBe("ACCOUNT_RECOVERY_REQUIRED");
     expect(w.host.accounts.get("alice")?.generation).toBe(1n);
     expect(w.host.circles.get(toHex(circleId))?.closed).toBe(false);
-    const wrongCode = "SS5R-" + "A".repeat(43);
+    const wrongCode = "KV1R-" + "A".repeat(43);
     expect(await code(() => wrong.client.restoreAccount(wrongCode))).toBe("DECRYPT_FAILED");
     // The right code works even on the wrong platform account.
     const right = await w.device("alice", new Platform("someone-else@platform"));

@@ -1,7 +1,7 @@
 /**
  * The Android recovery provider over Block Store (profile section 3).
  *
- * The entry is named `ss5.recovery.<hex identityId>` and holds
+ * The entry is named `kavach.recovery.<hex identityId>` and holds
  * `u8(1) || B(accountName) || identityId[32] || recoveryKey[32]`. Before storing with cloud
  * backup the provider awaits `isEndToEndEncryptionAvailable()`; only `true` permits it. On
  * false, error or absent services the existing entry is left untouched and a reason is
@@ -19,7 +19,7 @@ export interface BlockStoreLike {
   delete(key: string): Promise<void>;
 }
 
-export const BLOCK_STORE_PREFIX = "ss5.recovery.";
+export const BLOCK_STORE_PREFIX = "kavach.recovery.";
 const VERSION = 1;
 
 export function blockStoreKey(identityId: Uint8Array): string {

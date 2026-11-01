@@ -143,7 +143,7 @@ describe("recovery order", () => {
     expect(await outcome(() => recoverAccount({ ...base, provider: p }))).toBe("ACCOUNT_RECOVERY_REQUIRED");
     const wrongCode = encodeRecoveryCode(newRecoveryKey());
     expect(await outcome(() => recoverAccount({ ...base, provider: p, recoveryCode: wrongCode }))).toBe("DECRYPT_FAILED");
-    expect(await outcome(() => recoverAccount({ ...base, provider: p, recoveryCode: "SS5R-not-a-code" }))).toBe("MALFORMED");
+    expect(await outcome(() => recoverAccount({ ...base, provider: p, recoveryCode: "KV1R-not-a-code" }))).toBe("MALFORMED");
   });
 
   it("a wrong platform account yields unavailable, never a new account", async () => {

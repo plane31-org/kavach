@@ -26,7 +26,7 @@ export const PUBLIC_KEY_BYTES = 32;
 export const SEALED_BOX_BYTES = 80;
 export const DEVICE_ID_BYTES = 16;
 /** Recovery code prefix, also kept from the earlier name. */
-export const RECOVERY_CODE_PREFIX = "SS5R-";
+export const RECOVERY_CODE_PREFIX = "KV1R-";
 
 export type Label =
   | "identity"

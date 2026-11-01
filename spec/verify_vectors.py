@@ -267,10 +267,10 @@ def open_epoch(wire,author,recipient,wrap):
     return key
 
 def recovery_text(key):
-    return 'SS5R-'+base64.urlsafe_b64encode(key).decode().rstrip('=')
+    return 'KV1R-'+base64.urlsafe_b64encode(key).decode().rstrip('=')
 
 def parse_recovery_text(text):
-    if not text.startswith('SS5R-'):raise Bad('MALFORMED')
+    if not text.startswith('KV1R-'):raise Bad('MALFORMED')
     value=text[5:]
     if not re.fullmatch(r'[A-Za-z0-9_-]+',value):raise Bad('MALFORMED')
     try:raw=base64.urlsafe_b64decode(value+'='*((-len(value))%4))
