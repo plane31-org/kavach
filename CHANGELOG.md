@@ -2,9 +2,13 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
-## Unreleased
+## 0.2.0
 
 Protocol revision 9: account recovery (amendment A1, adopted). No existing wire byte or vector changes; a revision 8 device interoperates with a revision 9 host and with revision 9 peers until a succession occurs, which a revision 8 peer sees as a bare key change.
+
+**What this release is.** Until now a replacement phone proved it was the same account by holding the account key, recovered from the platform's synced secret store or the recovery code (identity continuity). This release adds a second way, decided per product: a phone with no secret from the old one generates fresh keys, and the host's signing authority, after the product's own fresh authentication, signs a succession that binds the account to them (account recovery). Peers verify the succession and rotate exactly as they do for a device change; circle ids, membership, ownership and pending requests are unchanged; the old phone is fenced and cannot read anything new. The price is explicit and the product's to accept: an authority that can sign successions can rebind any account, and through an owner's account inherit the owner's power over membership. The specification states that guarantee and its limits (section 15), and a product declares in its profile which models it enables; the SDK supports every model and records no product's choice.
+
+**Upgrading from 0.1.x.** Add `replacement: "continuity" | "recovery" | "both"` to the retention policy; `open` refuses a policy without it. `continuity` keeps 0.1.x behaviour exactly. `ClientState.identityId` and `Inspection.identityId` are now the account id (constant across successions); the identity of the current key is `keyIdentityId`. Hosts implementing `Directory` gain four methods and two optional fields on `ResolvedAccount`; the reference Worker ships the migrations. A `recovery`-only profile may omit `recoveryProvider`. The review of this release ran six rounds against targeted reproductions; every finding is a regression test in `packages/core/test/review9.test.ts` and the Worker's `race.test.ts` and `streamOpen.test.ts`.
 
 - A profile declares `replacement: "continuity" | "recovery" | "both"` in its retention policy; the SDK supports every model and records no product's choice. Peers enforce the declaration: a continuity-only deployment refuses every succession and keeps a changed key quarantined.
 - `prepareReplacement()` and `completeReplacement({ successionId, authorization })` replace an account's keys on a device with no secret from the old one, under a succession the host's authority signs after the product's fresh authentication; the device then discovers its circles through the host inside `sync()`. `restoreAccount()` (identity continuity) stays and now resolves the account id through the chain.
