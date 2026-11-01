@@ -1,7 +1,9 @@
 name: publish
-# Publishes @plane31/blind-relay and @plane31/blind-relay-expo to npm with provenance when a version tag
-# is pushed (v0.1.0 for package version 0.1.0). Needs the NPM_TOKEN secret: an automation token
-# for the plane31 organisation. Nothing publishes from a laptop.
+# Publishes @plane31/blind-relay and @plane31/blind-relay-expo to npm when a version tag is pushed
+# (v0.1.3 for package version 0.1.3), through npm trusted publishing: each package names this
+# repository and this workflow file as its trusted publisher, and npm exchanges the run's GitHub
+# identity (the id-token permission below) for a short-lived publish token. No npm token is stored,
+# and provenance is attached automatically. Nothing publishes from a laptop.
 on:
   push:
     tags: ["v*"]
@@ -41,8 +43,16 @@ jobs:
       - run: pnpm --filter "./packages/*" build
       - name: packed-package smoke test
         run: scripts/smoke.sh
+      # Trusted publishing needs npm 11.5.1 or later; the runner's Node 22 ships npm 10.
+      - run: npm install -g npm@11
+      # pnpm packs (it rewrites the Expo package's workspace dependency to the real version, as the
+      # smoke test checked); npm publishes, since npm is the client that performs the identity
+      # exchange. Core first: the Expo package depends on it at exactly the same version.
       - name: publish
-        run: pnpm --filter "./packages/*" publish --access public --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_PROVENANCE: "true"
+        run: |
+          out="$RUNNER_TEMP/release"
+          mkdir -p "$out"
+          (cd packages/core && pnpm pack --pack-destination "$out")
+          (cd packages/expo && pnpm pack --pack-destination "$out")
+          npm publish "$out"/plane31-blind-relay-[0-9]*.tgz --access public
+          npm publish "$out"/plane31-blind-relay-expo-[0-9]*.tgz --access public
