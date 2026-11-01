@@ -92,14 +92,19 @@ export {
 export type {
   AppendOutcome,
   AppendStatus,
+  CircleListing,
+  CirclePage,
   Directory,
   EpochBundle,
   JoinRequest,
   MutationOutcome,
   MutationStatus,
+  PreferenceOutcome,
   ReadRecordsResult,
   Relay,
   ResolvedAccount,
+  SuccessionLink,
+  SuccessionPage,
   Transport
 } from "../transport.js";
 

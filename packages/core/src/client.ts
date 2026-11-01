@@ -6,7 +6,7 @@
 import { concat, equalBytes, fromHex, toHex } from "./bytes.js";
 import { resolveAudience, type ResolvedAudience } from "./audience.js";
 import { acceptSnapshot, checkMemberResolution, createCircleSnapshot, newCircleId, pinCircle, successorSnapshot, type CircleState } from "./circle.js";
-import { DocumentType, expectType, parseDocument, parseVaultHeader, verifyDocument, type AccountDevice, type AccountSuccession, type RecordKind } from "./codec.js";
+import { DocumentType, buildCircleSnapshot, expectType, parseDocument, parseVaultHeader, verifyDocument, type AccountDevice, type AccountSuccession, type RecordKind } from "./codec.js";
 import { randomBytes, ready, type BoxKeypair } from "./crypto.js";
 import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
@@ -21,13 +21,13 @@ export interface EnqueueResult {
   readonly recordId: Uint8Array;
   readonly duplicate: boolean;
 }
-import { acceptsSuccession, allowsContinuity, kindOf, validatePolicy, type RetentionPolicy } from "./policy.js";
+import { acceptsSuccession, allowsContinuity, kindOf, validatePolicy, type ReplacementModel, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
-import type { CircleRow, PendingResetRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
+import type { CircleRow, PendingResetRow, ReplacementRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
 import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t3Circle, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault } from "./transactions.js";
 import { applySuccession } from "./succession.js";
-import type { Relay, ResolvedAccount, Transport } from "./transport.js";
+import type { CircleListing, Directory, Relay, ResolvedAccount, SuccessionLink, Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
 
 /** The types of the client's queries and of `receive`, defined with the inbox. */
@@ -52,8 +52,12 @@ function sameEntries(a: readonly VaultEntry[], b: readonly VaultEntry[]): boolea
   return key(a) === key(b);
 }
 
-export type ClientStatus = "fresh" | "ready" | "locked" | "accountRecoveryRequired" | "activationPending" | "retired" | "paused" | "quarantined";
+export type ClientStatus = "fresh" | "replacementPrepared" | "ready" | "locked" | "accountRecoveryRequired" | "activationPending" | "retired" | "paused" | "quarantined";
 export type PauseReason = "sync" | "rotation" | "metadata" | "limit";
+
+function proposalOf(row: ReplacementRow): ReplacementProposal {
+  return { successionId: fromHex(row.successionId), accountName: row.accountName, accountId: fromHex(row.accountId), expectedCertificateHash: fromHex(row.expectedCertificateHash), expectedGeneration: unbig(row.expectedGeneration), certificate: fromHex(row.certificate) };
+}
 
 /** The account id a directory answer names: the root of its succession chain, else the identity of its key. */
 export function resolvedAccountId(r: ResolvedAccount): Uint8Array {
@@ -82,6 +86,12 @@ export interface ClientState {
 export interface Inspection {
   readonly identityId: Uint8Array | undefined;
   readonly keyIdentityId: Uint8Array | undefined;
+  /** The replacement models the profile enables; never a runtime choice. */
+  readonly replacementModel: ReplacementModel;
+  /** A prepared account-recovery proposal on this device, until it commits or is definitively conflicted. */
+  readonly replacement: { readonly successionId: Uint8Array; readonly expectedGeneration: bigint; readonly stale: boolean; readonly conflictGeneration: bigint | undefined } | undefined;
+  /** Discovery after account recovery: where it stands. */
+  readonly bootstrap: { readonly cursor: string | undefined; readonly complete: boolean } | undefined;
   readonly certificateHash: Uint8Array | undefined;
   readonly generation: bigint | undefined;
   readonly desiredRevision: bigint;
@@ -141,6 +151,21 @@ export interface Client {
   recoveryStatus(): Promise<ProviderStatusResult>;
   recoveryCode(): Promise<string>;
   restoreAccount(recoveryCode?: string): Promise<{ identityId: Uint8Array; generation: bigint }>;
+  /**
+   * Account recovery (amendment A1), on a fresh device with no secret from the old one: prepare
+   * a replacement under fresh keys and return the proposal the product takes to the host's fresh
+   * authentication. A second call returns the same pending proposal. The remote account is untouched.
+   */
+  prepareReplacement(): Promise<ReplacementProposal>;
+  /**
+   * Commit the prepared replacement with the host's authorization. `SUCCESSION_PENDING` means the
+   * outcome is unknown and the same call is to be made again; `REPLACEMENT_CONFLICT` means the
+   * account moved and the next `prepareReplacement()` starts over; `AUTHORIZATION_REQUIRED` means
+   * the host refused the authorization.
+   */
+  completeReplacement(input: { successionId: Uint8Array; authorization: Uint8Array }): Promise<{ identityId: Uint8Array; generation: bigint }>;
+  /** The key changes this device accepted for its contacts, newest first, bounded. */
+  keyChanges(options?: { accountId?: Uint8Array; limit?: number }): Promise<KeyChangeEntry[]>;
   /** A durable outbound record of a declared kind; the payload is the product's bytes, never read by the SDK. */
   enqueue(kind: RecordKind, payload: Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult>;
   /** One synchronisation; `options.catchUp` bounds how much of a backlog this call reads (`SyncReport.inbox.hasMore` says when to call again). */
@@ -188,7 +213,31 @@ export interface SyncReport {
   /** `hasMore`: a stream still has records on the relay that this sync's budget did not reach; sync again soon. */
   inbox: { streams: number; stored: number; keyPending: number; invalid: number; acked: number; hasMore: boolean };
   purged: number;
+  /** Present while account recovery discovers circles through the host: pinned, pending and failed on this sync. */
+  bootstrap?: { circles: number; pending: number; failed: number };
   errors: SyncError[];
+}
+
+/** What `prepareReplacement()` returns: everything the product hands to the host for authorization. All public. */
+export interface ReplacementProposal {
+  readonly successionId: Uint8Array;
+  readonly accountName: string;
+  readonly accountId: Uint8Array;
+  readonly expectedCertificateHash: Uint8Array;
+  readonly expectedGeneration: bigint;
+  readonly certificate: Uint8Array;
+}
+
+/** One accepted key change of a contact: a verified succession or a validated reset. */
+export interface KeyChangeEntry {
+  readonly accountId: Uint8Array;
+  readonly accountName: string;
+  readonly previousIdentityId: Uint8Array;
+  readonly newIdentityId: Uint8Array;
+  readonly generation: bigint;
+  readonly reason: "succession" | "reset";
+  readonly successionId: Uint8Array | undefined;
+  readonly acceptedAt: bigint;
 }
 
 /** One failure a sync worked around: which step, the protocol code and stage, and whether the same step may succeed later unchanged. */
@@ -366,7 +415,10 @@ class ClientImpl implements Client {
   async getState(): Promise<ClientState> {
     const meta = await this.store.read((tx) => tx.get("meta", META));
     const base = { identityId: this.selfPin?.accountId, keyIdentityId: this.selfPin?.identityId, certificateHash: this.selfPin?.certificateHash, generation: this.selfPin?.generation, outbox: 0, waitingFor: [] as Uint8Array[], circles: [] as CircleSummary[] };
-    if (!meta || (!this.account && meta.state !== "RETIRED")) return { status: "fresh", paused: undefined, ...base };
+    if (!meta || (!this.account && meta.state !== "RETIRED")) {
+      const proposal = await this.store.read((tx) => tx.get("replacement", "pending"));
+      return { status: proposal && !proposal.stale ? "replacementPrepared" : "fresh", paused: undefined, ...base };
+    }
     const circles = await this.listCircles();
     const outbox = await outboxCount(this.store);
     const waitingFor = await this.waitingFor();
@@ -404,10 +456,15 @@ class ClientImpl implements Client {
       const stream = tx.get("stream", STREAM);
       const revision = tx.get("revision", REVISION);
       const vault = tx.get("vault", VAULT);
+      const meta = tx.get("meta", META);
+      const proposal = tx.get("replacement", "pending");
       const pendingEpoch = tx.list("epochs").find(([, e]) => e.status === "prepared" || e.status === "committed")?.[1].epoch;
       return {
         identityId: this.selfPin?.accountId,
         keyIdentityId: this.selfPin?.identityId,
+        replacementModel: this.policy.replacement,
+        replacement: proposal ? { successionId: fromHex(proposal.successionId), expectedGeneration: unbig(proposal.expectedGeneration), stale: proposal.stale, conflictGeneration: proposal.conflictGeneration === undefined ? undefined : unbig(proposal.conflictGeneration) } : undefined,
+        bootstrap: meta?.bootstrap ? { cursor: meta.bootstrap.cursor, complete: meta.bootstrap.complete } : undefined,
         certificateHash: this.selfPin?.certificateHash,
         generation: this.selfPin?.generation,
         desiredRevision: revision ? unbig(revision.desiredRevision) : 1n,
@@ -681,6 +738,8 @@ class ClientImpl implements Client {
       // A reset retires the whole account, however many successions it went through.
       for (const [, r] of tx.list("identities")) if (r.resetAt !== undefined) retired.add(r.accountId);
       const pins = new Map(tx.list("pins").map(([k, p]) => [k, rowToPin(p)]));
+      // An account whose chain this device has not finished verifying is out of every audience until it has.
+      for (const [, p] of tx.list("chainProgress")) if (!p.complete) pins.delete(p.accountId);
       const circles = tx.list("circles").map(([, c]) => rowToCircle(c));
       return resolveAudience(pin, circles, pins, retired);
     });
@@ -775,6 +834,19 @@ class ClientImpl implements Client {
       purged: 0,
       errors: []
     };
+    if (!this.selfPin) {
+      // A prepared replacement whose commit this device never saw: the chain says whether it landed.
+      const row = await this.store.read((tx) => tx.get("replacement", "pending"));
+      if (row && !row.stale) {
+        try {
+          const link = await this.findOwnLink(row);
+          const roots = await this.secrets.get("pendingReplacement");
+          if (link && roots && roots.length === RESET_ROOTS_BYTES) await this.activateReplacement(row, roots, link.wire);
+        } catch (e) {
+          report.errors.push(syncError("resumeReplacement", e));
+        }
+      }
+    }
     if (!this.account || !this.selfPin) return report;
     const meta = await this.store.read((tx) => tx.get("meta", META));
     if (!meta || meta.state === "RETIRED") return report;
@@ -800,10 +872,22 @@ class ClientImpl implements Client {
       }
     } else if (meta.state !== "ACTIVE") return report;
     await this.ensureBackup();
+    if (meta.bootstrap && !meta.bootstrap.complete) {
+      try {
+        report.bootstrap = await this.bootstrap(report, meta.bootstrap.cursor);
+      } catch (e) {
+        report.errors.push(syncError("bootstrap", e));
+      }
+    }
     try {
       await this.syncMetadata(report);
     } catch (e) {
       report.errors.push(syncError("metadata", e));
+    }
+    try {
+      await this.pushPreferences(report);
+    } catch (e) {
+      report.errors.push(syncError("preference", e));
     }
     const after = await this.store.read((tx) => tx.get("meta", META));
     if (after?.state === "RETIRED") return report;
@@ -923,7 +1007,7 @@ class ClientImpl implements Client {
       const wire = await this.transport.directory.getCircle(c.circleId);
       if (wire) {
         try {
-          const r = await this.acceptSnapshotFrom(c, wire, ownerPin, now);
+          const r = await this.acceptSnapshotFrom(c, wire, ownerPin, now, report);
           if (r.outcome === "ACCEPTED") {
             // The row may have moved since it was read: a sharing preference, a leave or a close
             // made meanwhile wins over the fetched snapshot, and a newer snapshot already stored
@@ -988,14 +1072,20 @@ class ClientImpl implements Client {
    * attestations leave the device as it is.
    */
   private async supersededBySuccession(pin: AccountPin, me: ResolvedAccount): Promise<boolean> {
-    const chain = me.successions ?? [];
-    const link = chain.find((l) => {
+    const fromUs = (l: SuccessionLink): boolean => {
       try {
         return toHex(expectType<AccountSuccession>(parseDocument(l.wire), DocumentType.AccountSuccession, "sync").previousIdentityId) === toHex(pin.identityId);
       } catch {
         return false;
       }
-    });
+    };
+    let link = (me.successions ?? []).find(fromUs);
+    let cursor = me.successionsNext;
+    for (let pages = 0; !link && cursor !== undefined && pages < 64; pages++) {
+      const page = await this.transport.directory.getSuccessions(pin.accountId, cursor, 32);
+      link = page.successions.find(fromUs);
+      cursor = page.successions.length ? page.nextGeneration : undefined;
+    }
     if (!link) return false;
     try {
       return await this.store.transaction((tx) => {
@@ -1013,7 +1103,7 @@ class ClientImpl implements Client {
    * succession and the snapshot predates it, under the retired key it was signed with. The
    * successor republishes at the next revision; until then the older snapshot stays valid.
    */
-  private async acceptSnapshotFrom(c: CircleState, wire: Uint8Array, ownerPin: AccountPin, now: bigint): Promise<ReturnType<typeof acceptSnapshot>> {
+  private async acceptSnapshotFrom(c: CircleState, wire: Uint8Array, ownerPin: AccountPin, now: bigint, report?: SyncReport, resolved = false): Promise<ReturnType<typeof acceptSnapshot>> {
     const { pin } = this.requireAccount("sync");
     try {
       return acceptSnapshot(c, wire, ownerPin.accountKey, pin.accountId, now);
@@ -1026,6 +1116,16 @@ class ClientImpl implements Client {
           return acceptSnapshot(c, wire, key, pin.accountId, now);
         } catch (inner) {
           if (!isKavachError(inner, "BAD_SIGNATURE")) throw inner;
+        }
+      }
+      // Signed by a key we do not know: the owner may have succeeded since we last resolved it.
+      // The chain is verified first; only a key it produced may sign this circle.
+      if (!resolved && report && !equalBytes(ownerPin.accountId, pin.accountId)) {
+        const [r] = await this.transport.directory.resolveIdentities([ownerPin.accountId]);
+        if (r && !equalBytes(r.accountKey, ownerPin.accountKey)) {
+          await this.acceptMemberCertificate(r, report);
+          const fresh = await this.pinFor(ownerPin.accountId);
+          if (fresh && !equalBytes(fresh.accountKey, ownerPin.accountKey)) return this.acceptSnapshotFrom(c, wire, fresh, now, report, true);
         }
       }
       throw e;
@@ -1042,43 +1142,61 @@ class ClientImpl implements Client {
    * duplicates. Returns the pin as it stands afterwards, or undefined when a link was deferred or
    * refused, in which case the certificate under the new key must not be accepted either.
    */
-  private async applyChain(current: AccountPin, chain: readonly { wire: Uint8Array; certificate: Uint8Array }[], report: SyncReport): Promise<AccountPin | undefined> {
-    let pin = current;
-    for (const link of chain) {
-      let previousGeneration: bigint;
+  private async applyChain(current: AccountPin, firstPage: readonly SuccessionLink[], next: bigint | undefined, report: SyncReport): Promise<AccountPin | undefined> {
+    const accountHex = toHex(current.accountId);
+    // The whole chain first (section 7: paged and bounded); the pin moves only when it is complete,
+    // so no epoch is ever sealed to an intermediate successor.
+    const links = [...firstPage];
+    let cursor = next;
+    for (let pages = 0; cursor !== undefined && pages < 64; pages++) {
+      let page;
       try {
-        previousGeneration = expectType<AccountSuccession>(parseDocument(link.wire), DocumentType.AccountSuccession, "sync").previousGeneration;
+        page = await this.transport.directory.getSuccessions(current.accountId, cursor, 32);
       } catch (e) {
         report.errors.push(syncError("succession", e));
-        return undefined;
+        break;
       }
-      if (previousGeneration < pin.generation && !equalBytes(pin.accountKey, expectType<AccountDevice>(verifyDocument(link.certificate), DocumentType.AccountDevice, "sync").accountKey)) {
-        // A link behind the pinned key: already applied (the pin moved past it) or never ours to apply.
-        const known = await this.store.read((tx) => tx.list("successions").some(([, s]) => s.accountId === toHex(pin.accountId) && unbig(s.previousGeneration) === previousGeneration));
-        if (known) continue;
-      }
-      try {
-        const effect = await this.store.transaction((tx) => {
-          const e = applySuccession(tx, { wire: link.wire, newCertificate: link.certificate, policy: this.policy, trust: this.trust, now: this.now() });
-          this.persistTrustIn(tx);
-          return e;
-        });
-        if (effect.outcome === "ACCEPTED") {
-          report.metadata.successions++;
-          report.metadata.rotations++;
-          this.emit({ kind: "accountKeyChanged", accountName: effect.accountName, quarantined: false });
-          this.emit({ kind: "deviceChanged", identityId: effect.pin.accountId, generation: effect.pin.generation });
-        }
-        if (effect.outcome === "ACCEPTED" || effect.outcome === "DUPLICATE") pin = effect.pin;
-      } catch (e) {
-        report.errors.push(syncError("succession", e));
-        if (e instanceof KavachError && (e.code === "EQUIVOCATION" || e.code === "ROLLBACK" || e.code === "SUCCESSION_BINDING" || e.code === "DEVICE_ID_REUSED")) {
-          this.emit({ kind: "securityError", code: e.code, detail: current.accountName });
-        }
-        return undefined;
-      }
+      if (page.successions.length === 0) break;
+      links.push(...page.successions);
+      cursor = page.nextGeneration;
     }
-    return pin;
+    if (cursor !== undefined) {
+      const remaining = cursor;
+      await this.store.transaction((tx) => tx.put("chainProgress", accountHex, { accountId: accountHex, nextGeneration: big(remaining), complete: false }));
+      report.errors.push({ operation: "succession", code: "METADATA_REQUIRED", stage: "chain", retryable: true });
+      return undefined;
+    }
+    try {
+      const applied = await this.store.transaction((tx) => {
+        const effects: ReturnType<typeof applySuccession>[] = [];
+        let pin = current;
+        for (const link of links) {
+          const doc = expectType<AccountSuccession>(parseDocument(link.wire), DocumentType.AccountSuccession, "sync");
+          // A link behind the pinned key that is already on record: the pin moved past it earlier.
+          if (doc.previousGeneration < pin.generation && tx.list("successions").some(([, s]) => s.accountId === accountHex && unbig(s.previousGeneration) === doc.previousGeneration)) continue;
+          const e = applySuccession(tx, { wire: link.wire, newCertificate: link.certificate, policy: this.policy, trust: this.trust, now: this.now() });
+          effects.push(e);
+          pin = e.pin;
+        }
+        this.persistTrustIn(tx);
+        tx.delete("chainProgress", accountHex);
+        return { effects, pin };
+      });
+      for (const effect of applied.effects) {
+        if (effect.outcome !== "ACCEPTED") continue;
+        report.metadata.successions++;
+        report.metadata.rotations++;
+        this.emit({ kind: "accountKeyChanged", accountName: effect.accountName, quarantined: false });
+        this.emit({ kind: "deviceChanged", identityId: effect.pin.accountId, generation: effect.pin.generation });
+      }
+      return applied.pin;
+    } catch (e) {
+      report.errors.push(syncError("succession", e));
+      if (e instanceof KavachError && (e.code === "EQUIVOCATION" || e.code === "ROLLBACK" || e.code === "SUCCESSION_BINDING" || e.code === "DEVICE_ID_REUSED")) {
+        this.emit({ kind: "securityError", code: e.code, detail: current.accountName });
+      }
+      return undefined;
+    }
   }
 
   /** Accept a member's certificate; a changed account key is quarantined unless a succession chain or a reset receipt explains it. */
@@ -1094,7 +1212,7 @@ class ClientImpl implements Client {
         // signed it, and the key change below is quarantined as a bare directory key change.
         report.errors.push(syncError("succession", new KavachError("UNSUPPORTED_TYPE", "succession", "this deployment does not accept successions")));
       } else {
-        current = await this.applyChain(current, resolved.successions, report);
+        current = await this.applyChain(current, resolved.successions, resolved.successionsNext, report);
         if (!current) return;
       }
     }
@@ -1243,6 +1361,30 @@ class ClientImpl implements Client {
 
   newest(identityId: Uint8Array, kind: RecordKind): Promise<Newest | undefined> {
     return newestSlot(this.store, identityId, kind, this.now());
+  }
+
+  keyChanges(options: { accountId?: Uint8Array; limit?: number } = {}): Promise<KeyChangeEntry[]> {
+    const limit = Math.max(1, Math.min(500, Math.floor(options.limit ?? 50)));
+    const who = options.accountId ? toHex(options.accountId) : undefined;
+    return this.store.read((tx) =>
+      tx
+        .list("keyChanges")
+        .map(([, r]) => r)
+        .filter((r) => who === undefined || r.accountId === who)
+        // Newest first; two changes accepted in one transaction order by generation.
+        .sort((x, y) => (unbig(y.acceptedAt) > unbig(x.acceptedAt) ? 1 : unbig(y.acceptedAt) < unbig(x.acceptedAt) ? -1 : unbig(y.generation) > unbig(x.generation) ? 1 : unbig(y.generation) < unbig(x.generation) ? -1 : 0))
+        .slice(0, limit)
+        .map((r) => ({
+          accountId: fromHex(r.accountId),
+          accountName: r.accountName,
+          previousIdentityId: fromHex(r.previousIdentityId),
+          newIdentityId: fromHex(r.newIdentityId),
+          generation: unbig(r.generation),
+          reason: r.reason,
+          successionId: r.successionId === undefined ? undefined : fromHex(r.successionId),
+          acceptedAt: unbig(r.acceptedAt)
+        }))
+    );
   }
 
 
@@ -1492,13 +1634,318 @@ class ClientImpl implements Client {
     }
     await this.store.transaction((tx) => {
       t3Circle(tx, { ...row, enabled }, { kind: enabled ? "enable" : "disable", circleId });
+      this.recordPreferenceIn(tx, circleId, enabled);
     });
     await this.syncVault();
+    if (acceptsSuccession(this.policy)) {
+      // Best effort now; sync retries until it lands or conflicts.
+      try {
+        await this.pushPreferences();
+      } catch {
+        /* retried by sync */
+      }
+    }
+  }
+
+  /** The user's latest action on a circle's preference, with the local sequence that a host response must name to clear it. */
+  private recordPreferenceIn(tx: Tx, circleId: Uint8Array, enabled: boolean): void {
+    const key = toHex(circleId);
+    const row = tx.get("preferences", key) ?? { circleId: key, enabled, revision: "0", pending: undefined, nextSequence: "1" };
+    const sequence = row.nextSequence;
+    tx.put("preferences", key, { ...row, enabled, pending: { enabled, sequence }, nextSequence: big(unbig(sequence) + 1n) });
+  }
+
+  /**
+   * Send pending preference changes to the host (amendment A1, section 7). On CONFLICT the
+   * device's latest persisted action wins, read from the store at retry time, and is written again
+   * at the served revision; a response clears only the sequence it answered.
+   */
+  private async pushPreferences(report?: SyncReport): Promise<void> {
+    if (!acceptsSuccession(this.policy) || !this.selfPin) return;
+    const pending = await this.store.read((tx) => tx.list("preferences").filter(([, p]) => p.pending !== undefined).map(([, p]) => p.circleId));
+    for (const key of pending) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const row = await this.store.read((tx) => tx.get("preferences", key));
+        if (!row?.pending) break;
+        const sent = row.pending;
+        const outcome = await this.transport.directory.setSharingPreference(fromHex(key), sent.enabled, unbig(row.revision));
+        if (outcome.status === "COMMITTED" || outcome.status === "ALREADY_COMMITTED") {
+          await this.store.transaction((tx) => {
+            const live = tx.get("preferences", key);
+            if (!live) return;
+            const cleared = live.pending?.sequence === sent.sequence ? undefined : live.pending;
+            tx.put("preferences", key, { ...live, revision: big(outcome.revision), pending: cleared });
+          });
+          break;
+        }
+        if (outcome.status === "CONFLICT") {
+          // Adopt the served revision; the latest persisted action is re-sent against it.
+          await this.store.transaction((tx) => {
+            const live = tx.get("preferences", key);
+            if (live) tx.put("preferences", key, { ...live, revision: big(outcome.revision) });
+          });
+          continue;
+        }
+        if (report) report.errors.push({ operation: "preference", code: outcome.status === "UNAUTHORIZED" ? "NOT_AUTHORIZED" : "NETWORK", stage: "preference", retryable: outcome.status !== "UNAUTHORIZED" });
+        break;
+      }
+    }
   }
 
   /** Close: the successor names only the owner; its publication forgets the members and removes the vault entry. */
   private async closeCircle(circleId: Uint8Array): Promise<void> {
     await this.changeMembership(circleId, { close: true });
+  }
+
+  // Account recovery (amendment A1) ---------------------------------------------------------------
+
+  async prepareReplacement(): Promise<ReplacementProposal> {
+    const stage = "prepareReplacement";
+    if (!acceptsSuccession(this.policy)) throw new KavachError("NOT_AUTHORIZED", stage, "this deployment does not use account recovery");
+    const opened = await openStore(this.store, this.secrets, this.accountName);
+    if (opened.kind !== "fresh") throw new KavachError("MALFORMED", stage, "an account already exists on this device");
+    const existing = await this.store.read((tx) => tx.get("replacement", "pending"));
+    const roots = await this.secrets.get("pendingReplacement");
+    if (existing && !existing.stale && roots && roots.length === RESET_ROOTS_BYTES) return proposalOf(existing);
+    const [resolved] = await this.transport.directory.resolveAccounts([this.accountName]);
+    if (!resolved) throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, "unknown account");
+    const current = expectType<AccountDevice>(verifyDocument(resolved.certificate), DocumentType.AccountDevice, stage);
+    const accountId = resolvedAccountId(resolved);
+    // Fresh roots: nothing from the old device, nothing from the host. The certificate is at the
+    // next generation under the new key; the vault is fresh at revision 1 so that identity
+    // continuity works on the next replacement.
+    const accountSeed = newAccountSeed();
+    const device = newDevice();
+    const recoveryKey = newRecoveryKey();
+    const instanceId = randomBytes(16);
+    const successionId = randomBytes(16);
+    const account = openAccount(this.accountName, accountSeed, accountId);
+    const generation = current.generation + 1n;
+    const certificate = certify(account, device, generation);
+    const pin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage), undefined, accountId);
+    const vault = buildVault({ accountName: this.accountName, accountKey: account.account.publicKey, vaultRevision: 1n }, { accountSeed, lastDeviceGeneration: generation, lastCertificateHash: pin.certificateHash, entries: [] }, recoveryKey);
+    // T11: roots in the secret store, the exact bytes in the store, before anything is sent.
+    await this.secrets.set("pendingReplacement", concat(accountSeed, device.deviceSeed, recoveryKey, instanceId, device.deviceId));
+    const row: ReplacementRow = {
+      successionId: toHex(successionId),
+      accountName: this.accountName,
+      accountId: toHex(accountId),
+      expectedCertificateHash: toHex(current.bodyHash),
+      expectedGeneration: big(current.generation),
+      certificate: toHex(certificate),
+      vault: toHex(vault.wire),
+      vaultHash: toHex(vault.hash),
+      deviceId: toHex(device.deviceId),
+      stale: false,
+      conflictGeneration: undefined
+    };
+    await this.store.transaction((tx) => tx.put("replacement", "pending", row));
+    await this.emitState();
+    return proposalOf(row);
+  }
+
+  async completeReplacement(input: { successionId: Uint8Array; authorization: Uint8Array }): Promise<{ identityId: Uint8Array; generation: bigint }> {
+    const stage = "completeReplacement";
+    // Already activated (by an earlier call, or by a sync that found the commit on the chain): idempotent.
+    if (this.selfPin && this.account && !this.retired) return { identityId: this.selfPin.identityId, generation: this.selfPin.generation };
+    const row = await this.store.read((tx) => tx.get("replacement", "pending"));
+    if (!row || row.successionId !== toHex(input.successionId)) throw new KavachError("MALFORMED", stage, "no such prepared replacement on this device");
+    if (row.stale) throw new KavachError("REPLACEMENT_CONFLICT", stage, row.conflictGeneration === undefined ? "the account moved" : `the account is at generation ${row.conflictGeneration}`);
+    const roots = await this.secrets.get("pendingReplacement");
+    if (!roots || roots.length !== RESET_ROOTS_BYTES) throw new KavachError("RECOVERY_REQUIRED", stage, "replacement prepared without its roots");
+    let outcome: Awaited<ReturnType<Directory["succeedAccount"]>>;
+    try {
+      outcome = await this.transport.directory.succeedAccount({
+        accountName: this.accountName,
+        expectedCertificateHash: fromHex(row.expectedCertificateHash),
+        newCertificate: fromHex(row.certificate),
+        newVault: fromHex(row.vault),
+        successionId: input.successionId,
+        authorization: input.authorization
+      });
+    } catch (e) {
+      if (!isKavachError(e, "NETWORK")) throw e;
+      // Unknown: the chain says whether ours committed. Never a second identity.
+      const link = await this.findOwnLink(row).catch(() => undefined);
+      if (!link) throw new KavachError("SUCCESSION_PENDING", stage, "the commit's outcome is unknown; call again with the same proposal");
+      outcome = { status: "COMMITTED", succession: link.wire };
+    }
+    if (outcome.status === "CONFLICT") {
+      // Definitive: the current certificate moved under the proposal, and the succession id is
+      // not on the chain (that answers first). The proposal can never commit: it is marked stale
+      // and its keys, never activated anywhere, are discarded.
+      let current: bigint | undefined;
+      try {
+        current = outcome.current ? expectType<AccountDevice>(verifyDocument(outcome.current), DocumentType.AccountDevice, stage).generation : undefined;
+      } catch {
+        current = undefined;
+      }
+      await this.store.transaction((tx) => tx.put("replacement", "pending", { ...row, stale: true, conflictGeneration: current === undefined ? undefined : big(current) }));
+      await this.secrets.delete("pendingReplacement");
+      await this.emitState();
+      throw new KavachError("REPLACEMENT_CONFLICT", stage, current === undefined ? "the account moved" : `the account is at generation ${current}`);
+    }
+    if (outcome.status === "UNAUTHORIZED") throw new KavachError("AUTHORIZATION_REQUIRED", stage, "the host refused the authorization; obtain a fresh one for the same proposal");
+    if ((outcome.status !== "COMMITTED" && outcome.status !== "ALREADY_COMMITTED") || !outcome.succession) {
+      throw new KavachError("SUCCESSION_PENDING", stage, `host answered ${outcome.status}`);
+    }
+    return this.activateReplacement(row, roots, outcome.succession);
+  }
+
+  /** Our own link on the host's chain, if the proposal committed: the one naming our succession id and certificate. */
+  private async findOwnLink(row: ReplacementRow): Promise<SuccessionLink | undefined> {
+    const page = await this.transport.directory.getSuccessions(fromHex(row.accountId), unbig(row.expectedGeneration), 8);
+    for (const l of page.successions) {
+      try {
+        const doc = expectType<AccountSuccession>(parseDocument(l.wire), DocumentType.AccountSuccession, "resume");
+        if (toHex(doc.successionId) === row.successionId && equalBytes(l.certificate, fromHex(row.certificate))) return l;
+      } catch {
+        /* not ours */
+      }
+    }
+    return undefined;
+  }
+
+  /** The reset-key list, fetched when the one held is not fresh. */
+  private async ensureResetList(): Promise<void> {
+    const now = this.now();
+    if (this.trust.fresh(now)) return;
+    const wire = await this.transport.directory.getResetKeyList();
+    if (!wire) return;
+    this.trust.install(wire, now);
+    await this.persistTrust();
+  }
+
+  /**
+   * Activate: verify the returned succession exactly as a peer would, against the previous state
+   * pinned from the host, then the T1 header under the new identity with the account id carried
+   * from the proposal. A succession that does not verify leaves the proposal intact.
+   */
+  private async activateReplacement(row: ReplacementRow, roots: Uint8Array, succession: Uint8Array): Promise<{ identityId: Uint8Array; generation: bigint }> {
+    const stage = "completeReplacement";
+    await this.ensureResetList();
+    const previousWire = await this.transport.directory.getCertificate(fromHex(row.expectedCertificateHash));
+    if (!previousWire) throw new KavachError("METADATA_REQUIRED", stage, "the previous certificate is not served");
+    const previous = expectType<AccountDevice>(verifyDocument(previousWire), DocumentType.AccountDevice, stage);
+    if (toHex(previous.bodyHash) !== row.expectedCertificateHash) throw new KavachError("SUCCESSION_BINDING", stage, "the served certificate is not the expected one");
+    const accountId = fromHex(row.accountId);
+    const previousPin = pinFromCertificate(previous, undefined, accountId);
+    const accountSeed = roots.subarray(0, 32);
+    const deviceSeed = roots.subarray(32, 64);
+    const recoveryKey = roots.subarray(64, 96);
+    const instanceId = roots.subarray(96, 112);
+    const deviceId = roots.subarray(112, 128);
+    const account = openAccount(this.accountName, accountSeed, accountId);
+    const device = deviceFromSeed(deviceSeed, deviceId);
+    const certificate = fromHex(row.certificate);
+    const doc = expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage);
+    const pin = pinFromCertificate(doc, undefined, accountId);
+    // Roots first, then the store: a crash in between leaves a device the next call finishes.
+    await t1Secrets(this.secrets, { accountSeed, deviceSeed, recoveryKey, instanceId });
+    await this.store.transaction((tx) => {
+      // The previous state as a first contact pins it, then the succession as a peer verifies it:
+      // nothing is written unless the document binds this account, this generation and this key.
+      tx.put("pins", toHex(accountId), pinToRow(previousPin));
+      tx.put("certificates", toHex(previousPin.certificateHash), { identityId: toHex(accountId), certificateHash: toHex(previousPin.certificateHash), signingKey: toHex(previousPin.signingKey), boxKey: toHex(previousPin.boxKey), streamId: toHex(previousPin.streamId), generation: big(previous.generation), wire: toHex(previousWire), current: true });
+      const effect = applySuccession(tx, { wire: succession, newCertificate: certificate, policy: this.policy, trust: this.trust, now: this.now() });
+      if (!equalBytes(effect.newIdentityId, account.identityId) || toHex(effect.accountId) !== row.accountId) throw new KavachError("SUCCESSION_BINDING", stage, "the succession does not name this device's key");
+      this.persistTrustIn(tx);
+      t1Header(tx, { account, device, certificate, instanceId, generation: doc.generation });
+      t9Vault(tx, { revision: "1", hash: row.vaultHash, wire: row.vault, pending: false, dirty: false });
+      t3ApplyChange(tx, { kind: "ownActivation" });
+      t1Activate(tx);
+      const meta = tx.get("meta", META);
+      if (meta) tx.put("meta", META, { ...meta, bootstrap: { complete: false } });
+      tx.delete("replacement", "pending");
+    });
+    await this.secrets.delete("pendingReplacement");
+    this.account = account;
+    this.device = device;
+    this.selfPin = pin;
+    this.retired = false;
+    try {
+      await this.provider.save(this.accountName, pin.identityId, recoveryKey);
+    } catch {
+      /* reported by recoveryStatus() */
+    }
+    await this.emitState();
+    return { identityId: pin.identityId, generation: pin.generation };
+  }
+
+  /**
+   * Discovery after account recovery (amendment A1, section 5): the host lists the account's
+   * circles page by page; each is pinned only when its snapshot verifies under the owner's
+   * verified chain and names this account as the host says. Discovery is not permission to share:
+   * the circle is enabled only if the served preference says so. Never writes membership; an
+   * owner's successor republishes the served snapshot at the next revision.
+   */
+  private async bootstrap(report: SyncReport, start: string | undefined): Promise<{ circles: number; pending: number; failed: number }> {
+    const out = { circles: 0, pending: 0, failed: 0 };
+    let cursor = start;
+    for (let pages = 0; pages < 64; pages++) {
+      const page = await this.transport.directory.listCircles(cursor);
+      for (const c of page.circles) {
+        try {
+          const r = await this.adoptListing(c, report);
+          if (r === "member") out.circles++;
+          else if (r === "pending") out.pending++;
+        } catch (e) {
+          out.failed++;
+          report.errors.push(syncError("bootstrap", e));
+        }
+      }
+      await this.store.transaction((tx) => {
+        const meta = tx.get("meta", META);
+        if (meta) tx.put("meta", META, { ...meta, bootstrap: page.cursor === undefined ? { complete: true } : { cursor: page.cursor, complete: false } });
+        t9MarkVault(tx);
+      });
+      if (page.cursor === undefined) break;
+      cursor = page.cursor;
+    }
+    return out;
+  }
+
+  private async adoptListing(c: CircleListing, report: SyncReport): Promise<"member" | "pending" | "skipped"> {
+    const stage = "bootstrap";
+    const { pin, account } = this.requireAccount(stage);
+    const key = toHex(c.circleId);
+    const existing = await this.store.read((tx) => tx.get("circles", key));
+    if (existing && (existing.revision !== "0" || existing.status === "requested")) return "skipped"; // a restart between pages
+    if (!c.snapshot) return "skipped"; // closed: nothing to pin, nothing to reopen
+    const ownerIsMe = equalBytes(c.ownerAccountId, pin.accountId);
+    let ownerPin = ownerIsMe ? pin : await this.pinFor(c.ownerAccountId);
+    if (!ownerPin) {
+      const [r] = await this.transport.directory.resolveIdentities([c.ownerAccountId]);
+      if (r) await this.acceptMemberCertificate(r, report);
+      ownerPin = await this.pinFor(c.ownerAccountId);
+    }
+    if (!ownerPin) throw new KavachError("METADATA_REQUIRED", stage, "the circle's owner cannot be resolved");
+    const enabled = c.enabled === true;
+    const base = pinCircle(c.circleId, c.ownerAccountId, enabled, c.role === "pending" ? "requested" : "member");
+    const accepted = await this.acceptSnapshotFrom(base, c.snapshot, ownerPin, this.now());
+    if (accepted.outcome !== "ACCEPTED") throw new KavachError("MALFORMED", stage, "an empty snapshot");
+    let state = accepted.state;
+    const named = c.role === "owner" ? equalBytes(state.ownerIdentityId, pin.accountId) : c.role === "member" ? state.members.some((m) => equalBytes(m, pin.accountId)) : true;
+    if (!named) throw new KavachError("NOT_AUTHORIZED", stage, "the snapshot does not name this account as the host says");
+    if (c.role === "pending") state = { ...state, status: "requested" };
+    // The successor owner republishes what it was served at the next revision; the host's
+    // compare-and-swap decides.
+    const republish = ownerIsMe ? buildCircleSnapshot({ circleId: c.circleId, ownerIdentityId: pin.accountId, revision: state.revision + 1n, members: state.members }, account.account.secretKey) : undefined;
+    await this.store.transaction((tx) => {
+      const row = circleToRow(state);
+      t3Circle(tx, republish ? { ...row, pending: { snapshot: toHex(republish), revision: big(state.revision + 1n) } } : row, { kind: "snapshot", circleId: c.circleId, revision: state.revision });
+      if (state.status === "member") t3ApplyChange(tx, { kind: "join", circleId: c.circleId });
+      tx.put("preferences", key, { circleId: key, enabled, revision: big(c.preferenceRevision), pending: undefined, nextSequence: "1" });
+    });
+    this.emit({ kind: "circleChanged", circleId: c.circleId, revision: state.revision, status: state.status });
+    if (republish) {
+      try {
+        await this.publishPendingSnapshot(c.circleId);
+      } catch (e) {
+        report.errors.push(syncError("publishSnapshot", e));
+      }
+    }
+    return state.status === "requested" ? "pending" : "member";
   }
 
   // Reset -----------------------------------------------------------------------------------------

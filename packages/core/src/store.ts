@@ -36,6 +36,8 @@ export interface MetaRow {
   identityId: string;
   certificateHash: string;
   state: StoreState;
+  /** Set by account recovery: discovery of this account's circles through the host, page by page, until complete. */
+  bootstrap?: { cursor?: string; complete: boolean };
 }
 
 export interface SelfRow {
@@ -320,6 +322,9 @@ export interface ReplacementRow {
   expectedGeneration: string;
   /** The exact certificate bytes under the new key, at expectedGeneration + 1. */
   certificate: string;
+  /** The fresh vault at revision 1 the succession installs, so a retry sends identical bytes. */
+  vault: string;
+  vaultHash: string;
   deviceId: string;
   /** Set by a definitive conflict: the proposal can never commit and the next prepare replaces it. */
   stale: boolean;
