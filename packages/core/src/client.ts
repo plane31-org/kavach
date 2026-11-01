@@ -26,7 +26,7 @@ import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
 import type { BootstrapRetryRow, CircleRow, MetaRow, PendingResetRow, ReplacementRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
 import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t3Circle, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault } from "./transactions.js";
-import { applySuccession, recordChainIn, rootIdentityIn, verifyChain, type SuccessionEffect, type VerifiedLink } from "./succession.js";
+import { applySuccession, pinnedState, recordChainIn, rootIdentityIn, rootState, sameTransition, transitionOf, verifyChain, type SuccessionEffect, type VerifiedLink } from "./succession.js";
 import type { CircleListing, Directory, Relay, ResolvedAccount, SuccessionLink, Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
 
@@ -279,6 +279,10 @@ class ClientImpl implements Client {
   private readonly secrets: SecretStore;
   private readonly transport: Transport;
   private readonly provider: RecoveryProvider | undefined;
+  /** A vault exists only where a recovery provider does: a recovery-only profile without one has no path that reads it. */
+  private get vaultEnabled(): boolean {
+    return this.provider !== undefined;
+  }
   private readonly now: () => bigint;
   private readonly listeners = new Set<(e: ClientEvent) => void>();
   private account: OwnAccount | undefined;
@@ -506,8 +510,8 @@ class ClientImpl implements Client {
     const pin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice));
     const iid = instanceId;
     await this.store.transaction((tx) => t1Header(tx, { account, device, certificate, instanceId: iid, generation: 1n }));
-    const vault = buildVault({ accountName: this.accountName, accountKey: account.account.publicKey, vaultRevision: 1n }, { accountSeed, lastDeviceGeneration: 1n, lastCertificateHash: pin.certificateHash, entries: [] }, recoveryKey);
-    const outcome = await this.transport.directory.registerAccount({ certificate, vault: vault.wire });
+    const vault = this.vaultEnabled ? buildVault({ accountName: this.accountName, accountKey: account.account.publicKey, vaultRevision: 1n }, { accountSeed, lastDeviceGeneration: 1n, lastCertificateHash: pin.certificateHash, entries: [] }, recoveryKey) : undefined;
+    const outcome = await this.transport.directory.registerAccount({ certificate, vault: vault?.wire });
     if (outcome.status === "CONFLICT") {
       // A restart or a lost response after the host committed: the name is ours if the host holds
       // exactly the certificate this device saved; anything else is somebody else's account.
@@ -517,7 +521,7 @@ class ClientImpl implements Client {
       throw new KavachError("NOT_AUTHORIZED", stage, `host refused registration: ${outcome.status}`);
     }
     await this.store.transaction((tx) => {
-      t9Vault(tx, { revision: "1", hash: toHex(vault.hash), wire: toHex(vault.wire), pending: false, dirty: false });
+      if (vault) t9Vault(tx, { revision: "1", hash: toHex(vault.hash), wire: toHex(vault.wire), pending: false, dirty: false });
       t1Activate(tx);
     });
     this.account = account;
@@ -1156,23 +1160,43 @@ class ClientImpl implements Client {
     const accountHex = toHex(input.accountId);
     const startIdentity = input.current?.identityId ?? input.accountId;
     await this.ensureResetList();
+    // The state the chain is validated against: the pin with what this store retired, or the root.
+    const current = input.current;
+    let state = current ? await this.store.read((tx) => pinnedState(tx, current, this.trust)) : rootState(input.accountId, input.accountName, this.trust);
+    // Reconcile first: the host serves the chain from the root, and a pinned contact already holds
+    // a prefix of it. Links whose transition is on record are dropped (the same transition at a
+    // recorded state; a different one is the authority signing two successors), so verification
+    // starts at the pinned identity with only the transitions this device has not seen.
+    const recorded = current ? await this.store.read((tx) => tx.list("successions", accountHex + ":").map(([, r]) => r)) : [];
+    const unseen = (links: readonly SuccessionLink[]): SuccessionLink[] =>
+      links.filter((l) => {
+        const doc = expectType<AccountSuccession>(parseDocument(l.wire), DocumentType.AccountSuccession, stage);
+        const t = transitionOf(doc);
+        const row = recorded.find((r) => unbig(r.previousGeneration) === t.previousGeneration && r.previousIdentityId === t.previousIdentityId);
+        if (!row) return true;
+        if (!sameTransition({ accountName: row.accountName, accountId: row.accountId, successionId: row.successionId, previousIdentityId: row.previousIdentityId, newIdentityId: row.newIdentityId, previousGeneration: unbig(row.previousGeneration), newGeneration: unbig(row.newGeneration), newCertificateHash: row.newCertificateHash }, t)) {
+          throw new KavachError("EQUIVOCATION", stage, "two successors for one account state");
+        }
+        return false;
+      });
     const progress = await this.store.read((tx) => tx.get("chainProgress", accountHex));
     const verified: VerifiedLink[] = [];
     let cursor: bigint | undefined;
     let pending: readonly SuccessionLink[];
+    const verifyMore = (links: readonly SuccessionLink[]): void => {
+      const r = verifyChain(unseen(links), { state, trust: this.trust, now: this.now() });
+      verified.push(...r.links);
+      state = r.state;
+    };
     if (progress && progress.startIdentityId === toHex(startIdentity) && progress.links.length > 0) {
-      // Resume: the prefix was verified by an earlier sync from this same start.
-      for (const l of progress.links) verified.push({ doc: expectType<AccountSuccession>(parseDocument(fromHex(l.wire)), DocumentType.AccountSuccession, stage), wire: fromHex(l.wire), certificate: fromHex(l.certificate) });
+      // Resume: the prefix was verified by an earlier sync from this same start; its state is recomputed.
+      verifyMore(progress.links.map((l) => ({ wire: fromHex(l.wire), certificate: fromHex(l.certificate) })));
       cursor = unbig(progress.nextGeneration);
       pending = [];
     } else {
       pending = input.firstPage;
       cursor = input.next;
     }
-    const verifyMore = (links: readonly SuccessionLink[]): void => {
-      const from = verified.at(-1)?.doc.newIdentityId ?? startIdentity;
-      verified.push(...verifyChain(links, { accountId: input.accountId, startIdentityId: from, trust: this.trust, now: this.now() }));
-    };
     const persist = (): Promise<void> =>
       this.store.transaction((tx) => {
         if (cursor === undefined) tx.delete("chainProgress", accountHex);
@@ -1201,13 +1225,11 @@ class ClientImpl implements Client {
       cursor = page.nextGeneration;
       if (cursor !== undefined) await persist();
     }
-    const last = verified.at(-1)?.doc.newIdentityId ?? startIdentity;
-    if (input.finalIdentityId && !equalBytes(last, input.finalIdentityId)) throw new KavachError("SUCCESSION_BINDING", stage, "the chain does not end at the served key");
-    if (!input.current) {
+    if (input.finalIdentityId && state.identityId !== toHex(input.finalIdentityId)) throw new KavachError("SUCCESSION_BINDING", stage, "the chain does not end at the served key");
+    if (!current) {
       if (progress) await this.store.transaction((tx) => tx.delete("chainProgress", accountHex));
       return { pin: undefined, verified, accepted: [] };
     }
-    const current = input.current;
     const applied = await this.store.transaction((tx) => {
       const effects: SuccessionEffect[] = [];
       let pin = current;
@@ -1249,7 +1271,10 @@ class ClientImpl implements Client {
     let current = existing ? rowToPin(existing) : undefined;
     const accountId = current?.accountId ?? resolvedAccountId(resolved);
     const chain = resolved.successions ?? [];
-    if (current && chain.length > 0 && !equalBytes(current.accountKey, doc.accountKey)) {
+    // A served chain is followed whenever there is one, even when the served key equals the pinned
+    // one: a certificate under a retired key at a higher generation must be refused as a return to
+    // that identity, never accepted as a plain device change. Links already on record cost nothing.
+    if (current && chain.length > 0) {
       try {
         const r = await this.followChain({ accountId, accountName: doc.accountName, current, firstPage: chain, next: resolved.successionsNext, budget: this.syncBudget });
         this.reportAccepted(r.accepted, report);
@@ -1482,6 +1507,7 @@ class ClientImpl implements Client {
    * the state, so a change that landed in the rows reaches the vault however the process dies.
    */
   private async syncVault(): Promise<void> {
+    if (!this.vaultEnabled) return;
     const { account, pin } = this.requireAccount("vault");
     const recoveryKey = await this.secrets.get("recoveryKey");
     const accountSeed = await this.secrets.get("accountSeed");
@@ -1806,7 +1832,7 @@ class ClientImpl implements Client {
     const generation = current.generation + 1n;
     const certificate = certify(account, device, generation);
     const pin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage), undefined, accountId);
-    const vault = buildVault({ accountName: this.accountName, accountKey: account.account.publicKey, vaultRevision: 1n }, { accountSeed, lastDeviceGeneration: generation, lastCertificateHash: pin.certificateHash, entries: [] }, recoveryKey);
+    const vault = this.vaultEnabled ? buildVault({ accountName: this.accountName, accountKey: account.account.publicKey, vaultRevision: 1n }, { accountSeed, lastDeviceGeneration: generation, lastCertificateHash: pin.certificateHash, entries: [] }, recoveryKey) : undefined;
     // T11: roots in the secret store, the exact bytes in the store, before anything is sent.
     await this.secrets.set("pendingReplacement", concat(accountSeed, device.deviceSeed, recoveryKey, instanceId, device.deviceId));
     const row: ReplacementRow = {
@@ -1816,8 +1842,8 @@ class ClientImpl implements Client {
       expectedCertificateHash: toHex(current.bodyHash),
       expectedGeneration: big(current.generation),
       certificate: toHex(certificate),
-      vault: toHex(vault.wire),
-      vaultHash: toHex(vault.hash),
+      vault: vault ? toHex(vault.wire) : undefined,
+      vaultHash: vault ? toHex(vault.hash) : undefined,
       deviceId: toHex(device.deviceId),
       stale: false,
       conflictGeneration: undefined
@@ -1842,7 +1868,7 @@ class ClientImpl implements Client {
         accountName: this.accountName,
         expectedCertificateHash: fromHex(row.expectedCertificateHash),
         newCertificate: fromHex(row.certificate),
-        newVault: fromHex(row.vault),
+        newVault: row.vault === undefined ? undefined : fromHex(row.vault),
         successionId: input.successionId,
         authorization: input.authorization
       });
@@ -1934,7 +1960,7 @@ class ClientImpl implements Client {
       if (!equalBytes(effect.newIdentityId, account.identityId) || toHex(effect.accountId) !== row.accountId) throw new KavachError("SUCCESSION_BINDING", stage, "the succession does not name this device's key");
       this.persistTrustIn(tx);
       t1Header(tx, { account, device, certificate, instanceId, generation: doc.generation });
-      t9Vault(tx, { revision: "1", hash: row.vaultHash, wire: row.vault, pending: false, dirty: false });
+      if (row.vault !== undefined && row.vaultHash !== undefined) t9Vault(tx, { revision: "1", hash: row.vaultHash, wire: row.vault, pending: false, dirty: false });
       t3ApplyChange(tx, { kind: "ownActivation" });
       t1Activate(tx);
       const meta = tx.get("meta", META);
@@ -2072,13 +2098,13 @@ class ClientImpl implements Client {
     const certificate = certify(account, device, 1n);
     const newPin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice));
     const recoveryKey = newRecoveryKey();
-    const vault = buildVault({ accountName: this.accountName, accountKey: account.account.publicKey, vaultRevision: 1n }, { accountSeed, lastDeviceGeneration: 1n, lastCertificateHash: newPin.certificateHash, entries: [] }, recoveryKey);
+    const vault = this.vaultEnabled ? buildVault({ accountName: this.accountName, accountKey: account.account.publicKey, vaultRevision: 1n }, { accountSeed, lastDeviceGeneration: 1n, lastCertificateHash: newPin.certificateHash, entries: [] }, recoveryKey) : undefined;
     const resetId = randomBytes(16);
     const instanceId = randomBytes(16);
     // Persisted before it is sent: the host may commit the new identity and the response be lost,
     // and the only keys that can continue are these. Roots in the secret store, wires in the store.
     await this.secrets.set("pendingReset", concat(accountSeed, device.deviceSeed, recoveryKey, instanceId, device.deviceId));
-    await this.store.transaction((tx) => tx.put("pendingReset", "pending", { resetId: toHex(resetId), oldIdentityId: toHex(pin.identityId), certificate: toHex(certificate), vault: toHex(vault.wire), vaultHash: toHex(vault.hash) }));
+    await this.store.transaction((tx) => tx.put("pendingReset", "pending", { resetId: toHex(resetId), oldIdentityId: toHex(pin.identityId), certificate: toHex(certificate), vault: vault ? toHex(vault.wire) : undefined, vaultHash: vault ? toHex(vault.hash) : undefined }));
     return this.resumeReset(stage, options.reauthProof);
   }
 
@@ -2089,7 +2115,7 @@ class ClientImpl implements Client {
     if (!row || !roots || roots.length !== RESET_ROOTS_BYTES) throw new KavachError("RECOVERY_REQUIRED", stage, "reset pending without its roots");
     const certificate = fromHex(row.certificate);
     expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage);
-    const outcome = await this.transport.directory.resetAccount({ accountName: this.accountName, expectedOldIdentityId: fromHex(row.oldIdentityId), newCertificate: certificate, newVault: fromHex(row.vault), resetId: fromHex(row.resetId), reauthProof: reauthProof ?? new Uint8Array() });
+    const outcome = await this.transport.directory.resetAccount({ accountName: this.accountName, expectedOldIdentityId: fromHex(row.oldIdentityId), newCertificate: certificate, newVault: row.vault === undefined ? undefined : fromHex(row.vault), resetId: fromHex(row.resetId), reauthProof: reauthProof ?? new Uint8Array() });
     if ((outcome.status !== "COMMITTED" && outcome.status !== "ALREADY_COMMITTED") || !outcome.receipt) throw new KavachError("NOT_AUTHORIZED", stage, `host refused reset: ${outcome.status}`);
     return this.finishReset(stage, row, roots);
   }
@@ -2115,7 +2141,7 @@ class ClientImpl implements Client {
         for (const [k] of tx.list(table)) tx.delete(table, k);
       }
       t1Header(tx, { account, device, certificate, instanceId, generation: 1n });
-      t9Vault(tx, { revision: "1", hash: row.vaultHash, wire: row.vault, pending: false, dirty: false });
+      if (row.vault !== undefined && row.vaultHash !== undefined) t9Vault(tx, { revision: "1", hash: row.vaultHash, wire: row.vault, pending: false, dirty: false });
       t1Activate(tx);
     });
     await this.secrets.delete("pendingReset");

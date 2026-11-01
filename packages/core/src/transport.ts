@@ -87,7 +87,8 @@ export interface Directory {
     newCertificate: Uint8Array;
     newVault: Uint8Array;
   }): Promise<MutationOutcome>;
-  registerAccount(input: { certificate: Uint8Array; vault: Uint8Array }): Promise<MutationOutcome>;
+  /** `vault` is absent for an account on a recovery-only profile without a recovery provider. */
+  registerAccount(input: { certificate: Uint8Array; vault: Uint8Array | undefined }): Promise<MutationOutcome>;
   getVault(accountName: string): Promise<Uint8Array | undefined>;
   publishVault(input: { expectedRevision: bigint; expectedHash: Uint8Array | undefined; newVault: Uint8Array }): Promise<MutationOutcome>;
   getCircle(circleId: Uint8Array): Promise<Uint8Array | undefined>;
@@ -101,7 +102,7 @@ export interface Directory {
     accountName: string;
     expectedOldIdentityId: Uint8Array;
     newCertificate: Uint8Array;
-    newVault: Uint8Array;
+    newVault: Uint8Array | undefined;
     resetId: Uint8Array;
     reauthProof: Uint8Array;
   }): Promise<MutationOutcome & { receipt?: Uint8Array | undefined }>;

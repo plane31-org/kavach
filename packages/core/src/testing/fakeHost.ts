@@ -276,7 +276,7 @@ export class FakeHost {
         const doc = expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice);
         const taken = host.accounts.get(doc.accountName);
         if (taken) return equalBytes(taken.certificate, certificate) ? { status: "ALREADY_COMMITTED" } : { status: "CONFLICT" };
-        const vh = parseVaultHeader(vault);
+        const vh = vault ? parseVaultHeader(vault) : undefined;
         const iid = toHex(identityId(doc.accountName, doc.accountKey));
         host.accounts.set(doc.accountName, {
           accountName: doc.accountName,
@@ -290,7 +290,7 @@ export class FakeHost {
           generation: doc.generation,
           deviceIds: new Set([toHex(doc.deviceId)]),
           retiredCertificates: new Set(),
-          vault: { wire: vault, revision: vh.vaultRevision, hash: toHex(vh.hash) },
+          vault: vault && vh ? { wire: vault, revision: vh.vaultRevision, hash: toHex(vh.hash) } : undefined,
           retiredIdentity: false,
           previousIdentities: new Set(),
           resetReceipt: undefined
@@ -411,7 +411,7 @@ export class FakeHost {
         );
         host.receipts.set(toHex(input.resetId), receipt);
         for (const c of host.circles.values()) if (c.ownerIdentityId === a.accountId) c.closed = true;
-        const vh = parseVaultHeader(input.newVault);
+        const vh = input.newVault ? parseVaultHeader(input.newVault) : undefined;
         // The whole chain is retired; the reset starts a new account root with an empty chain.
         a.previousIdentities.add(a.identityId);
         a.previousIdentities.add(a.accountId);
@@ -427,7 +427,7 @@ export class FakeHost {
         a.generation = doc.generation;
         a.deviceIds.add(toHex(doc.deviceId));
         a.accountId = toHex(newIid);
-        a.vault = { wire: input.newVault, revision: vh.vaultRevision, hash: toHex(vh.hash) };
+        a.vault = input.newVault && vh ? { wire: input.newVault, revision: vh.vaultRevision, hash: toHex(vh.hash) } : undefined;
         host.certificates.set(a.certificateHash, input.newCertificate);
         host.stream(toHex(deriveStreamId(newIid, doc.deviceId)), a.accountId, a.accountName);
         return { status: "COMMITTED" as const, receipt };

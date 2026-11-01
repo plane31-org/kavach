@@ -17,7 +17,7 @@ export async function handle(request: Request, env: Env): Promise<Response> {
 async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const now = hostNow(request, env);
-  const dir = new Directory(env, now);
+  const dir = new Directory(env, now, env.ALLOW_TEST_CLOCK === "true" && request.headers.get("x-test-fail-stream-open") === "true");
   const p = url.pathname.replace(/\/+$/, "").split("/").slice(1); // ["v1", ...]
   const m = request.method;
   if (url.pathname === "/health") return json({ ok: true, host: "kavach reference host", clock: env.ALLOW_TEST_CLOCK === "true" ? "test" : "real" });
@@ -26,7 +26,7 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   // Directory ----------------------------------------------------------------------------------
   if (seg[0] === "accounts" && seg.length === 1 && m === "POST") {
-    const b = await body<{ certificate: string; vault: string }>(request);
+    const b = await body<{ certificate: string; vault?: string }>(request);
     return json(await dir.register(b.certificate, b.vault));
   }
   if (seg[0] === "accounts" && seg.length === 1 && m === "GET") {
@@ -82,7 +82,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     return w ? json({ wire: w }) : error(404, "NOT_FOUND");
   }
   if (seg[0] === "accounts" && seg[1] && seg[2] === "reset" && m === "POST") {
-    const b = await body<{ expectedOldIdentityId: string; newCertificate: string; newVault: string; resetId: string }>(request);
+    const b = await body<{ expectedOldIdentityId: string; newCertificate: string; newVault?: string; resetId: string }>(request);
     return json(await dir.reset({ accountName: seg[1], ...b }));
   }
   if (seg[0] === "accounts" && seg[1] && seg[2] === "succeed" && m === "POST") {
@@ -115,6 +115,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     }
     if (seg[2] === "epochs" && seg.length === 3 && m === "PUT") {
       const a = await dir.currentDevice(requireCaller(request));
+      await dir.ensureStream(a); // the current device's stream exists before its first manifest, however its commit ended
       const b = await body<{ expectedEpoch: number; manifest: string; wraps: Record<string, string> }>(request);
       const r = await call<{ status: string; newSubscriptions?: { certificateHash: string; identityId: string }[] }>("/publishEpoch", { callerIdentityId: accountIdOf(a), ...b });
       for (const s of r.newSubscriptions ?? []) {

@@ -7,7 +7,7 @@
  * only a new transition meets the pin, generation, retirement and certificate checks.
  */
 import { equalBytes, toHex } from "./bytes.js";
-import { DocumentType, expectType, parseDocument, verifyDocument, type AccountDevice, type AccountSuccession } from "./codec.js";
+import { DocumentType, expectType, parseDocument, verifyDocument, type AccountDevice, type AccountSuccession, type Parsed } from "./codec.js";
 import { identityId } from "./crypto.js";
 import { KavachError } from "./errors.js";
 import { pinFromCertificate, type AccountPin } from "./identity.js";
@@ -63,6 +63,74 @@ export function successionKey(accountId: string, previousGeneration: bigint): st
   return `${accountId}:${previousGeneration.toString().padStart(20, "0")}`;
 }
 
+/**
+ * The state a chain is validated against, the same for a pinned contact, a first contact and a
+ * restoring device: where the account stands and what it has used up. Advancing it is pure, so
+ * the state after a verified prefix is recomputed from the prefix and never persisted separately.
+ */
+export interface ChainState {
+  readonly accountId: string;
+  readonly accountName: string;
+  /** The identity a transition must leave from. */
+  readonly identityId: string;
+  /** The generation a transition may not fall below (0 at a root nobody has pinned). */
+  readonly generation: bigint;
+  /** Identities no transition may leave from or arrive at: retired by successions or by resets. */
+  readonly retired: ReadonlySet<string>;
+  /** Device ids the account has used, hex. */
+  readonly deviceIds: ReadonlySet<string>;
+}
+
+/** The state of an account nobody has pinned yet: its root, with what the reset trust already retired. */
+export function rootState(accountId: Uint8Array, accountName: string, trust: ResetTrust): ChainState {
+  return { accountId: toHex(accountId), accountName, identityId: toHex(accountId), generation: 0n, retired: new Set(trust.state.retired), deviceIds: new Set() };
+}
+
+/** The state at a pin: its current identity and generation, the identities this store retired, and its device ids. */
+export function pinnedState(tx: Pick<Tx, "get" | "list">, pin: AccountPin, trust: ResetTrust): ChainState {
+  const accountId = toHex(pin.accountId);
+  const retired = new Set(trust.state.retired);
+  for (const [k, r] of tx.list("identities")) if (r.accountId === accountId && r.retired) retired.add(k);
+  return { accountId, accountName: pin.accountName, identityId: toHex(pin.identityId), generation: pin.generation, retired, deviceIds: new Set(pin.deviceIds.map(toHex)) };
+}
+
+/**
+ * The transition rules (section 4, order four), applied to one parsed succession and the
+ * certificate served with it against a state. Throws the protocol code; returns the next state.
+ * Authentication (order two) and the comparison with recorded transitions (orders one and three)
+ * are the caller's, since only a store knows what it recorded.
+ */
+export function validateTransition(doc: AccountSuccession, certificate: Uint8Array, state: ChainState): { next: ChainState; cert: Parsed<AccountDevice> } {
+  const stage = "succession";
+  const t = transitionOf(doc);
+  if (t.accountName !== state.accountName || t.accountId !== state.accountId) throw new KavachError("SUCCESSION_BINDING", stage, "account name or id does not match");
+  if (t.previousIdentityId !== state.identityId) throw new KavachError("SUCCESSION_BINDING", stage, "previous identity is not the account's current identity");
+  if (t.previousGeneration < state.generation) throw new KavachError("ROLLBACK", stage, "previous generation below the current one");
+  if (state.retired.has(t.previousIdentityId) || state.retired.has(t.newIdentityId)) throw new KavachError("SUPERSEDED_IDENTITY", stage, "a retired identity cannot be previous or new");
+  const cert = expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage);
+  if (toHex(cert.bodyHash) !== t.newCertificateHash || cert.accountName !== t.accountName || cert.generation !== t.newGeneration || toHex(identityId(cert.accountName, cert.accountKey)) !== t.newIdentityId) {
+    throw new KavachError("SUCCESSION_BINDING", stage, "the certificate does not bind to the succession");
+  }
+  if (state.deviceIds.has(toHex(cert.deviceId))) throw new KavachError("DEVICE_ID_REUSED", stage);
+  const retired = new Set(state.retired);
+  retired.add(t.previousIdentityId);
+  const deviceIds = new Set(state.deviceIds);
+  deviceIds.add(toHex(cert.deviceId));
+  return { next: { ...state, identityId: t.newIdentityId, generation: t.newGeneration, retired, deviceIds }, cert };
+}
+
+/** Authenticate an attestation under the current list (order two). Returns the verified document. */
+export function authenticateSuccession(wire: Uint8Array, trust: ResetTrust, now: bigint | undefined): AccountSuccession {
+  const stage = "succession";
+  const parsed = expectType<AccountSuccession>(parseDocument(wire), DocumentType.AccountSuccession, stage);
+  if (now === undefined || now < trust.state.timeHighWater) throw new KavachError("RESET_CLOCK_UNTRUSTED", stage);
+  const list = trust.state.current;
+  if (!list || !trust.fresh(now)) throw new KavachError("RESET_KEYS_REQUIRED", stage, "no fresh key list");
+  const signer = list.list.keys.find((k) => equalBytes(k.keyId, parsed.authorityKeyId));
+  if (!signer) throw new KavachError("RESET_KEY_REVOKED", stage, "the signing key is not in the current list");
+  return expectType<AccountSuccession>(verifyDocument(wire, signer.publicKey), DocumentType.AccountSuccession, stage);
+}
+
 export interface SuccessionEffect {
   readonly outcome: "ACCEPTED" | "DUPLICATE";
   readonly accountId: Uint8Array;
@@ -100,37 +168,26 @@ export function retiredIdentities(tx: Pick<Tx, "list">): Set<string> {
  * accepted or duplicate document; throws the protocol code for anything else, having written
  * nothing (an equivocation is recorded by the caller's quarantine).
  */
-/**
- * Verify a whole chain for an account whose current key this device holds (identity continuity
- * after successions): every link attested under the current list, contiguous from the root to
- * `finalIdentityId`, each certificate bound by its link. Returns the parsed links in order.
- * Nothing is written; `recordChainIn` keeps the evidence once the header exists.
- */
 export interface VerifiedLink {
   readonly doc: AccountSuccession;
   readonly wire: Uint8Array;
   readonly certificate: Uint8Array;
 }
 
-export function verifyChain(links: readonly { wire: Uint8Array; certificate: Uint8Array }[], input: { accountId: Uint8Array; startIdentityId?: Uint8Array; finalIdentityId?: Uint8Array; trust: ResetTrust; now: bigint }): VerifiedLink[] {
-  const stage = "chain";
-  const list = input.trust.state.current;
-  if (!list || !input.trust.fresh(input.now)) throw new KavachError("RESET_KEYS_REQUIRED", stage, "no fresh key list");
+/**
+ * Verify links in order from a state, with the same rules a pinned contact applies: each
+ * attested under the current list, each transition valid against the state the previous one
+ * produced. Nothing is written; the caller records the links once the chain is complete.
+ */
+export function verifyChain(links: readonly { wire: Uint8Array; certificate: Uint8Array }[], input: { state: ChainState; trust: ResetTrust; now: bigint }): { links: VerifiedLink[]; state: ChainState } {
   const out: VerifiedLink[] = [];
-  let previous = input.startIdentityId ?? input.accountId;
+  let state = input.state;
   for (const link of links) {
-    const parsed = expectType<AccountSuccession>(parseDocument(link.wire), DocumentType.AccountSuccession, stage);
-    const signer = list.list.keys.find((k) => equalBytes(k.keyId, parsed.authorityKeyId));
-    if (!signer) throw new KavachError("RESET_KEY_REVOKED", stage, "a link is attested under a key the list no longer allows");
-    const doc = expectType<AccountSuccession>(verifyDocument(link.wire, signer.publicKey), DocumentType.AccountSuccession, stage);
-    const cert = expectType<AccountDevice>(verifyDocument(link.certificate), DocumentType.AccountDevice, stage);
-    if (!equalBytes(doc.accountId, input.accountId) || !equalBytes(doc.previousIdentityId, previous) || doc.accountName !== cert.accountName) throw new KavachError("SUCCESSION_BINDING", stage, "the chain is not contiguous from the root");
-    if (!equalBytes(doc.newCertificateHash, cert.bodyHash) || !equalBytes(identityId(cert.accountName, cert.accountKey), doc.newIdentityId) || cert.generation !== doc.newGeneration) throw new KavachError("SUCCESSION_BINDING", stage, "a link does not bind its certificate");
+    const doc = authenticateSuccession(link.wire, input.trust, input.now);
+    state = validateTransition(doc, link.certificate, state).next;
     out.push({ doc, wire: link.wire, certificate: link.certificate });
-    previous = doc.newIdentityId;
   }
-  if (input.finalIdentityId && !equalBytes(previous, input.finalIdentityId)) throw new KavachError("SUCCESSION_BINDING", stage, "the chain does not end at this key");
-  return out;
+  return { links: out, state };
 }
 
 /** Keep a verified chain as evidence: succession rows, identity rows (retired ones with the keys the chain shows) and key-change rows. */
@@ -171,12 +228,8 @@ export function applySuccession(tx: Tx, input: SuccessionInput): SuccessionEffec
   // Order 1: authenticate the attestation under the current list. A failure here records nothing
   // and changes nothing, so an obsolete attestation of an accepted transition is merely dropped.
   const now = input.now;
-  if (now === undefined || now < input.trust.state.timeHighWater) throw new KavachError("RESET_CLOCK_UNTRUSTED", stage);
-  const list = input.trust.state.current;
-  if (!list || !input.trust.fresh(now)) throw new KavachError("RESET_KEYS_REQUIRED", stage, "no fresh key list");
-  const signer = list.list.keys.find((k) => equalBytes(k.keyId, parsed.authorityKeyId));
-  if (!signer) throw new KavachError("RESET_KEY_REVOKED", stage, "the signing key is not in the current list");
-  expectType<AccountSuccession>(verifyDocument(input.wire, signer.publicKey), DocumentType.AccountSuccession, stage);
+  authenticateSuccession(input.wire, input.trust, now);
+  if (now === undefined) throw new KavachError("RESET_CLOCK_UNTRUSTED", stage);
 
   // Order 2: compare the transition with the recorded ones for this account.
   const recorded = tx.list("successions", t.accountId + ":").map(([, r]) => r);
@@ -192,22 +245,10 @@ export function applySuccession(tx: Tx, input: SuccessionInput): SuccessionEffec
   }
   if (byId && !sameTransition(rowTransition(byId), t)) throw new KavachError("EQUIVOCATION", stage, "a known succession id with a different transition");
 
-  // Order 3: a new transition against the pin, the generation, the retired set and the certificate.
+  // Order 3: a new transition against the pinned state, with the one validator every path uses.
   if (!pinRow) throw new KavachError("SUCCESSION_BINDING", stage, "no pin for the account");
   const pin = rowToPin(pinRow);
-  if (pin.accountName !== t.accountName || (pinRow.accountId ?? pinRow.identityId) !== t.accountId) throw new KavachError("SUCCESSION_BINDING", stage, "account name or id does not match the pin");
-  if (toHex(pin.identityId) !== t.previousIdentityId) throw new KavachError("SUCCESSION_BINDING", stage, "previous identity is not the account's current identity");
-  if (t.previousGeneration < pin.generation) throw new KavachError("ROLLBACK", stage, "previous generation below the pinned one");
-  const retiredBySuccession = (hex: string): boolean => tx.get("identities", hex)?.retired === true;
-  if (retiredBySuccession(t.previousIdentityId) || retiredBySuccession(t.newIdentityId) || input.trust.state.retired.has(t.previousIdentityId) || input.trust.state.retired.has(t.newIdentityId)) {
-    throw new KavachError("SUPERSEDED_IDENTITY", stage, "a retired identity cannot be previous or new");
-  }
-  const cert = expectType<AccountDevice>(verifyDocument(input.newCertificate), DocumentType.AccountDevice, stage);
-  const derived = identityId(cert.accountName, cert.accountKey);
-  if (toHex(cert.bodyHash) !== t.newCertificateHash || cert.accountName !== t.accountName || cert.generation !== t.newGeneration || toHex(derived) !== t.newIdentityId) {
-    throw new KavachError("SUCCESSION_BINDING", stage, "the certificate does not bind to the succession");
-  }
-  if (pin.deviceIds.some((d) => equalBytes(d, cert.deviceId))) throw new KavachError("DEVICE_ID_REUSED", stage);
+  const { cert } = validateTransition(parsed, input.newCertificate, pinnedState(tx, pin, input.trust));
 
   // Accept, all in this transaction: the pin, the certificates, the identities, the transition,
   // the durable notice, and the rotation (T3) that moves the audience to the new key.

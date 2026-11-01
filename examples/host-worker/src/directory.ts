@@ -77,8 +77,11 @@ interface SubscriptionView {
 export class Directory {
   constructor(
     private readonly env: Env,
-    private readonly now: bigint
+    private readonly now: bigint,
+    /** Test switch: the next stream open fails after the directory committed, as a crashed Durable Object call would. */
+    private readonly failStreamOpenOnce = false
   ) {}
+  private streamOpenFailed = false
 
   private get db(): D1Database {
     return this.env.DIRECTORY;
@@ -168,7 +171,12 @@ export class Directory {
     // The succession id answers first: a device retrying after a lost response finds its proposal
     // committed and its token spent, and must get the document, not UNAUTHORIZED.
     const known = await this.db.prepare("SELECT account_name, certificate_hash, wire FROM successions WHERE succession_id = ?").bind(input.successionId).first<{ account_name: string; certificate_hash: string; wire: string }>();
-    if (known) return known.certificate_hash === certHash && known.account_name === input.accountName ? { status: "ALREADY_COMMITTED", succession: known.wire } : { status: "UNAUTHORIZED" };
+    if (known) {
+      if (known.certificate_hash !== certHash || known.account_name !== input.accountName) return { status: "UNAUTHORIZED" };
+      const committed = await this.account(input.accountName);
+      if (committed) await this.ensureStream(committed); // a commit whose stream open did not finish
+      return { status: "ALREADY_COMMITTED", succession: known.wire };
+    }
     const a = await this.account(input.accountName);
     if (!a || doc.accountName !== a.account_name) return { status: "UNAUTHORIZED" };
     const auth = await this.db.prepare("SELECT * FROM authorizations WHERE token = ?").bind(input.authorization).first<{ account_name: string; succession_id: string; expected_certificate_hash: string; certificate_hash: string; expires_at: string; used: number }>();
@@ -273,19 +281,19 @@ export class Directory {
     return r?.wire ?? null;
   }
 
-  async register(certificateHex: string, vaultHex: string): Promise<Outcome> {
+  async register(certificateHex: string, vaultHex: string | undefined): Promise<Outcome> {
     const certificate = unhex(certificateHex, "certificate");
     const doc = expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice);
     const taken = await this.account(doc.accountName);
     // The same certificate again is an enrollment resuming after a lost response, not a conflict.
     if (taken) return taken.certificate === certificateHex ? { status: "ALREADY_COMMITTED" } : { status: "CONFLICT" };
-    const vh = parseVaultHeader(unhex(vaultHex, "vault"));
+    const vh = vaultHex ? parseVaultHeader(unhex(vaultHex, "vault")) : undefined;
     const iid = hex(identityId(doc.accountName, doc.accountKey));
     const certHash = hex(doc.bodyHash);
     await this.db.batch([
       this.db
         .prepare("INSERT INTO accounts (account_name, account_key, identity_id, account_id, certificate, certificate_hash, generation, vault, vault_revision, vault_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(doc.accountName, hex(doc.accountKey), iid, iid, certificateHex, certHash, doc.generation.toString(), vaultHex, vh.vaultRevision.toString(), hex(vh.hash)),
+        .bind(doc.accountName, hex(doc.accountKey), iid, iid, certificateHex, certHash, doc.generation.toString(), vaultHex ?? null, vh ? vh.vaultRevision.toString() : null, vh ? hex(vh.hash) : null),
       this.db.prepare("INSERT INTO identities (identity_id, account_name) VALUES (?, ?)").bind(iid, doc.accountName),
       this.db.prepare("INSERT INTO certificates (certificate_hash, account_name, wire, current) VALUES (?, ?, ?, 1)").bind(certHash, doc.accountName, certificateHex),
       this.db.prepare("INSERT INTO device_ids (account_name, device_id) VALUES (?, ?)").bind(doc.accountName, hex(doc.deviceId))
@@ -296,9 +304,24 @@ export class Directory {
 
   /** A stream is derived from the key identity and the device id; its author is the account id, which manifests name. */
   private async openStream(iid: string, deviceId: Uint8Array, accountName: string, authorAccountId = iid): Promise<void> {
+    if (this.failStreamOpenOnce && !this.streamOpenFailed) {
+      this.streamOpenFailed = true;
+      throw new HttpError(503, "RETRYABLE", "stream open failed");
+    }
     const sid = hex(streamId(unhex(iid, "identity"), deviceId));
     const stub = this.env.STREAMS.get(this.env.STREAMS.idFromName(sid));
     await stub.fetch("https://stream/open", { method: "POST", body: JSON.stringify({ streamId: sid, authorIdentityId: authorAccountId, accountName }) });
+  }
+
+  /**
+   * The stream of the account's current device, opened if it is not: the completion step of
+   * every commit that moved the current-device pointer. The Durable Object's open is idempotent,
+   * so this runs on a retry that finds the commit already made, and before the current device's
+   * first publication, which is how a device that finished from the chain gets its stream.
+   */
+  async ensureStream(a: AccountRow): Promise<void> {
+    const doc = expectType<AccountDevice>(verifyDocument(unhex(a.certificate, "certificate")), DocumentType.AccountDevice);
+    await this.openStream(a.identity_id, doc.deviceId, a.account_name, accountIdOf(a));
   }
 
   async activate(input: { accountName: string; expectedCertificateHash: string; expectedVaultRevision: string; expectedVaultHash: string; newCertificate: string; newVault: string }): Promise<Outcome> {
@@ -306,7 +329,10 @@ export class Directory {
     if (!a) return { status: "UNAUTHORIZED" };
     const doc = expectType<AccountDevice>(verifyDocument(unhex(input.newCertificate, "newCertificate")), DocumentType.AccountDevice);
     const newHash = hex(doc.bodyHash);
-    if (newHash === a.certificate_hash) return { status: "ALREADY_COMMITTED" };
+    if (newHash === a.certificate_hash) {
+      await this.ensureStream(a);
+      return { status: "ALREADY_COMMITTED" };
+    }
     if (a.certificate_hash !== input.expectedCertificateHash) return { status: "CONFLICT", current: a.certificate };
     if (a.vault_revision !== input.expectedVaultRevision || a.vault_hash !== input.expectedVaultHash) return { status: "CONFLICT", ...(a.vault ? { current: a.vault } : {}), ...(a.vault_revision ? { currentRevision: a.vault_revision } : {}) };
     if (hex(doc.accountKey) !== a.account_key || doc.generation !== BigInt(a.generation) + 1n) return { status: "UNAUTHORIZED" };
@@ -415,11 +441,15 @@ export class Directory {
     return r?.wire ?? null;
   }
 
-  async reset(input: { accountName: string; expectedOldIdentityId: string; newCertificate: string; newVault: string; resetId: string }): Promise<Outcome> {
+  async reset(input: { accountName: string; expectedOldIdentityId: string; newCertificate: string; newVault?: string; resetId: string }): Promise<Outcome> {
     // The reset id answers first: a device retrying after a lost response finds the account
     // already under its new identity and must get its receipt, not UNAUTHORIZED.
     const existing = await this.receipt(input.resetId);
-    if (existing) return { status: "ALREADY_COMMITTED", receipt: existing };
+    if (existing) {
+      const committed = await this.account(input.accountName);
+      if (committed) await this.ensureStream(committed);
+      return { status: "ALREADY_COMMITTED", receipt: existing };
+    }
     const a = await this.account(input.accountName);
     if (!a || a.identity_id !== input.expectedOldIdentityId) return { status: "UNAUTHORIZED" };
     if (!this.env.RESET_OPERATIONAL_SEED || !this.env.RESET_KEY_ID) return { status: "PERMANENT_FAILURE" };
@@ -431,7 +461,7 @@ export class Directory {
       { accountName: a.account_name, oldIdentityId: unhex(a.identity_id, "iid"), newIdentityId: newIid, resetId: unhex(input.resetId, "resetId"), issuedAt: this.now, authorityKeyId: unhex(this.env.RESET_KEY_ID, "keyId") },
       signer.secretKey
     );
-    const vh = parseVaultHeader(unhex(input.newVault, "newVault"));
+    const vh = input.newVault ? parseVaultHeader(unhex(input.newVault, "newVault")) : undefined;
     const receiptHex = hex(receipt);
     const newHash = hex(doc.bodyHash);
     await this.db.batch([
@@ -440,7 +470,7 @@ export class Directory {
       // The whole chain is retired: the reset starts a new account root with an empty chain.
       this.db
         .prepare("UPDATE accounts SET account_key = ?, identity_id = ?, account_id = ?, certificate = ?, certificate_hash = ?, generation = ?, vault = ?, vault_revision = ?, vault_hash = ?, reset_receipt = ? WHERE account_name = ?")
-        .bind(hex(doc.accountKey), hex(newIid), hex(newIid), input.newCertificate, newHash, doc.generation.toString(), input.newVault, vh.vaultRevision.toString(), hex(vh.hash), receiptHex, a.account_name),
+        .bind(hex(doc.accountKey), hex(newIid), hex(newIid), input.newCertificate, newHash, doc.generation.toString(), input.newVault ?? null, vh ? vh.vaultRevision.toString() : null, vh ? hex(vh.hash) : null, receiptHex, a.account_name),
       this.db.prepare("INSERT INTO identities (identity_id, account_name) VALUES (?, ?)").bind(hex(newIid), a.account_name),
       this.db.prepare("UPDATE certificates SET current = 0 WHERE account_name = ?").bind(a.account_name),
       this.db.prepare("INSERT INTO certificates (certificate_hash, account_name, wire, current) VALUES (?, ?, ?, 1)").bind(newHash, a.account_name, input.newCertificate),

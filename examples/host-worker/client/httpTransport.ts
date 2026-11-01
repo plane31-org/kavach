@@ -68,7 +68,7 @@ export function httpTransport(o: HttpTransportOptions): Transport {
       const r = await call<{ wire: string } | null>("GET", `/v1/certificates/${toHex(hash)}`);
       return r ? fromHex(r.wire) : undefined;
     },
-    registerAccount: async ({ certificate, vault }) => outcome(await call<Json>("POST", "/v1/accounts", { certificate: toHex(certificate), vault: toHex(vault) })),
+    registerAccount: async ({ certificate, vault }) => outcome(await call<Json>("POST", "/v1/accounts", { certificate: toHex(certificate), ...(vault ? { vault: toHex(vault) } : {}) })),
     activateDevice: async (i) =>
       outcome(
         await call<Json>("POST", `/v1/accounts/${i.accountName}/activate`, {
@@ -102,7 +102,7 @@ export function httpTransport(o: HttpTransportOptions): Transport {
       return r ? fromHex(r.wire) : undefined;
     },
     resetAccount: async (i) => {
-      const r = await call<Json>("POST", `/v1/accounts/${i.accountName}/reset`, { expectedOldIdentityId: toHex(i.expectedOldIdentityId), newCertificate: toHex(i.newCertificate), newVault: toHex(i.newVault), resetId: toHex(i.resetId) });
+      const r = await call<Json>("POST", `/v1/accounts/${i.accountName}/reset`, { expectedOldIdentityId: toHex(i.expectedOldIdentityId), newCertificate: toHex(i.newCertificate), ...(i.newVault ? { newVault: toHex(i.newVault) } : {}), resetId: toHex(i.resetId) });
       return { ...outcome(r), ...(typeof r["receipt"] === "string" ? { receipt: fromHex(r["receipt"]) } : {}) };
     },
     succeedAccount: async (i) => {

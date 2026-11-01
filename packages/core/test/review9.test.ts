@@ -148,6 +148,77 @@ describe("5: chain paging resumes within the budget", () => {
   });
 });
 
+describe("second review: chains over time", () => {
+  it("a second replacement after a peer accepted the first: the served chain is reconciled with the accepted prefix and applied", async () => {
+    const w = world();
+    const { a, bobId } = await pair(w);
+    await recover(w, "bob");
+    const first = await w.sync(a);
+    expect([first.errors, first.metadata.successions]).toEqual([[], 1]);
+    await recover(w, "bob");
+    const second = await w.sync(a);
+    expect([second.errors, second.metadata.successions]).toEqual([[], 1]);
+    expect((await a.store.read((tx) => tx.get("pins", toHex(bobId))))?.generation).toBe("3");
+    expect((await a.client.keyChanges({ accountId: bobId })).map((c) => c.generation)).toEqual([3n, 2n]);
+    // And a third, with a sync in between again.
+    await recover(w, "bob");
+    const third = await w.sync(a);
+    expect([third.errors, third.metadata.successions, (await a.store.read((tx) => tx.get("pins", toHex(bobId))))?.generation]).toEqual([[], 1, "4"]);
+  });
+
+  it("a return to a retired identity is refused by a first contact exactly as by an established peer", async () => {
+    const w = world();
+    const { a, b, circleId, aliceId, bobId } = await pair(w);
+    const seedA = (await b.secrets.get("accountSeed")) ?? new Uint8Array(32);
+    await recover(w, "bob"); // A -> B
+    // The host signs a succession back to A's key (it checks only that the key differs from the current one).
+    const acct = w.host.accounts.get("bob");
+    if (!acct) throw new Error("bob");
+    const accountA = openAccount("bob", seedA);
+    const device = newDevice();
+    const certificate = certify(accountA, device, acct.generation + 1n);
+    const successionId = randomBytes(16);
+    const expected = fromHex(acct.certificateHash);
+    const token = w.host.authorizeReplacement({ accountName: "bob", successionId, expectedCertificateHash: expected, certificate });
+    expect((await w.host.asDevice("bob", expected).directory.succeedAccount({ accountName: "bob", expectedCertificateHash: expected, newCertificate: certificate, newVault: undefined, successionId, authorization: token })).status).toBe("COMMITTED");
+    // Carol, a first contact, and Alice, established at A: both refuse, neither pins A again.
+    const c = await w.device("carol");
+    await c.client.initializeAccount();
+    await c.client.circles.requestJoin(circleId, aliceId);
+    await w.sync(a);
+    await a.client.circles.approve(circleId, "carol");
+    await w.sync(a);
+    const cr = await w.sync(c);
+    expect(cr.errors.map((e) => e.code)).toContain("SUPERSEDED_IDENTITY");
+    expect(await c.store.read((tx) => tx.get("pins", toHex(bobId)))).toBeUndefined();
+    const ar = await w.sync(a);
+    expect(ar.errors.map((e) => e.code)).toContain("SUPERSEDED_IDENTITY");
+    expect((await a.store.read((tx) => tx.get("pins", toHex(bobId))))?.generation).toBe("1");
+    expect(a.events.some((e) => e.kind === "securityError" && e.code === "SUPERSEDED_IDENTITY")).toBe(true);
+  });
+});
+
+describe("a recovery-only client without a provider has no vault", () => {
+  it("registers without one, publishes none, and the host holds none", async () => {
+    const recovery = { ...testPolicy, replacement: "recovery" as const };
+    const w = world(recovery);
+    const alice = await open({ accountName: "alice", retentionPolicy: recovery, resetTrust, secretStore: new MemorySecretStore(), store: new MemoryStore(), transport: hostTransport(w.host, "alice"), now: w.clock.now });
+    await alice.initializeAccount();
+    const { circleId } = await alice.circles.create();
+    await alice.circles.setEnabled(circleId, false);
+    await alice.sync();
+    expect(w.host.accounts.get("alice")?.vault).toBeUndefined();
+    expect((await alice.inspect()).vault).toBeUndefined();
+    const a2 = await open({ accountName: "alice", retentionPolicy: recovery, resetTrust, secretStore: new MemorySecretStore(), store: new MemoryStore(), transport: hostTransport(w.host, "alice"), now: w.clock.now });
+    const p = await a2.prepareReplacement();
+    const token = w.host.authorizeReplacement({ accountName: "alice", successionId: p.successionId, expectedCertificateHash: p.expectedCertificateHash, certificate: p.certificate });
+    await a2.completeReplacement({ successionId: p.successionId, authorization: token });
+    const r = await a2.sync();
+    expect([r.errors, r.bootstrap?.circles, (await a2.inspect()).vault, w.host.accounts.get("alice")?.vault]).toEqual([[], 1, undefined, undefined]);
+    expect((await a2.circles.list())[0]?.enabled).toBe(false);
+  });
+});
+
 describe("the recovery provider on a recovery-only profile", () => {
   it("is optional there, required where identity continuity is enabled, and the account works without it", async () => {
     const recovery = { ...testPolicy, replacement: "recovery" as const };
