@@ -291,8 +291,8 @@ export interface SuccessionRow {
 export interface IdentityRow {
   accountId: string;
   accountName: string;
-  /** The account key of this identity, so a snapshot signed under a retired owner key still verifies. */
-  accountKey: string;
+  /** The account key of this identity, so a snapshot signed under a retired owner key still verifies. Absent for a chain root whose certificate this device never saw. */
+  accountKey?: string;
   /** The generation at which this identity became current (1 for a root). */
   sinceGeneration: string;
   /** Retired as a key identity, by a succession or a reset. The account itself may live on under a successor. */

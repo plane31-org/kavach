@@ -24,10 +24,9 @@ describe("account recovery over HTTP", () => {
     expect((await b2.client.completeReplacement({ successionId: proposal.successionId, authorization: Uint8Array.from(Buffer.from(token, "hex")) })).generation).toBe(2n);
     const first = await b2.client.sync();
     expect([first.errors, first.bootstrap]).toEqual([[], { circles: 1, pending: 0, failed: 0 }]);
-    expect((await b2.client.circles.list()).map((c) => [toHex(c.circleId), c.status, c.enabled])).toEqual([[toHex(circleId), "member", false]]);
+    expect((await b2.client.circles.list()).map((c) => [toHex(c.circleId), c.status, c.enabled])).toEqual([[toHex(circleId), "member", true]]);
     const ar = await a.client.sync();
     expect([ar.errors, ar.metadata.successions]).toEqual([[], 1]);
-    await b2.client.circles.setEnabled(circleId, true);
     await b2.client.sync();
     await enqueueLocation(b2.client, loc(2));
     await b2.client.sync();

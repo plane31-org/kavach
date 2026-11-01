@@ -57,7 +57,8 @@ export function httpTransport(o: HttpTransportOptions): Transport {
       certificate: fromHex(String(r["certificate"])),
       ...(typeof r["resetReceipt"] === "string" ? { resetReceipt: fromHex(r["resetReceipt"]) } : {}),
       ...(Array.isArray(r["successions"]) ? { successions: links(r["successions"]) } : {}),
-      ...(typeof r["successionsNext"] === "string" ? { successionsNext: BigInt(r["successionsNext"]) } : {})
+      ...(typeof r["successionsNext"] === "string" ? { successionsNext: BigInt(r["successionsNext"]) } : {}),
+      ...(typeof r["rootCertificate"] === "string" ? { rootCertificate: fromHex(r["rootCertificate"]) } : {})
     }));
 
   const directory: Directory = {
@@ -116,7 +117,7 @@ export function httpTransport(o: HttpTransportOptions): Transport {
     },
     getSuccessions: async (accountId, after, limit) => {
       const r = await call<Json | null>("GET", `/v1/successions/${toHex(accountId)}?after=${after}&limit=${limit}`);
-      return { successions: links(r?.["successions"]), ...(typeof r?.["nextGeneration"] === "string" ? { nextGeneration: BigInt(r["nextGeneration"]) } : {}) };
+      return { successions: links(r?.["successions"]), ...(typeof r?.["nextGeneration"] === "string" ? { nextGeneration: BigInt(r["nextGeneration"]) } : {}), ...(typeof r?.["rootCertificate"] === "string" ? { rootCertificate: fromHex(r["rootCertificate"]) } : {}) };
     },
     listCircles: async (cursor) => {
       const r = await call<Json | null>("GET", `/v1/circles${cursor ? `?cursor=${cursor}` : ""}`);

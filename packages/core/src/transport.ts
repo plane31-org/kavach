@@ -23,6 +23,8 @@ export interface ResolvedAccount {
   readonly successions?: readonly SuccessionLink[] | undefined;
   /** Set when `successions` is not the whole chain: the generation to continue from with `getSuccessions`. */
   readonly successionsNext?: bigint | undefined;
+  /** With a non-empty chain: a certificate under the root key (the one the first succession replaced), so a peer can verify what that key signed. */
+  readonly rootCertificate?: Uint8Array | undefined;
 }
 
 /** One link of an account's succession chain: the type 9 document and the certificate it binds. */
@@ -33,6 +35,8 @@ export interface SuccessionLink {
 
 export interface SuccessionPage {
   readonly successions: readonly SuccessionLink[];
+  /** On the first page of a non-empty chain: a certificate under the root key. */
+  readonly rootCertificate?: Uint8Array | undefined;
   /** The generation to ask after for the next page; absent when the chain ends here. */
   readonly nextGeneration?: bigint | undefined;
 }

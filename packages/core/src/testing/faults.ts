@@ -258,7 +258,8 @@ export class MaliciousTransport implements Transport {
       },
       listCircles: async (cursor) => {
         this.calls.push("listCircles");
-        return k.withhold.has("circleList") ? { circles: [] } : d().listCircles(cursor);
+        if (k.withhold.has("circleList")) throw new KavachError("NETWORK", "transport", "network unreachable");
+        return d().listCircles(cursor);
       },
       setSharingPreference: (circleId, enabled, expected) => this.mutate("setSharingPreference", () => d().setSharingPreference(circleId, enabled, expected))
     };

@@ -100,6 +100,68 @@ export function retiredIdentities(tx: Pick<Tx, "list">): Set<string> {
  * accepted or duplicate document; throws the protocol code for anything else, having written
  * nothing (an equivocation is recorded by the caller's quarantine).
  */
+/**
+ * Verify a whole chain for an account whose current key this device holds (identity continuity
+ * after successions): every link attested under the current list, contiguous from the root to
+ * `finalIdentityId`, each certificate bound by its link. Returns the parsed links in order.
+ * Nothing is written; `recordChainIn` keeps the evidence once the header exists.
+ */
+export interface VerifiedLink {
+  readonly doc: AccountSuccession;
+  readonly wire: Uint8Array;
+  readonly certificate: Uint8Array;
+}
+
+export function verifyChain(links: readonly { wire: Uint8Array; certificate: Uint8Array }[], input: { accountId: Uint8Array; finalIdentityId: Uint8Array; trust: ResetTrust; now: bigint }): VerifiedLink[] {
+  const stage = "chain";
+  const list = input.trust.state.current;
+  if (!list || !input.trust.fresh(input.now)) throw new KavachError("RESET_KEYS_REQUIRED", stage, "no fresh key list");
+  const out: VerifiedLink[] = [];
+  let previous = input.accountId;
+  for (const link of links) {
+    const parsed = expectType<AccountSuccession>(parseDocument(link.wire), DocumentType.AccountSuccession, stage);
+    const signer = list.list.keys.find((k) => equalBytes(k.keyId, parsed.authorityKeyId));
+    if (!signer) throw new KavachError("RESET_KEY_REVOKED", stage, "a link is attested under a key the list no longer allows");
+    const doc = expectType<AccountSuccession>(verifyDocument(link.wire, signer.publicKey), DocumentType.AccountSuccession, stage);
+    const cert = expectType<AccountDevice>(verifyDocument(link.certificate), DocumentType.AccountDevice, stage);
+    if (!equalBytes(doc.accountId, input.accountId) || !equalBytes(doc.previousIdentityId, previous) || doc.accountName !== cert.accountName) throw new KavachError("SUCCESSION_BINDING", stage, "the chain is not contiguous from the root");
+    if (!equalBytes(doc.newCertificateHash, cert.bodyHash) || !equalBytes(identityId(cert.accountName, cert.accountKey), doc.newIdentityId) || cert.generation !== doc.newGeneration) throw new KavachError("SUCCESSION_BINDING", stage, "a link does not bind its certificate");
+    out.push({ doc, wire: link.wire, certificate: link.certificate });
+    previous = doc.newIdentityId;
+  }
+  if (!equalBytes(previous, input.finalIdentityId)) throw new KavachError("SUCCESSION_BINDING", stage, "the chain does not end at this key");
+  return out;
+}
+
+/** Keep a verified chain as evidence: succession rows, identity rows (retired ones with the keys the chain shows) and key-change rows. */
+export function recordChainIn(tx: Tx, chain: readonly VerifiedLink[], now: bigint): void {
+  for (const { doc, wire, certificate } of chain) {
+    const t = transitionOf(doc);
+    const cert = expectType<AccountDevice>(parseDocument(certificate), DocumentType.AccountDevice, "chain");
+    const row: SuccessionRow = { accountId: t.accountId, accountName: t.accountName, successionId: t.successionId, previousIdentityId: t.previousIdentityId, newIdentityId: t.newIdentityId, previousGeneration: big(t.previousGeneration), newGeneration: big(t.newGeneration), newCertificateHash: t.newCertificateHash, authorityKeyId: toHex(doc.authorityKeyId), wire: toHex(wire), acceptedAt: big(now) };
+    tx.put("successions", successionKey(t.accountId, t.previousGeneration), row);
+    const prev = tx.get("identities", t.previousIdentityId);
+    tx.put("identities", t.previousIdentityId, { accountId: t.accountId, accountName: t.accountName, ...(prev?.accountKey ? { accountKey: prev.accountKey } : {}), sinceGeneration: prev?.sinceGeneration ?? big(1n), retired: true });
+    const next = tx.get("identities", t.newIdentityId);
+    tx.put("identities", t.newIdentityId, { accountId: t.accountId, accountName: t.accountName, accountKey: toHex(cert.accountKey), sinceGeneration: big(t.newGeneration), retired: next?.retired ?? false });
+  }
+}
+
+/** The root identity's row with its key, from a certificate under the root key the host served, when it is one. */
+export function rootIdentityIn(tx: Tx, accountId: Uint8Array, accountName: string, rootCertificate: Uint8Array | undefined): void {
+  if (!rootCertificate) return;
+  let cert: AccountDevice & { bodyHash: Uint8Array };
+  try {
+    cert = expectType<AccountDevice>(verifyDocument(rootCertificate), DocumentType.AccountDevice, "chain");
+  } catch {
+    return;
+  }
+  if (cert.accountName !== accountName || !equalBytes(identityId(cert.accountName, cert.accountKey), accountId)) return;
+  const key = toHex(accountId);
+  const row = tx.get("identities", key);
+  tx.put("identities", key, { accountId: key, accountName, accountKey: toHex(cert.accountKey), sinceGeneration: row?.sinceGeneration ?? big(1n), retired: row?.retired ?? true, ...(row?.resetAt !== undefined ? { resetAt: row.resetAt } : {}) });
+}
+
 export function applySuccession(tx: Tx, input: SuccessionInput): SuccessionEffect {
   const stage = "succession";
   if (!acceptsSuccession(input.policy)) throw new KavachError("UNSUPPORTED_TYPE", stage, "this deployment does not accept successions");

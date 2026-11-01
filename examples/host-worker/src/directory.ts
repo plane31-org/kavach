@@ -48,6 +48,7 @@ interface Resolved {
   resetReceipt?: string;
   successions?: Link[];
   successionsNext?: string;
+  rootCertificate?: string;
 }
 interface CircleListing {
   circleId: string;
@@ -108,7 +109,8 @@ export class Directory {
       certificate: a.certificate,
       ...(a.reset_receipt ? { resetReceipt: a.reset_receipt } : {}),
       ...(page.successions.length ? { successions: page.successions } : {}),
-      ...(page.nextGeneration !== undefined ? { successionsNext: page.nextGeneration } : {})
+      ...(page.nextGeneration !== undefined ? { successionsNext: page.nextGeneration } : {}),
+      ...(page.rootCertificate ? { rootCertificate: page.rootCertificate } : {})
     };
   }
 
@@ -131,16 +133,17 @@ export class Directory {
   }
 
   /** One page of an account's chain: links whose new generation exceeds `after`, oldest first. A reset's new root has an empty chain. */
-  async successions(accountId: string, after: string, limit: number): Promise<{ successions: Link[]; nextGeneration?: string }> {
+  async successions(accountId: string, after: string, limit: number): Promise<{ successions: Link[]; nextGeneration?: string; rootCertificate?: string }> {
     const n = Math.max(1, Math.min(limit, 100));
     const rows = await this.db
-      .prepare("SELECT wire, certificate, new_generation FROM successions WHERE account_id = ? AND CAST(new_generation AS INTEGER) > CAST(? AS INTEGER) ORDER BY CAST(new_generation AS INTEGER) LIMIT ?")
+      .prepare("SELECT wire, certificate, new_generation, previous_certificate FROM successions WHERE account_id = ? AND CAST(new_generation AS INTEGER) > CAST(? AS INTEGER) ORDER BY CAST(new_generation AS INTEGER) LIMIT ?")
       .bind(accountId, after, n + 1)
-      .all<{ wire: string; certificate: string; new_generation: string }>();
+      .all<{ wire: string; certificate: string; new_generation: string; previous_certificate: string | null }>();
     const page = rows.results.slice(0, n);
     const last = page.at(-1);
     const links = page.map((r) => ({ wire: r.wire, certificate: r.certificate }));
-    return rows.results.length > n && last ? { successions: links, nextGeneration: last.new_generation } : { successions: links };
+    const root = after === "0" && page[0]?.previous_certificate ? { rootCertificate: page[0].previous_certificate } : {};
+    return rows.results.length > n && last ? { successions: links, nextGeneration: last.new_generation, ...root } : { successions: links, ...root };
   }
 
   /**
@@ -201,8 +204,8 @@ export class Directory {
     const statements = [
       this.db.prepare("UPDATE authorizations SET used = 1 WHERE token = ?").bind(input.authorization),
       this.db
-        .prepare("INSERT INTO successions (succession_id, account_name, account_id, previous_generation, new_generation, wire, certificate, certificate_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(input.successionId, a.account_name, accountId, a.generation, doc.generation.toString(), wire, input.newCertificate, certHash),
+        .prepare("INSERT INTO successions (succession_id, account_name, account_id, previous_generation, new_generation, wire, certificate, certificate_hash, previous_certificate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(input.successionId, a.account_name, accountId, a.generation, doc.generation.toString(), wire, input.newCertificate, certHash, a.certificate),
       vault && input.newVault
         ? this.db
             .prepare("UPDATE accounts SET account_key = ?, identity_id = ?, certificate = ?, certificate_hash = ?, generation = ?, vault = ?, vault_revision = ?, vault_hash = ? WHERE account_name = ? AND certificate_hash = ?")

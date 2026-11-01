@@ -44,6 +44,8 @@ interface Account {
   accountId: string;
   /** The chain from the root, oldest first; empty until a succession. */
   successions: SuccessionLink[];
+  /** The certificate the first succession replaced: a certificate under the root key. */
+  rootCertificate: Uint8Array | undefined;
   certificate: Uint8Array;
   certificateHash: string;
   generation: bigint;
@@ -107,6 +109,11 @@ export class FakeHost {
   authorizationTtlMs = 300_000n;
   successionPageSize = 8;
   circlePageSize = 50;
+  /** Re-attest a link under the current operational key when its original signer is no longer it (section 7). */
+  reattest = true;
+  /** Test switch: the n-th call to listCircles (1-based) fails with a transport error, once. */
+  failCircleListAt: number | undefined;
+  circleListCalls = 0;
   resetKeyList: Uint8Array | undefined;
   resetSigner: { key: SigningKeypair; keyId: Uint8Array } | undefined;
   /** Test switches. */
@@ -147,16 +154,28 @@ export class FakeHost {
       ...r,
       ...(a.resetReceipt ? { resetReceipt: a.resetReceipt } : {}),
       ...(page.successions.length ? { successions: page.successions } : {}),
-      ...(page.nextGeneration !== undefined ? { successionsNext: page.nextGeneration } : {})
+      ...(page.nextGeneration !== undefined ? { successionsNext: page.nextGeneration } : {}),
+      ...(page.rootCertificate ? { rootCertificate: page.rootCertificate } : {})
     };
   }
 
-  private successionPage(a: Account, afterGeneration: bigint, limit: number): { successions: SuccessionLink[]; nextGeneration?: bigint } {
+  private successionPage(a: Account, afterGeneration: bigint, limit: number): { successions: SuccessionLink[]; nextGeneration?: bigint; rootCertificate?: Uint8Array } {
     const gen = (l: SuccessionLink): bigint => expectType<AccountDevice>(parseDocument(l.certificate), DocumentType.AccountDevice).generation;
-    const rest = a.successions.filter((l) => gen(l) > afterGeneration);
+    const rest = a.successions.filter((l) => gen(l) > afterGeneration).map((l) => this.served(l));
     const page = rest.slice(0, Math.max(1, limit));
     const last = page.at(-1);
-    return rest.length > page.length && last ? { successions: page, nextGeneration: gen(last) } : { successions: page };
+    const root = afterGeneration === 0n && page.length && a.rootCertificate ? { rootCertificate: a.rootCertificate } : {};
+    return rest.length > page.length && last ? { successions: page, nextGeneration: gen(last), ...root } : { successions: page, ...root };
+  }
+
+  /** A link as served: re-attested under the current operational key when its signer changed and re-attestation is on. */
+  private served(l: SuccessionLink): SuccessionLink {
+    const signer = this.resetSigner;
+    if (!this.reattest || !signer) return l;
+    const doc = expectType<AccountSuccession>(parseDocument(l.wire), DocumentType.AccountSuccession);
+    if (equalBytes(doc.authorityKeyId, signer.keyId)) return l;
+    const fields = { accountName: doc.accountName, accountId: doc.accountId, previousIdentityId: doc.previousIdentityId, newIdentityId: doc.newIdentityId, previousGeneration: doc.previousGeneration, newGeneration: doc.newGeneration, newCertificateHash: doc.newCertificateHash, successionId: doc.successionId };
+    return { wire: buildSuccession({ ...fields, issuedAt: this.now(), authorityKeyId: signer.keyId }, signer.key.secretKey), certificate: l.certificate };
   }
 
   /** The circle fence: is this certificate the account's current device? A retired device is refused reads too. */
@@ -263,6 +282,7 @@ export class FakeHost {
           identityId: iid,
           accountId: iid,
           successions: [],
+          rootCertificate: undefined,
           certificate,
           certificateHash: toHex(doc.bodyHash),
           generation: doc.generation,
@@ -395,6 +415,7 @@ export class FakeHost {
         a.previousIdentities.add(a.accountId);
         for (const l of a.successions) a.previousIdentities.add(toHex(expectType<AccountSuccession>(parseDocument(l.wire), DocumentType.AccountSuccession).previousIdentityId));
         a.successions = [];
+        a.rootCertificate = undefined;
         a.resetReceipt = receipt;
         a.retiredCertificates.add(a.certificateHash);
         a.accountKey = doc.accountKey;
@@ -444,6 +465,7 @@ export class FakeHost {
         );
         auth.used = true;
         host.successionLog.set(toHex(input.successionId), { accountName: a.accountName, certificateHash: certHash, wire });
+        if (a.successions.length === 0) a.rootCertificate = a.certificate;
         a.successions.push({ wire, certificate: input.newCertificate });
         a.previousIdentities.add(a.identityId);
         a.retiredCertificates.add(a.certificateHash);
@@ -468,6 +490,10 @@ export class FakeHost {
       },
       async listCircles(cursor) {
         const a = caller();
+        if (host.failCircleListAt !== undefined && ++host.circleListCalls === host.failCircleListAt) {
+          host.failCircleListAt = undefined;
+          throw new Error("transport down");
+        }
         if (!current()) return { circles: [] };
         const mine: CircleListing[] = [];
         for (const [key, c] of [...host.circles].sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0))) {

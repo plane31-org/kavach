@@ -168,11 +168,12 @@ describe("the fence, discovery and preferences", () => {
     const fresh = w.host.asDevice("bob", r.pin.certificateHash);
     const page = await fresh.directory.listCircles(undefined);
     expect(page.cursor).toBeUndefined();
-    expect(page.circles.map((c) => [toHex(c.circleId), toHex(c.ownerAccountId), c.role, c.enabled, c.preferenceRevision, c.snapshot !== undefined])).toEqual([[toHex(circleId), toHex(aliceId), "member", undefined, 0n, true]]);
-    expect((await fresh.directory.setSharingPreference(circleId, true, 0n))).toEqual({ status: "COMMITTED", revision: 1n });
-    // A delayed request against the old revision loses to the one that landed.
+    // The preference Bob's first phone set when it asked to join (share on approval) is served with the circle.
+    expect(page.circles.map((c) => [toHex(c.circleId), toHex(c.ownerAccountId), c.role, c.enabled, c.preferenceRevision, c.snapshot !== undefined])).toEqual([[toHex(circleId), toHex(aliceId), "member", true, 1n, true]]);
+    // A delayed request against an old revision loses to the one that landed.
     expect((await fresh.directory.setSharingPreference(circleId, false, 0n))).toEqual({ status: "CONFLICT", revision: 1n, enabled: true });
     expect((await fresh.directory.setSharingPreference(circleId, false, 1n))).toEqual({ status: "COMMITTED", revision: 2n });
+    expect((await fresh.directory.setSharingPreference(circleId, true, 1n))).toEqual({ status: "CONFLICT", revision: 2n, enabled: false });
     expect((await fresh.directory.listCircles(undefined)).circles[0]).toMatchObject({ enabled: false, preferenceRevision: 2n });
     // The owner sees her own circle as owner; paging by one.
     w.host.circlePageSize = 1;

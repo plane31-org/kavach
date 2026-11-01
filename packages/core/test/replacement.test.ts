@@ -38,20 +38,19 @@ describe("account recovery: prepare and commit", () => {
     // Paused for rotation until the first sync seals an epoch, exactly as after an identity-continuity restore.
     expect([state.status, state.paused, toHex(state.identityId ?? new Uint8Array()), toHex(insp.identityId ?? new Uint8Array()) === toHex(insp.keyIdentityId ?? new Uint8Array()), insp.replacement, insp.bootstrap]).toEqual(["paused", "rotation", toHex(bobId), false, undefined, { cursor: undefined, complete: false }]);
     expect(await b2.secrets.get("pendingReplacement")).toBeUndefined();
-    // Bootstrap: the circle is discovered as a member, disabled (no preference was ever set).
+    // Bootstrap: the circle is discovered as a member, with the preference the first phone set when it asked to join.
     const first = await w.sync(b2);
     expect(first.bootstrap).toEqual({ circles: 1, pending: 0, failed: 0 });
     expect(first.errors).toEqual([]);
     const circles = await b2.client.circles.list();
-    expect(circles.map((c) => [toHex(c.circleId), toHex(c.ownerIdentityId), c.status, c.enabled, c.owned])).toEqual([[toHex(circleId), toHex(aliceId), "member", false, false]]);
+    expect(circles.map((c) => [toHex(c.circleId), toHex(c.ownerIdentityId), c.status, c.enabled, c.owned])).toEqual([[toHex(circleId), toHex(aliceId), "member", true, false]]);
     expect([(await b2.client.inspect()).bootstrap, (await b2.client.getState()).status]).toEqual([{ cursor: undefined, complete: true }, "ready"]);
     // Alice applies the chain and rotates; she records the key change.
     const ar = await w.sync(a);
     expect([ar.errors, ar.metadata.successions, ar.epoch]).toEqual([[], 1, "prepared"]);
     const changes = await a.client.keyChanges();
     expect(changes.map((c) => [toHex(c.accountId), c.accountName, c.generation, c.reason, toHex(c.successionId ?? new Uint8Array())])).toEqual([[toHex(bobId), "bob", 2n, "succession", toHex(proposal.successionId)]]);
-    // Bob enables sharing on the new phone and shares; Alice reads him under the same account id.
-    await b2.client.circles.setEnabled(circleId, true);
+    // Bob shares from the new phone; Alice reads him under the same account id.
     expect(w.host.preferences.get(`${toHex(bobId)}:${toHex(circleId)}`)).toEqual({ enabled: true, revision: 1n });
     await w.sync(b2);
     await enqueueLocation(b2.client, w.loc(2));
@@ -98,7 +97,7 @@ describe("account recovery: prepare and commit", () => {
     const w = world();
     const { b, circleId, bobId } = await pair(w);
     await b.client.circles.setEnabled(circleId, false);
-    expect(w.host.preferences.get(`${toHex(bobId)}:${toHex(circleId)}`)).toEqual({ enabled: false, revision: 1n });
+    expect(w.host.preferences.get(`${toHex(bobId)}:${toHex(circleId)}`)).toEqual({ enabled: false, revision: 2n }); // 1 was set at the join request
     const { d: b2, proposal, authorization } = await prepared(w, "bob");
     await b2.client.completeReplacement({ successionId: proposal.successionId, authorization });
     await w.sync(b2);
@@ -108,14 +107,14 @@ describe("account recovery: prepare and commit", () => {
     expect(stale.status).toBe("CONFLICT");
     // A disable while the host is unreachable stops sharing at once, and lands on the next sync.
     await b2.client.circles.setEnabled(circleId, true);
-    expect(w.host.preferences.get(`${toHex(bobId)}:${toHex(circleId)}`)).toEqual({ enabled: true, revision: 2n });
+    expect(w.host.preferences.get(`${toHex(bobId)}:${toHex(circleId)}`)).toEqual({ enabled: true, revision: 3n });
     b2.t.knobs.refuse.add("setSharingPreference");
     await b2.client.circles.setEnabled(circleId, false);
     expect((await b2.client.circles.list())[0]?.enabled).toBe(false);
-    expect(w.host.preferences.get(`${toHex(bobId)}:${toHex(circleId)}`)).toEqual({ enabled: true, revision: 2n });
+    expect(w.host.preferences.get(`${toHex(bobId)}:${toHex(circleId)}`)).toEqual({ enabled: true, revision: 3n });
     const r = await w.sync(b2);
     expect(r.errors).toEqual([]);
-    expect(w.host.preferences.get(`${toHex(bobId)}:${toHex(circleId)}`)).toEqual({ enabled: false, revision: 3n });
+    expect(w.host.preferences.get(`${toHex(bobId)}:${toHex(circleId)}`)).toEqual({ enabled: false, revision: 4n });
     // A change the host moved under us is re-sent as the latest persisted action at the served revision.
     w.host.preferences.set(`${toHex(bobId)}:${toHex(circleId)}`, { enabled: false, revision: 7n });
     await b2.client.circles.setEnabled(circleId, true);
