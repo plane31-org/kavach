@@ -111,6 +111,8 @@ export interface MaliciousKnobs {
   readonly refuse: Set<MutationName>;
   /** Mutations whose next response waits for the given promise after the host committed (consumed once). */
   readonly hold: Map<MutationName, Promise<void>>;
+  /** Called when a held mutation has reached its gate (the host has answered; the response is being held), so a test can act at exactly that point. */
+  onHeld?: (name: MutationName) => void;
   /** Reads that answer "nothing" while present. */
   readonly withhold: Set<"snapshots" | "epochs" | "records" | "requests" | "currentEpoch" | "keyList" | "certificates" | "successions" | "circleList" | "subscriptions">;
   /** Older documents served instead of the current ones. */
@@ -188,6 +190,7 @@ export class MaliciousTransport implements Transport {
     const gate = this.knobs.hold.get(name);
     if (gate) {
       this.knobs.hold.delete(name);
+      this.knobs.onHeld?.(name);
       await gate;
     }
     if (this.knobs.loseResponseOf.has(name)) {

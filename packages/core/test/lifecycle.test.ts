@@ -115,8 +115,13 @@ describe("second review of 0.3.0", () => {
     // inside its inbox phase. What its outbox settled must still be in the report.
     let release: () => void = () => undefined;
     a.t.knobs.hold.set("ackThrough", new Promise<void>((res) => (release = res)));
+    const reached = new Promise<void>((res) => {
+      a.t.knobs.onHeld = (name) => {
+        if (name === "ackThrough") res();
+      };
+    });
     const drain = a.client.syncUntilDrained();
-    await new Promise((r) => setTimeout(r, 20));
+    await reached; // the round is inside its inbox phase, the acknowledgement held
     const closing = a.client.close();
     release();
     await closing;
