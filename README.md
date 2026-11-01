@@ -4,6 +4,7 @@ End-to-end encrypted, relayed, durable records between a person's devices and th
 
 - `spec/Kavach-v1.md`: the protocol specification, which names no product concept. Revision 8, wire version 5.
 - `spec/Profile-template.md`: what an implementation profile must decide; a product keeps its profile in its own repository.
+- `spec/amendments/`: proposed changes to the protocol under review, not adopted and not implemented. A1 is account replacement authorized by the host's signing authority.
 - `Kavach-v1-Build-Sequence.md`: the order in which this repository is built, one tested module at a time.
 - `packages/core`: the protocol in pure TypeScript.
 - `packages/expo`: Expo adapters.

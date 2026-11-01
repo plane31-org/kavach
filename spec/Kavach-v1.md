@@ -2,7 +2,7 @@
 
 End-to-end encrypted, relayed, durable records between a person's devices and the devices of the people they share with, for circles of up to 100 accounts, through a server that stores only what it cannot open and deletes each record once every reader has it. What a record means is the product's; the protocol carries bytes of a kind the product declares.
 
-Kavach v1, protocol revision 8, formerly SealedStream SS5. Wire version 5, unchanged since revision 2; revision 6 assigned a flag bit that was reserved, revision 7 changed no byte, and revision 8 puts an envelope in front of every record payload. October 2026. An implementation profile states a product's record kinds, payload codecs, platform, server and retention choices; `spec/Profile-template.md` lists what a profile must decide, and each product keeps its profile in its own repository.
+Kavach v1, protocol revision 8, formerly SealedStream SS5. Wire version 5, unchanged since revision 2; revision 6 assigned a flag bit that was reserved, revision 7 changed no byte, and revision 8 puts an envelope in front of every record payload. October 2026. An implementation profile states a product's record kinds, payload codecs, platform, server and retention choices; `spec/Profile-template.md` lists what a profile must decide, and each product keeps its profile in its own repository. Proposed amendments under review live in `spec/amendments/`; none is part of this revision.
 
 > **How to read this**
 >
