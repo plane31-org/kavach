@@ -6,7 +6,7 @@
 import { concat, equalBytes, fromHex, toHex } from "./bytes.js";
 import { resolveAudience, type ResolvedAudience } from "./audience.js";
 import { acceptSnapshot, checkMemberResolution, createCircleSnapshot, newCircleId, pinCircle, successorSnapshot, type CircleState } from "./circle.js";
-import { DocumentType, expectType, parseVaultHeader, verifyDocument, type AccountDevice, type RecordKind } from "./codec.js";
+import { DocumentType, expectType, parseDocument, parseVaultHeader, verifyDocument, type AccountDevice, type AccountSuccession, type RecordKind } from "./codec.js";
 import { randomBytes, ready, type BoxKeypair } from "./crypto.js";
 import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
@@ -21,12 +21,13 @@ export interface EnqueueResult {
   readonly recordId: Uint8Array;
   readonly duplicate: boolean;
 }
-import { kindOf, validatePolicy, type RetentionPolicy } from "./policy.js";
+import { allowsContinuity, kindOf, validatePolicy, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
 import type { CircleRow, PendingResetRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
 import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t3Circle, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault } from "./transactions.js";
-import type { Relay, Transport } from "./transport.js";
+import { applySuccession } from "./succession.js";
+import type { Relay, ResolvedAccount, Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
 
 /** The types of the client's queries and of `receive`, defined with the inbox. */
@@ -54,10 +55,21 @@ function sameEntries(a: readonly VaultEntry[], b: readonly VaultEntry[]): boolea
 export type ClientStatus = "fresh" | "ready" | "locked" | "accountRecoveryRequired" | "activationPending" | "retired" | "paused" | "quarantined";
 export type PauseReason = "sync" | "rotation" | "metadata" | "limit";
 
+/** The account id a directory answer names: the root of its succession chain, else the identity of its key. */
+export function resolvedAccountId(r: ResolvedAccount): Uint8Array {
+  const first = r.successions?.[0];
+  if (first) return expectType<AccountSuccession>(parseDocument(first.wire), DocumentType.AccountSuccession, "resolve").accountId;
+  const doc = expectType<AccountDevice>(verifyDocument(r.certificate), DocumentType.AccountDevice, "resolve");
+  return pinFromCertificate(doc).identityId;
+}
+
 export interface ClientState {
   readonly status: ClientStatus;
   readonly paused: PauseReason | undefined;
+  /** The account id: what circles, manifests and records name. Constant across successions. */
   readonly identityId: Uint8Array | undefined;
+  /** The identity of the current account key; equal to `identityId` until a succession. */
+  readonly keyIdentityId: Uint8Array | undefined;
   readonly certificateHash: Uint8Array | undefined;
   readonly generation: bigint | undefined;
   readonly outbox: number;
@@ -69,6 +81,7 @@ export interface ClientState {
 /** Diagnostics: where the protocol stands on this device. Never a secret or a plaintext. */
 export interface Inspection {
   readonly identityId: Uint8Array | undefined;
+  readonly keyIdentityId: Uint8Array | undefined;
   readonly certificateHash: Uint8Array | undefined;
   readonly generation: bigint | undefined;
   readonly desiredRevision: bigint;
@@ -169,7 +182,7 @@ export interface SyncOptions {
 export const DEFAULT_CATCH_UP = { maxRecords: 500, maxMs: 5_000 } as const;
 
 export interface SyncReport {
-  metadata: { certificates: number; snapshots: number; rotations: number; quarantined: number; resets: number };
+  metadata: { certificates: number; snapshots: number; rotations: number; quarantined: number; resets: number; successions: number };
   epoch: "unchanged" | "prepared" | "paused" | "pending";
   outbox: { sent: number; accepted: number; cancelled: number; unknown: number; retry: number };
   /** `hasMore`: a stream still has records on the relay that this sync's budget did not reach; sync again soon. */
@@ -259,7 +272,7 @@ class ClientImpl implements Client {
     const self = await this.store.read((tx) => tx.get("self", "self"));
     if (deviceSeed && self) {
       this.device = deviceFromSeed(deviceSeed, fromHex(self.deviceId));
-      const pinRow = await this.store.read((tx) => tx.get("pins", toHex(opened.account.identityId)));
+      const pinRow = await this.store.read((tx) => tx.get("pins", toHex(opened.account.accountId)));
       if (pinRow) this.selfPin = rowToPin(pinRow);
     }
     const rows = await this.store.read((tx) => ({
@@ -305,7 +318,7 @@ class ClientImpl implements Client {
 
   private selfView(): { identityId: Uint8Array; certificateHash: Uint8Array; box: BoxKeypair } {
     const { device, pin } = this.requireAccount("self");
-    return { identityId: pin.identityId, certificateHash: pin.certificateHash, box: device.box };
+    return { identityId: pin.accountId, certificateHash: pin.certificateHash, box: device.box };
   }
 
   private outboxDeps() {
@@ -315,7 +328,7 @@ class ClientImpl implements Client {
       relay: this.transport.relay,
       policy: this.policy,
       now: this.now,
-      author: () => ({ streamId: pin.streamId, signingSecretKey: device.signing.secretKey, generation: pin.generation, identityId: pin.identityId }),
+      author: () => ({ streamId: pin.streamId, signingSecretKey: device.signing.secretKey, generation: pin.generation, identityId: pin.accountId }),
       events: {
         queued: (recordId: Uint8Array, recordKind: RecordKind) => this.emit({ kind: "queued", recordId, recordKind }),
         accepted: (recordId: Uint8Array) => this.emit({ kind: "accepted", recordId }),
@@ -347,7 +360,7 @@ class ClientImpl implements Client {
 
   async getState(): Promise<ClientState> {
     const meta = await this.store.read((tx) => tx.get("meta", META));
-    const base = { identityId: this.selfPin?.identityId, certificateHash: this.selfPin?.certificateHash, generation: this.selfPin?.generation, outbox: 0, waitingFor: [] as Uint8Array[], circles: [] as CircleSummary[] };
+    const base = { identityId: this.selfPin?.accountId, keyIdentityId: this.selfPin?.identityId, certificateHash: this.selfPin?.certificateHash, generation: this.selfPin?.generation, outbox: 0, waitingFor: [] as Uint8Array[], circles: [] as CircleSummary[] };
     if (!meta || !this.account) return { status: "fresh", paused: undefined, ...base };
     const circles = await this.listCircles();
     const outbox = await outboxCount(this.store);
@@ -365,7 +378,7 @@ class ClientImpl implements Client {
 
   private async waitingFor(): Promise<Uint8Array[]> {
     if (!this.selfPin) return [];
-    const selfHex = toHex(this.selfPin.identityId);
+    const selfHex = toHex(this.selfPin.accountId);
     return this.store.read((tx) => {
       const authors = new Set<string>();
       for (const [, c] of tx.list("circles")) if (c.status === "member") for (const m of c.members) if (m !== selfHex) authors.add(m);
@@ -388,7 +401,8 @@ class ClientImpl implements Client {
       const vault = tx.get("vault", VAULT);
       const pendingEpoch = tx.list("epochs").find(([, e]) => e.status === "prepared" || e.status === "committed")?.[1].epoch;
       return {
-        identityId: this.selfPin?.identityId,
+        identityId: this.selfPin?.accountId,
+        keyIdentityId: this.selfPin?.identityId,
         certificateHash: this.selfPin?.certificateHash,
         generation: this.selfPin?.generation,
         desiredRevision: revision ? unbig(revision.desiredRevision) : 1n,
@@ -473,11 +487,13 @@ class ClientImpl implements Client {
       // moved under us): prepare again with the same device keys. Nothing was allocated remotely.
       pending = resumed;
     }
+    if (!allowsContinuity(this.policy)) throw new KavachError("NOT_AUTHORIZED", stage, "this deployment replaces devices through successions, not the recovery key");
     const [resolved] = await this.transport.directory.resolveAccounts([this.accountName]);
     if (!resolved) throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, "unknown account");
     const current = expectType<AccountDevice>(verifyDocument(resolved.certificate), DocumentType.AccountDevice, stage);
     const vaultWire = await this.transport.directory.getVault(this.accountName);
     if (!vaultWire) throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, "no vault");
+    const accountId = resolvedAccountId(resolved);
     const identity = pinFromCertificate(current).identityId;
     const recovered = await recoverAccount({
       accountName: this.accountName,
@@ -487,12 +503,12 @@ class ClientImpl implements Client {
       provider: this.provider,
       ...(recoveryCode === undefined ? {} : { recoveryCode })
     });
-    const account = openAccount(this.accountName, recovered.vault.accountSeed);
+    const account = openAccount(this.accountName, recovered.vault.accountSeed, accountId);
     // Fresh device keys and a fresh local store. Nothing from the old device is copied.
     const device = pending?.device ?? newDevice();
     const generation = current.generation + 1n;
     const certificate = certify(account, device, generation);
-    const pin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice));
+    const pin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice), undefined, accountId);
     const header = parseVaultHeader(vaultWire);
     const nextVault = buildVault(
       { accountName: this.accountName, accountKey: account.account.publicKey, vaultRevision: header.vaultRevision + 1n },
@@ -538,7 +554,7 @@ class ClientImpl implements Client {
       tx.delete("activation", "pending");
       t9Vault(tx, { revision: big(input.vaultRevision), hash: toHex(input.vault.hash), wire: toHex(input.vault.wire), pending: false, dirty: false });
       for (const e of input.entries) {
-        const owned = equalBytes(e.ownerIdentityId, pin.identityId);
+        const owned = equalBytes(e.ownerIdentityId, pin.accountId);
         const c = pinCircle(e.circleId, e.ownerIdentityId, e.sharingEnabled, owned ? "member" : "requested");
         tx.put("circles", toHex(e.circleId), circleToRow(c));
       }
@@ -568,13 +584,14 @@ class ClientImpl implements Client {
     const row = await this.store.read((tx) => tx.get("activation", "pending"));
     if (!row) throw new KavachError("RECOVERY_REQUIRED", stage, "activation pending without its prepared bytes");
     const [accountSeed, deviceSeed, recoveryKey, instanceId] = await Promise.all([this.secrets.get("accountSeed"), this.secrets.get("deviceSeed"), this.secrets.get("recoveryKey"), this.secrets.get("instanceId")]);
-    const self = await this.store.read((tx) => tx.get("self", "self"));
-    if (!accountSeed || !deviceSeed || !recoveryKey || !instanceId || !self) throw new KavachError("RECOVERY_REQUIRED", stage, "activation pending without its roots");
-    const account = openAccount(this.accountName, accountSeed);
+    const [self, meta] = await this.store.read((tx) => [tx.get("self", "self"), tx.get("meta", META)] as const);
+    if (!accountSeed || !deviceSeed || !recoveryKey || !instanceId || !self || !meta) throw new KavachError("RECOVERY_REQUIRED", stage, "activation pending without its roots");
+    const accountId = fromHex(meta.accountId ?? meta.identityId);
+    const account = openAccount(this.accountName, accountSeed, accountId);
     const device = deviceFromSeed(deviceSeed, fromHex(self.deviceId));
     const certificate = fromHex(row.certificate);
     const prepared = expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage);
-    const pin = pinFromCertificate(prepared);
+    const pin = pinFromCertificate(prepared, undefined, accountId);
     const [me] = await this.transport.directory.resolveAccounts([this.accountName]);
     if (!me) throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, "unknown account");
     const theirs = expectType<AccountDevice>(verifyDocument(me.certificate), DocumentType.AccountDevice, stage);
@@ -646,7 +663,7 @@ class ClientImpl implements Client {
 
   /** After commit: the device's own record is stored like any author's, so one subscription covers self and others. */
   private enqueued(kind: RecordKind, r: { recordId: Uint8Array; duplicate: boolean; own: boolean }): EnqueueResult {
-    if (!r.duplicate && this.selfPin) this.emit({ kind: "recordStored", recordKind: kind, authorIdentityId: this.selfPin.identityId, recordId: r.recordId, tookSlot: r.own });
+    if (!r.duplicate && this.selfPin) this.emit({ kind: "recordStored", recordKind: kind, authorIdentityId: this.selfPin.accountId, recordId: r.recordId, tookSlot: r.own });
     return { recordId: r.recordId, duplicate: r.duplicate };
   }
 
@@ -656,6 +673,8 @@ class ClientImpl implements Client {
     const { pin } = this.requireAccount("audience");
     const retired = new Set(this.trust.state.retired);
     return this.store.read((tx) => {
+      // A reset retires the whole account, however many successions it went through.
+      for (const [, r] of tx.list("identities")) if (r.resetAt !== undefined) retired.add(r.accountId);
       const pins = new Map(tx.list("pins").map(([k, p]) => [k, rowToPin(p)]));
       const circles = tx.list("circles").map(([, c]) => rowToCircle(c));
       return resolveAudience(pin, circles, pins, retired);
@@ -692,7 +711,7 @@ class ClientImpl implements Client {
       } else {
         const revision = revisionRow ? unbig(revisionRow.desiredRevision) : 1n;
         const fresh = prepareEpoch({
-          author: { identityId: pin.identityId, certificateHash: pin.certificateHash, streamId: pin.streamId, signingSecretKey: device.signing.secretKey },
+          author: { identityId: pin.accountId, certificateHash: pin.certificateHash, streamId: pin.streamId, signingSecretKey: device.signing.secretKey },
           epoch: stream.highestCommittedEpoch + 1,
           createdAt: this.now(),
           audience,
@@ -744,7 +763,7 @@ class ClientImpl implements Client {
 
   private async runSync(options: SyncOptions): Promise<SyncReport> {
     const report: SyncReport = {
-      metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 },
+      metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 },
       epoch: "unchanged",
       outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 },
       inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false },
@@ -833,7 +852,13 @@ class ClientImpl implements Client {
     if (me) {
       const theirs = expectType<AccountDevice>(verifyDocument(me.certificate), DocumentType.AccountDevice, "sync");
       if (!equalBytes(theirs.accountKey, pin.accountKey)) {
-        // Our own key changed at the host: only a receipt we produced explains that; otherwise ignore.
+        // Our own key changed at the host. A succession from our identity, attested by an authority
+        // we trust, retires this device (its key is no longer the account's); a bare key change or a
+        // reset we did not make is ignored here, as before.
+        if (await this.supersededBySuccession(pin, me)) {
+          await this.retire();
+          return;
+        }
       } else if (!equalBytes(theirs.bodyHash, pin.certificateHash) && theirs.generation > pin.generation) {
         await this.retire();
         return;
@@ -856,7 +881,7 @@ class ClientImpl implements Client {
     // Unconfirmed writes of our own first: a successor snapshot the host never took, a vault update
     // it never saw. Until they land, peers read stale membership and a replacement phone a stale
     // preference.
-    const pendingOwned = await this.store.read((tx) => tx.list("circles").filter(([, r]) => r.pending && r.ownerIdentityId === toHex(pin.identityId)).map(([, r]) => fromHex(r.circleId)));
+    const pendingOwned = await this.store.read((tx) => tx.list("circles").filter(([, r]) => r.pending && r.ownerIdentityId === toHex(pin.accountId)).map(([, r]) => fromHex(r.circleId)));
     for (const circleId of pendingOwned) {
       try {
         if ((await this.publishPendingSnapshot(circleId)) === "COMMITTED") report.metadata.snapshots++;
@@ -874,15 +899,15 @@ class ClientImpl implements Client {
     const unknownOwners: Uint8Array[] = [];
     for (const c of circles) {
       if (c.status === "closed" || c.status === "quarantined" || c.status === "left") continue;
-      if (!equalBytes(c.ownerIdentityId, pin.identityId) && !(await this.pinFor(c.ownerIdentityId))) unknownOwners.push(c.ownerIdentityId);
+      if (!equalBytes(c.ownerIdentityId, pin.accountId) && !(await this.pinFor(c.ownerIdentityId))) unknownOwners.push(c.ownerIdentityId);
     }
     if (unknownOwners.length > 0) {
-      for (const r of await this.transport.directory.resolveIdentities(unknownOwners)) await this.acceptMemberCertificate(r.certificate, r.resetReceipt, report);
+      for (const r of await this.transport.directory.resolveIdentities(unknownOwners)) await this.acceptMemberCertificate(r, report);
     }
     const memberIds = new Map<string, Uint8Array>();
     for (const c of circles) {
       if (c.status === "closed" || c.status === "quarantined" || c.status === "left") continue;
-      const ownerPin = equalBytes(c.ownerIdentityId, pin.identityId) ? pin : await this.pinFor(c.ownerIdentityId);
+      const ownerPin = equalBytes(c.ownerIdentityId, pin.accountId) ? pin : await this.pinFor(c.ownerIdentityId);
       if (!ownerPin) {
         memberIds.set(toHex(c.ownerIdentityId), c.ownerIdentityId);
         continue;
@@ -890,7 +915,7 @@ class ClientImpl implements Client {
       const wire = await this.transport.directory.getCircle(c.circleId);
       if (wire) {
         try {
-          const r = acceptSnapshot(c, wire, ownerPin.accountKey, pin.identityId, now);
+          const r = await this.acceptSnapshotFrom(c, wire, ownerPin, now);
           if (r.outcome === "ACCEPTED") {
             // The row may have moved since it was read: a sharing preference, a leave or a close
             // made meanwhile wins over the fetched snapshot, and a newer snapshot already stored
@@ -920,46 +945,145 @@ class ClientImpl implements Client {
           for (const m of c.members) memberIds.set(toHex(m), m);
         }
       } else for (const m of c.members) memberIds.set(toHex(m), m);
-      if (equalBytes(c.ownerIdentityId, pin.identityId) && c.status === "member") {
+      if (equalBytes(c.ownerIdentityId, pin.accountId) && c.status === "member") {
         const requests = await this.transport.directory.readRequests(c.circleId);
         const joins = requests.filter((r) => r.action === "join").map((r) => r.accountName);
         if (joins.length) this.emit({ kind: "joinRequests", circleId: c.circleId, accountNames: joins });
         for (const r of requests.filter((r) => r.action === "leave")) {
           const [acct] = await this.transport.directory.resolveAccounts([r.accountName]);
           if (!acct) continue;
-          const leaver = pinFromCertificate(expectType<AccountDevice>(verifyDocument(acct.certificate), DocumentType.AccountDevice));
           try {
-            await this.changeMembership(c.circleId, { remove: leaver.identityId });
+            await this.changeMembership(c.circleId, { remove: resolvedAccountId(acct) });
           } catch (e) {
             report.errors.push(syncError("removeLeaver", e));
           }
         }
       }
     }
-    memberIds.delete(toHex(pin.identityId));
+    memberIds.delete(toHex(pin.accountId));
     if (memberIds.size > 0) {
       const resolved = await this.transport.directory.resolveIdentities([...memberIds.values()]);
       const byIdentity = new Map<string, { accountName: string; accountKey: Uint8Array }>();
       for (const r of resolved) {
-        const doc = expectType<AccountDevice>(verifyDocument(r.certificate), DocumentType.AccountDevice, "sync");
-        const iid = toHex(pinFromCertificate(doc).identityId);
-        byIdentity.set(iid, { accountName: r.accountName, accountKey: r.accountKey });
-        await this.acceptMemberCertificate(r.certificate, r.resetReceipt, report);
+        expectType<AccountDevice>(verifyDocument(r.certificate), DocumentType.AccountDevice, "sync");
+        byIdentity.set(toHex(resolvedAccountId(r)), { accountName: r.accountName, accountKey: r.accountKey });
+        await this.acceptMemberCertificate(r, report);
       }
       checkMemberResolution(byIdentity);
     }
   }
 
-  private async pinFor(identityId: Uint8Array): Promise<AccountPin | undefined> {
-    const row = await this.store.read((tx) => tx.get("pins", toHex(identityId)));
+  /**
+   * Has the host's chain for our own account moved past our key? A valid succession from our
+   * current identity means an authority replaced this account's key; the device holding the old
+   * key has nothing left to say. Deferred (no fresh list, untrusted clock) and invalid
+   * attestations leave the device as it is.
+   */
+  private async supersededBySuccession(pin: AccountPin, me: ResolvedAccount): Promise<boolean> {
+    const chain = me.successions ?? [];
+    const link = chain.find((l) => {
+      try {
+        return toHex(expectType<AccountSuccession>(parseDocument(l.wire), DocumentType.AccountSuccession, "sync").previousIdentityId) === toHex(pin.identityId);
+      } catch {
+        return false;
+      }
+    });
+    if (!link) return false;
+    try {
+      return await this.store.transaction((tx) => {
+        const effect = applySuccession(tx, { wire: link.wire, newCertificate: link.certificate, policy: this.policy, trust: this.trust, now: this.now() });
+        this.persistTrustIn(tx);
+        return effect.outcome === "ACCEPTED" || effect.outcome === "DUPLICATE";
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Verify a snapshot under the owner's current key, or, when the owner's key changed through a
+   * succession and the snapshot predates it, under the retired key it was signed with. The
+   * successor republishes at the next revision; until then the older snapshot stays valid.
+   */
+  private async acceptSnapshotFrom(c: CircleState, wire: Uint8Array, ownerPin: AccountPin, now: bigint): Promise<ReturnType<typeof acceptSnapshot>> {
+    const { pin } = this.requireAccount("sync");
+    try {
+      return acceptSnapshot(c, wire, ownerPin.accountKey, pin.accountId, now);
+    } catch (e) {
+      if (!isKavachError(e, "BAD_SIGNATURE")) throw e;
+      const ownerHex = toHex(ownerPin.accountId);
+      const retiredKeys = await this.store.read((tx) => tx.list("identities").filter(([, r]) => r.accountId === ownerHex && r.retired).map(([, r]) => fromHex(r.accountKey)));
+      for (const key of retiredKeys) {
+        try {
+          return acceptSnapshot(c, wire, key, pin.accountId, now);
+        } catch (inner) {
+          if (!isKavachError(inner, "BAD_SIGNATURE")) throw inner;
+        }
+      }
+      throw e;
+    }
+  }
+
+  private async pinFor(accountId: Uint8Array): Promise<AccountPin | undefined> {
+    const row = await this.store.read((tx) => tx.get("pins", toHex(accountId)));
     return row ? rowToPin(row) : undefined;
   }
 
-  /** Accept a member's certificate; a changed account key is quarantined unless a valid receipt explains it. */
-  private async acceptMemberCertificate(wire: Uint8Array, resetReceipt: Uint8Array | undefined, report: SyncReport): Promise<void> {
+  /**
+   * Apply the host's succession chain for a pinned account: each link in order, accepted ones as
+   * duplicates. Returns the pin as it stands afterwards, or undefined when a link was deferred or
+   * refused, in which case the certificate under the new key must not be accepted either.
+   */
+  private async applyChain(current: AccountPin, chain: readonly { wire: Uint8Array; certificate: Uint8Array }[], report: SyncReport): Promise<AccountPin | undefined> {
+    let pin = current;
+    for (const link of chain) {
+      let previousGeneration: bigint;
+      try {
+        previousGeneration = expectType<AccountSuccession>(parseDocument(link.wire), DocumentType.AccountSuccession, "sync").previousGeneration;
+      } catch (e) {
+        report.errors.push(syncError("succession", e));
+        return undefined;
+      }
+      if (previousGeneration < pin.generation && !equalBytes(pin.accountKey, expectType<AccountDevice>(verifyDocument(link.certificate), DocumentType.AccountDevice, "sync").accountKey)) {
+        // A link behind the pinned key: already applied (the pin moved past it) or never ours to apply.
+        const known = await this.store.read((tx) => tx.list("successions").some(([, s]) => s.accountId === toHex(pin.accountId) && unbig(s.previousGeneration) === previousGeneration));
+        if (known) continue;
+      }
+      try {
+        const effect = await this.store.transaction((tx) => {
+          const e = applySuccession(tx, { wire: link.wire, newCertificate: link.certificate, policy: this.policy, trust: this.trust, now: this.now() });
+          this.persistTrustIn(tx);
+          return e;
+        });
+        if (effect.outcome === "ACCEPTED") {
+          report.metadata.successions++;
+          report.metadata.rotations++;
+          this.emit({ kind: "accountKeyChanged", accountName: effect.accountName, quarantined: false });
+          this.emit({ kind: "deviceChanged", identityId: effect.pin.accountId, generation: effect.pin.generation });
+        }
+        if (effect.outcome === "ACCEPTED" || effect.outcome === "DUPLICATE") pin = effect.pin;
+      } catch (e) {
+        report.errors.push(syncError("succession", e));
+        if (e instanceof KavachError && (e.code === "EQUIVOCATION" || e.code === "ROLLBACK" || e.code === "SUCCESSION_BINDING" || e.code === "DEVICE_ID_REUSED")) {
+          this.emit({ kind: "securityError", code: e.code, detail: current.accountName });
+        }
+        return undefined;
+      }
+    }
+    return pin;
+  }
+
+  /** Accept a member's certificate; a changed account key is quarantined unless a succession chain or a reset receipt explains it. */
+  private async acceptMemberCertificate(resolved: ResolvedAccount, report: SyncReport): Promise<void> {
+    const wire = resolved.certificate;
+    const resetReceipt = resolved.resetReceipt;
     const doc = expectType<AccountDevice>(verifyDocument(wire), DocumentType.AccountDevice, "sync");
     const existing = await this.store.read((tx) => tx.list("pins").find(([, p]) => p.accountName === doc.accountName)?.[1]);
-    const current = existing ? rowToPin(existing) : undefined;
+    let current = existing ? rowToPin(existing) : undefined;
+    if (current && resolved.successions?.length && !equalBytes(current.accountKey, doc.accountKey)) {
+      current = await this.applyChain(current, resolved.successions, report);
+      if (!current) return;
+    }
     let outcome;
     try {
       outcome = acceptCertificate(current, wire);
@@ -976,21 +1100,29 @@ class ClientImpl implements Client {
       throw e;
     }
     if (outcome.outcome === "DUPLICATE") return;
-    const p = outcome.pin;
+    // A first contact with an account that went through successions is pinned under its root id,
+    // as the chain the host serves names it; the chain itself is not re-verified at first contact,
+    // exactly as a first certificate is taken from the directory today.
+    const p = current ? outcome.pin : { ...outcome.pin, accountId: resolvedAccountId(resolved) };
     await this.store.transaction((tx) => {
-      tx.put("pins", toHex(p.identityId), pinToRow(p));
+      tx.put("pins", toHex(p.accountId), pinToRow(p));
+      if (!tx.get("identities", toHex(p.identityId))) {
+        const last = resolved.successions?.at(-1);
+        const since = last ? expectType<AccountSuccession>(parseDocument(last.wire), DocumentType.AccountSuccession, "sync").newGeneration : 1n;
+        tx.put("identities", toHex(p.identityId), { accountId: toHex(p.accountId), accountName: p.accountName, accountKey: toHex(p.accountKey), sinceGeneration: big(since), retired: false });
+      }
       if (outcome.previous) {
         const old = tx.get("certificates", toHex(outcome.previous.certificateHash));
         if (old) tx.put("certificates", toHex(outcome.previous.certificateHash), { ...old, current: false });
       }
-      tx.put("certificates", toHex(p.certificateHash), { identityId: toHex(p.identityId), certificateHash: toHex(p.certificateHash), signingKey: toHex(p.signingKey), boxKey: toHex(p.boxKey), streamId: toHex(p.streamId), generation: big(p.generation), wire: toHex(p.certificate), current: true });
+      tx.put("certificates", toHex(p.certificateHash), { identityId: toHex(p.accountId), certificateHash: toHex(p.certificateHash), signingKey: toHex(p.signingKey), boxKey: toHex(p.boxKey), streamId: toHex(p.streamId), generation: big(p.generation), wire: toHex(p.certificate), current: true });
       if (outcome.rotate) {
-        const ch = t3ApplyChange(tx, { kind: "deviceChanged", identityId: p.identityId, certificateHash: p.certificateHash });
+        const ch = t3ApplyChange(tx, { kind: "deviceChanged", identityId: p.accountId, certificateHash: p.certificateHash });
         if (ch.changed) report.metadata.rotations++;
       }
     });
     report.metadata.certificates++;
-    if (outcome.rotate) this.emit({ kind: "deviceChanged", identityId: p.identityId, generation: p.generation });
+    if (outcome.rotate) this.emit({ kind: "deviceChanged", identityId: p.accountId, generation: p.generation });
   }
 
   private async onKeyChanged(current: AccountPin, wire: Uint8Array, receipt: Uint8Array | undefined, report: SyncReport): Promise<void> {
@@ -1025,17 +1157,21 @@ class ClientImpl implements Client {
 
   /** Peers on a validated reset: stop sharing to the old identity, close its circles, rotate. */
   private applyResetIn(tx: Tx, old: AccountPin, newIdentityId: Uint8Array): void {
-    tx.delete("pins", toHex(old.identityId));
+    const accountHex = toHex(old.accountId);
+    tx.delete("pins", accountHex);
     tx.delete("quarantine", old.accountName);
-    for (const [k, c] of tx.list("certificates")) if (c.identityId === toHex(old.identityId)) tx.put("certificates", k, { ...c, current: false });
+    for (const [k, c] of tx.list("certificates")) if (c.identityId === accountHex) tx.put("certificates", k, { ...c, current: false });
+    // Every identity of the chain is retired; the root remembers the reset, so no successor of
+    // the old account is ever a recipient again.
+    for (const [k, r] of tx.list("identities")) if (r.accountId === accountHex) tx.put("identities", k, k === accountHex ? { ...r, retired: true, resetAt: big(this.now()) } : { ...r, retired: true });
     for (const [k, c] of tx.list("circles")) {
-      if (c.ownerIdentityId === toHex(old.identityId)) {
+      if (c.ownerIdentityId === accountHex) {
         t3Circle(tx, { ...c, status: "closed" }, { kind: "leave", circleId: fromHex(k) });
-      } else if (c.members.includes(toHex(old.identityId))) {
-        t3ApplyChange(tx, { kind: "deviceChanged", identityId: old.identityId, certificateHash: newIdentityId });
+      } else if (c.members.includes(accountHex)) {
+        t3ApplyChange(tx, { kind: "deviceChanged", identityId: old.accountId, certificateHash: newIdentityId });
       }
     }
-    forgetAuthorIn(tx, old.identityId);
+    forgetAuthorIn(tx, old.accountId);
   }
 
   private persistTrustIn(tx: Tx): void {
@@ -1056,7 +1192,7 @@ class ClientImpl implements Client {
     const { pin } = this.requireAccount("left");
     const others = await this.store.read((tx) => tx.list("circles").filter(([, x]) => x.circleId !== toHex(c.circleId) && x.status === "member").flatMap(([, x]) => x.members));
     for (const m of c.members) {
-      if (equalBytes(m, pin.identityId) || others.includes(toHex(m))) continue;
+      if (equalBytes(m, pin.accountId) || others.includes(toHex(m))) continue;
       await forgetAuthor(this.store, m);
     }
   }
@@ -1099,7 +1235,7 @@ class ClientImpl implements Client {
   // Circles ---------------------------------------------------------------------------------------
 
   private async listCircles(): Promise<CircleSummary[]> {
-    const self = this.selfPin?.identityId;
+    const self = this.selfPin?.accountId;
     const now = this.now();
     return this.store.read((tx) =>
       tx.list("circles").map(([, r]) => {
@@ -1195,8 +1331,8 @@ class ClientImpl implements Client {
   private async createCircle(): Promise<{ circleId: Uint8Array }> {
     const { account, pin } = this.requireAccount("createCircle");
     const circleId = newCircleId();
-    const genesis = createCircleSnapshot({ identityId: pin.identityId, accountSecretKey: account.account.secretKey }, circleId);
-    const state = acceptSnapshot(pinCircle(circleId, pin.identityId, true, "member"), genesis, pin.accountKey, pin.identityId, this.now());
+    const genesis = createCircleSnapshot({ identityId: pin.accountId, accountSecretKey: account.account.secretKey }, circleId);
+    const state = acceptSnapshot(pinCircle(circleId, pin.accountId, true, "member"), genesis, pin.accountKey, pin.accountId, this.now());
     if (state.outcome !== "ACCEPTED") throw new KavachError("STORAGE_FAILURE", "createCircle");
     await this.store.transaction((tx) => t3Circle(tx, { ...circleToRow(state.state), pending: { snapshot: toHex(genesis), revision: "1" } }));
     const published = await this.publishPendingSnapshot(circleId);
@@ -1231,12 +1367,12 @@ class ClientImpl implements Client {
   private async approve(circleId: Uint8Array, accountName: string): Promise<{ revision: bigint }> {
     const [resolved] = await this.transport.directory.resolveAccounts([accountName]);
     if (!resolved) throw new KavachError("METADATA_REQUIRED", "approve", "unknown account");
-    const report: SyncReport = { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false }, purged: 0, errors: [] };
-    await this.acceptMemberCertificate(resolved.certificate, resolved.resetReceipt, report);
-    const requester = pinFromCertificate(expectType<AccountDevice>(verifyDocument(resolved.certificate), DocumentType.AccountDevice));
-    const pinned = await this.pinFor(requester.identityId);
-    if (!pinned) throw new KavachError("ACCOUNT_KEY_CHANGED", "approve", "requester's key is quarantined");
-    return this.changeMembership(circleId, { admit: requester.identityId });
+    const report: SyncReport = { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false }, purged: 0, errors: [] };
+    await this.acceptMemberCertificate(resolved, report);
+    const requester = resolvedAccountId(resolved);
+    const pinned = await this.pinFor(requester);
+    if (!pinned || !equalBytes(pinned.certificateHash, expectType<AccountDevice>(verifyDocument(resolved.certificate), DocumentType.AccountDevice).bodyHash)) throw new KavachError("ACCOUNT_KEY_CHANGED", "approve", "requester's key is quarantined");
+    return this.changeMembership(circleId, { admit: requester });
   }
 
   private async changeMembership(circleId: Uint8Array, change: { admit: Uint8Array } | { remove: Uint8Array } | { close: true }): Promise<{ revision: bigint }> {
@@ -1251,7 +1387,7 @@ class ClientImpl implements Client {
       }
       const state = rowToCircle(row);
       if (state.status === "closed") return { revision: state.revision };
-      const successor = successorSnapshot(state, change, { identityId: pin.identityId, accountSecretKey: account.account.secretKey });
+      const successor = successorSnapshot(state, change, { identityId: pin.accountId, accountSecretKey: account.account.secretKey });
       if (!successor) {
         if (!("close" in change)) return { revision: state.revision };
         // Nobody but the owner to tell: the close is local, and the vault entry goes with it.
@@ -1289,7 +1425,7 @@ class ClientImpl implements Client {
     const expectedRevision = unbig(pending.revision) - 1n;
     const outcome = await this.transport.directory.publishOwnedCircle({ circleId, expectedRevision, expectedHash: expectedRevision === state.revision ? state.bodyHash : undefined, newSnapshot: successor });
     if (outcome.status === "COMMITTED" || outcome.status === "ALREADY_COMMITTED") {
-      const accepted = acceptSnapshot(state, successor, pin.accountKey, pin.identityId, this.now());
+      const accepted = acceptSnapshot(state, successor, pin.accountKey, pin.accountId, this.now());
       if (accepted.outcome !== "ACCEPTED" && accepted.outcome !== "DUPLICATE") throw new KavachError("STORAGE_FAILURE", stage, "the successor was refused locally");
       let next = pending.close ? { ...accepted.state, status: "closed" as const } : accepted.state;
       await this.store.transaction((tx) => {
@@ -1301,7 +1437,7 @@ class ClientImpl implements Client {
       });
       const after = new Set(next.members.map(toHex));
       for (const m of state.members) {
-        if (after.has(toHex(m)) || equalBytes(m, pin.identityId)) continue;
+        if (after.has(toHex(m)) || equalBytes(m, pin.accountId)) continue;
         const stillElsewhere = await this.store.read((tx) => tx.list("circles").some(([, c]) => c.circleId !== toHex(circleId) && c.status === "member" && c.members.includes(toHex(m))));
         if (!stillElsewhere) await forgetAuthor(this.store, m);
       }
@@ -1310,7 +1446,7 @@ class ClientImpl implements Client {
       return "COMMITTED";
     }
     if (outcome.status === "CONFLICT" && outcome.current) {
-      const accepted = acceptSnapshot(state, outcome.current, pin.accountKey, pin.identityId, this.now());
+      const accepted = acceptSnapshot(state, outcome.current, pin.accountKey, pin.accountId, this.now());
       await this.store.transaction((tx) => t3Circle(tx, { ...circleToRow(accepted.outcome === "ACCEPTED" ? accepted.state : state), pending: undefined }));
       return "CONFLICT";
     }
@@ -1321,7 +1457,7 @@ class ClientImpl implements Client {
     const { pin } = this.requireAccount("leave");
     const row = await this.store.read((tx) => tx.get("circles", toHex(circleId)));
     if (!row) return;
-    if (row.ownerIdentityId === toHex(pin.identityId)) throw new KavachError("NOT_AUTHORIZED", "leave", "the owner closes instead");
+    if (row.ownerIdentityId === toHex(pin.accountId)) throw new KavachError("NOT_AUTHORIZED", "leave", "the owner closes instead");
     const state = rowToCircle(row);
     await this.store.transaction((tx) => {
       t3Circle(tx, circleToRow({ ...state, enabled: false, status: "left" }), { kind: "leave", circleId });

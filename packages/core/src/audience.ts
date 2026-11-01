@@ -23,12 +23,12 @@ export interface ResolvedAudience {
   readonly key: string;
 }
 
-export function isEligible(circle: CircleState, selfIdentityId: Uint8Array): boolean {
+export function isEligible(circle: CircleState, selfAccountId: Uint8Array): boolean {
   return (
     circle.status === "member" &&
     circle.enabled &&
     circle.revision > 0n &&
-    circle.members.some((m) => equalBytes(m, selfIdentityId))
+    circle.members.some((m) => equalBytes(m, selfAccountId))
   );
 }
 
@@ -39,17 +39,18 @@ export function isEligible(circle: CircleState, selfIdentityId: Uint8Array): boo
  */
 export function resolveAudience(self: AccountPin, circles: readonly CircleState[], pins: ReadonlyMap<string, AccountPin>, retired: ReadonlySet<string> = new Set()): ResolvedAudience {
   const stage = "resolveAudience";
+  // Members are account ids; `pins` is keyed by account id and names each account's current device.
   const wanted = new Map<string, Uint8Array>();
-  wanted.set(toHex(self.identityId), self.identityId);
+  wanted.set(toHex(self.accountId), self.accountId);
   for (const c of circles) {
-    if (!isEligible(c, self.identityId)) continue;
-    // An identity retired by a validated reset receipt is no longer a recipient.
+    if (!isEligible(c, self.accountId)) continue;
+    // An account retired by a validated reset receipt is no longer a recipient.
     for (const m of c.members) if (!retired.has(toHex(m))) wanted.set(toHex(m), m);
   }
   if (wanted.size > MAX_AUDIENCE) throw new KavachError("RECIPIENT_LIMIT", stage, `${wanted.size} accounts`);
   const rows: AudienceEntry[] = [];
   for (const [hex, iid] of wanted) {
-    const pin = hex === toHex(self.identityId) ? self : pins.get(hex);
+    const pin = hex === toHex(self.accountId) ? self : pins.get(hex);
     if (!pin) throw new KavachError("METADATA_REQUIRED", stage, "no certificate for a member");
     rows.push({ identityId: iid, certificateHash: pin.certificateHash, boxKey: pin.boxKey });
   }

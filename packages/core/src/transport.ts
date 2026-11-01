@@ -19,6 +19,8 @@ export interface ResolvedAccount {
   readonly certificate: Uint8Array;
   /** When the account's key changed through a reset: the receipt that proves it. */
   readonly resetReceipt?: Uint8Array | undefined;
+  /** When the account's key changed through successions (revision 9): the chain from the root, each link with the successor's certificate, oldest first. */
+  readonly successions?: readonly { readonly wire: Uint8Array; readonly certificate: Uint8Array }[] | undefined;
 }
 
 export interface JoinRequest {

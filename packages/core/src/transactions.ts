@@ -3,7 +3,7 @@
  * live with the outbox and the inbox. Each function takes an open `Tx` so callers can compose
  * them; nothing here opens the network.
  */
-import { equalBytes, toHex } from "./bytes.js";
+import { equalBytes, fromHex, toHex } from "./bytes.js";
 import { applyAudienceEvent, initialRevisionState, type AudienceEvent } from "./audience.js";
 import { DocumentType, expectType, parseDocument, type AccountDevice } from "./codec.js";
 import { identityId } from "./crypto.js";
@@ -39,7 +39,7 @@ export async function openStore(store: Store, secrets: SecretStore, accountName:
     if (meta) throw new KavachError("RECOVERY_REQUIRED", stage, "store present but secrets missing");
     return { kind: "fresh" };
   }
-  const account = openAccount(accountName, accountSeed);
+  const account = openAccount(accountName, accountSeed, meta?.accountId ? fromHex(meta.accountId) : undefined);
   if (!meta) return { kind: "initializing", account };
   if (meta.instanceId !== toHex(instanceId) || meta.identityId !== toHex(account.identityId) || meta.accountName !== accountName || meta.schema !== 1) {
     throw new KavachError("RECOVERY_REQUIRED", stage, "store header does not match the secret store");
@@ -61,7 +61,7 @@ export async function t1Secrets(secrets: SecretStore, roots: { accountSeed: Uint
 /** T1b: the store header with the INITIALIZING marker, the own pin and the stream state. */
 export function t1Header(tx: Tx, input: { account: OwnAccount; device: DeviceKeys; certificate: Uint8Array; instanceId: Uint8Array; generation: bigint }): void {
   const doc = expectType<AccountDevice>(parseDocument(input.certificate), DocumentType.AccountDevice, "t1");
-  const pin = pinFromCertificate(doc);
+  const pin = pinFromCertificate(doc, undefined, input.account.accountId);
   if (!equalBytes(pin.identityId, input.account.identityId)) throw new KavachError("MALFORMED", "t1", "certificate is not for this account");
   tx.put("meta", META, {
     schema: 1,
@@ -70,6 +70,7 @@ export function t1Header(tx: Tx, input: { account: OwnAccount; device: DeviceKey
     instanceId: toHex(input.instanceId),
     accountName: input.account.accountName,
     identityId: toHex(input.account.identityId),
+    accountId: toHex(input.account.accountId),
     certificateHash: toHex(pin.certificateHash),
     state: "INITIALIZING"
   });
@@ -80,9 +81,12 @@ export function t1Header(tx: Tx, input: { account: OwnAccount; device: DeviceKey
     certificateHash: toHex(pin.certificateHash),
     streamId: toHex(pin.streamId)
   });
-  tx.put("pins", toHex(pin.identityId), pinToRow(pin));
+  tx.put("pins", toHex(pin.accountId), pinToRow(pin));
+  if (!tx.get("identities", toHex(pin.identityId))) {
+    tx.put("identities", toHex(pin.identityId), { accountId: toHex(pin.accountId), accountName: pin.accountName, accountKey: toHex(pin.accountKey), sinceGeneration: big(input.generation), retired: false });
+  }
   tx.put("certificates", toHex(pin.certificateHash), {
-    identityId: toHex(pin.identityId),
+    identityId: toHex(pin.accountId),
     certificateHash: toHex(pin.certificateHash),
     signingKey: toHex(pin.signingKey),
     boxKey: toHex(pin.boxKey),

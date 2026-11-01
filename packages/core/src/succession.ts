@@ -150,13 +150,13 @@ export function applySuccession(tx: Tx, input: SuccessionInput): SuccessionEffec
   // Accept, all in this transaction: the pin, the certificates, the identities, the transition,
   // the durable notice, and the rotation (T3) that moves the audience to the new key.
   const next = pinFromCertificate(cert, pin);
-  tx.put("pins", t.accountId, { ...pinToRow(next), accountId: t.accountId });
+  tx.put("pins", t.accountId, pinToRow(next));
   const previousCert = tx.get("certificates", toHex(pin.certificateHash));
   if (previousCert) tx.put("certificates", toHex(pin.certificateHash), { ...previousCert, current: false });
   tx.put("certificates", t.newCertificateHash, { identityId: t.accountId, certificateHash: t.newCertificateHash, signingKey: toHex(next.signingKey), boxKey: toHex(next.boxKey), streamId: toHex(next.streamId), generation: big(next.generation), wire: toHex(input.newCertificate), current: true });
   const previousIdentity = tx.get("identities", t.previousIdentityId);
-  tx.put("identities", t.previousIdentityId, { accountId: t.accountId, accountName: t.accountName, sinceGeneration: previousIdentity?.sinceGeneration ?? big(1n), retired: true });
-  tx.put("identities", t.newIdentityId, { accountId: t.accountId, accountName: t.accountName, sinceGeneration: big(t.newGeneration), retired: false });
+  tx.put("identities", t.previousIdentityId, { accountId: t.accountId, accountName: t.accountName, accountKey: previousIdentity?.accountKey ?? toHex(pin.accountKey), sinceGeneration: previousIdentity?.sinceGeneration ?? big(1n), retired: true });
+  tx.put("identities", t.newIdentityId, { accountId: t.accountId, accountName: t.accountName, accountKey: toHex(cert.accountKey), sinceGeneration: big(t.newGeneration), retired: false });
   tx.put("successions", successionKey(t.accountId, t.previousGeneration), { accountId: t.accountId, accountName: t.accountName, successionId: t.successionId, previousIdentityId: t.previousIdentityId, newIdentityId: t.newIdentityId, previousGeneration: big(t.previousGeneration), newGeneration: big(t.newGeneration), newCertificateHash: t.newCertificateHash, authorityKeyId: toHex(parsed.authorityKeyId), wire: toHex(input.wire), acceptedAt: big(now) });
   const notice: KeyChangeRow = { accountId: t.accountId, accountName: t.accountName, previousIdentityId: t.previousIdentityId, newIdentityId: t.newIdentityId, generation: big(t.newGeneration), reason: "succession", successionId: t.successionId, acceptedAt: big(now) };
   tx.put("keyChanges", `${now.toString().padStart(20, "0")}:${t.accountId}:${t.successionId}`, notice);

@@ -32,7 +32,10 @@ import { KavachError } from "./errors.js";
 export interface AccountPin {
   readonly accountName: string;
   readonly accountKey: Uint8Array;
+  /** The identity of the current key: `H(C("identity") || name || AK)`. Changes at a succession. */
   readonly identityId: Uint8Array;
+  /** The account id: the identity at enrollment, what every document names. Constant across successions. */
+  readonly accountId: Uint8Array;
   readonly generation: bigint;
   readonly certificateHash: Uint8Array;
   readonly certificate: Uint8Array;
@@ -48,7 +51,7 @@ export type CertificateOutcome =
   | { readonly outcome: "ACCEPTED"; readonly pin: AccountPin; readonly rotate: boolean; readonly previous: AccountPin | undefined }
   | { readonly outcome: "DUPLICATE"; readonly pin: AccountPin };
 
-export function pinFromCertificate(doc: Parsed<AccountDevice>, previous?: AccountPin): AccountPin {
+export function pinFromCertificate(doc: Parsed<AccountDevice>, previous?: AccountPin, accountId?: Uint8Array): AccountPin {
   const iid = identityId(doc.accountName, doc.accountKey);
   const ids = previous ? [...previous.deviceIds] : [];
   if (!ids.some((d) => equalBytes(d, doc.deviceId))) ids.push(doc.deviceId);
@@ -56,6 +59,9 @@ export function pinFromCertificate(doc: Parsed<AccountDevice>, previous?: Accoun
     accountName: doc.accountName,
     accountKey: doc.accountKey,
     identityId: iid,
+    // The account id is carried from the previous pin (a succession keeps it) or given by the
+    // caller who resolved the chain; a first contact is its own root.
+    accountId: accountId ?? previous?.accountId ?? iid,
     generation: doc.generation,
     certificateHash: doc.bodyHash,
     certificate: concat(doc.body, doc.signature),
@@ -111,13 +117,17 @@ export interface OwnAccount {
   readonly accountName: string;
   readonly accountSeed: Uint8Array;
   readonly account: SigningKeypair;
+  /** The identity of this key. */
   readonly identityId: Uint8Array;
+  /** The account id: this identity for an account enrolled under this key, the root of the chain otherwise. */
+  readonly accountId: Uint8Array;
 }
 
-export function openAccount(accountName: string, accountSeed: Uint8Array): OwnAccount {
+export function openAccount(accountName: string, accountSeed: Uint8Array, accountId?: Uint8Array): OwnAccount {
   if (accountSeed.length !== SEED_BYTES) throw new KavachError("INVALID_KEY", "openAccount");
   const account = accountKeypair(accountSeed);
-  return { accountName, accountSeed, account, identityId: identityId(accountName, account.publicKey) };
+  const iid = identityId(accountName, account.publicKey);
+  return { accountName, accountSeed, account, identityId: iid, accountId: accountId ?? iid };
 }
 
 export function newAccountSeed(): Uint8Array {
