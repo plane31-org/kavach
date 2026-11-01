@@ -2,6 +2,12 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
+## 0.1.2
+
+- The `/sodium` entry loads `libsodium-wrappers-sumo` through its CommonJS build. Its ESM build has shipped broken (0.7.16 imports a file the package does not contain), so a plain import of the 0.1.1 entry failed in a fresh Node install.
+- Both packages ship `src` next to `dist`, so source maps and declaration maps resolve in a consumer's project.
+- The release workflow packs both tarballs, installs them into an empty directory and imports every public entry point in a plain Node before publishing; ordinary CI runs the same check.
+
 ## 0.1.1
 
 First published versions of `@plane31/blind-relay` and `@plane31/blind-relay-expo`, implementing protocol revision 8. (0.1.0 was tagged but never reached the registry; its tag points at an earlier tree.)

@@ -1,6 +1,6 @@
 {
   "name": "@plane31/blind-relay-expo",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Kavach v1 adapters for Expo: SecureStore secrets, SQLite with SQLCipher store, Keychain and Block Store recovery providers, clock and background glue.",
   "license": "Apache-2.0",
   "repository": {
@@ -28,7 +28,8 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "scripts": {
     "build": "tsc -b",

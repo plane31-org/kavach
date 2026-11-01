@@ -19,6 +19,9 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm test
+      - run: pnpm --filter "./packages/*" build
+      - name: packed-package smoke test
+        run: scripts/smoke.sh
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

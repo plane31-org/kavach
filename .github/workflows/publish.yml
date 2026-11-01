@@ -39,6 +39,8 @@ jobs:
       - name: vectors
         run: scripts/vectors.sh
       - run: pnpm --filter "./packages/*" build
+      - name: packed-package smoke test
+        run: scripts/smoke.sh
       - name: publish
         run: pnpm --filter "./packages/*" publish --access public --no-git-checks
         env:
