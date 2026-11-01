@@ -26,7 +26,7 @@ import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
 import type { BootstrapRetryRow, CircleRow, MetaRow, PendingResetRow, ReplacementRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
 import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t3Circle, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault } from "./transactions.js";
-import { applySuccession, pinnedState, recordChainIn, rootIdentityIn, rootState, sameTransition, transitionOf, verifyChain, type SuccessionEffect, type VerifiedLink } from "./succession.js";
+import { applySuccession, authenticateSuccession, pinnedState, recordChainIn, rootIdentityIn, rootState, sameTransition, transitionOf, validateTransition, verifyChain, type SuccessionEffect, type VerifiedLink } from "./succession.js";
 import type { CircleListing, Directory, Relay, ResolvedAccount, SuccessionLink, Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
 
@@ -543,6 +543,9 @@ class ClientImpl implements Client {
   }
 
   async recoveryCode(): Promise<string> {
+    // A code opens a vault for identity continuity; where the profile disables that, or where no
+    // vault exists, the code would open nothing and is not issued.
+    if (!allowsContinuity(this.policy) || !this.vaultEnabled) throw new KavachError("NOT_AUTHORIZED", "recoveryCode", "this deployment does not restore accounts by recovery code");
     const key = await this.secrets.get("recoveryKey");
     if (!key) throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", "recoveryCode");
     return encodeRecoveryCode(key);
@@ -1175,6 +1178,9 @@ class ClientImpl implements Client {
         const row = recorded.find((r) => unbig(r.previousGeneration) === t.previousGeneration && r.previousIdentityId === t.previousIdentityId);
         if (!row) return true;
         if (!sameTransition({ accountName: row.accountName, accountId: row.accountId, successionId: row.successionId, previousIdentityId: row.previousIdentityId, newIdentityId: row.newIdentityId, previousGeneration: unbig(row.previousGeneration), newGeneration: unbig(row.newGeneration), newCertificateHash: row.newCertificateHash }, t)) {
+          // A different transition at a recorded state is evidence against the authority only if
+          // the authority signed it: unauthenticated bytes are a bad signature, nothing more.
+          authenticateSuccession(l.wire, this.trust, this.now());
           throw new KavachError("EQUIVOCATION", stage, "two successors for one account state");
         }
         return false;
@@ -1183,14 +1189,24 @@ class ClientImpl implements Client {
     const verified: VerifiedLink[] = [];
     let cursor: bigint | undefined;
     let pending: readonly SuccessionLink[];
+    // Only links this device has not recorded are verified, and only they count against the budget.
     const verifyMore = (links: readonly SuccessionLink[]): void => {
-      const r = verifyChain(unseen(links), { state, trust: this.trust, now: this.now() });
+      const fresh = unseen(links);
+      const r = verifyChain(fresh, { state, trust: this.trust, now: this.now() });
       verified.push(...r.links);
       state = r.state;
+      if (input.budget) input.budget.remainingRecords -= fresh.length;
     };
-    if (progress && progress.startIdentityId === toHex(startIdentity) && progress.links.length > 0) {
-      // Resume: the prefix was verified by an earlier sync from this same start; its state is recomputed.
-      verifyMore(progress.links.map((l) => ({ wire: fromHex(l.wire), certificate: fromHex(l.certificate) })));
+    if (progress && progress.startIdentityId === toHex(startIdentity)) {
+      // Resume at the saved cursor, however long the verified prefix is. The prefix's transitions
+      // were verified when their attestations were allowed, so they are replayed through the
+      // transition rules alone; their bytes are authenticated again below, and refreshed from the
+      // host where a key rotation since made them stale.
+      for (const l of progress.links) {
+        const doc = expectType<AccountSuccession>(parseDocument(fromHex(l.wire)), DocumentType.AccountSuccession, stage);
+        state = validateTransition(doc, fromHex(l.certificate), state).next;
+        verified.push({ doc, wire: fromHex(l.wire), certificate: fromHex(l.certificate) });
+      }
       cursor = unbig(progress.nextGeneration);
       pending = [];
     } else {
@@ -1203,7 +1219,6 @@ class ClientImpl implements Client {
         else tx.put("chainProgress", accountHex, { accountId: accountHex, startIdentityId: toHex(startIdentity), links: verified.map((v) => ({ wire: toHex(v.wire), certificate: toHex(v.certificate) })), nextGeneration: big(cursor), complete: false });
       });
     verifyMore(pending);
-    if (input.budget) input.budget.remainingRecords -= pending.length;
     while (cursor !== undefined) {
       if (input.budget && (input.budget.remainingRecords <= 0 || this.now() >= input.budget.deadline)) {
         await persist();
@@ -1221,11 +1236,28 @@ class ClientImpl implements Client {
         throw new KavachError("METADATA_REQUIRED", stage, "the host did not finish serving the chain");
       }
       verifyMore(page.successions);
-      if (input.budget) input.budget.remainingRecords -= page.successions.length;
       cursor = page.nextGeneration;
       if (cursor !== undefined) await persist();
     }
     if (input.finalIdentityId && state.identityId !== toHex(input.finalIdentityId)) throw new KavachError("SUCCESSION_BINDING", stage, "the chain does not end at the served key");
+    // Every attestation under the current list before anything is recorded. A link whose signer
+    // left the list since it was verified is fetched again: the host re-attests a legitimate
+    // transition under a current key, and the transition must be the same one.
+    for (let i = 0; i < verified.length; i++) {
+      const link = verified[i];
+      if (!link) continue;
+      try {
+        authenticateSuccession(link.wire, this.trust, this.now());
+      } catch (e) {
+        if (!isKavachError(e, "RESET_KEY_REVOKED")) throw e;
+        const page = await this.transport.directory.getSuccessions(input.accountId, link.doc.newGeneration - 1n, 1);
+        const again = page.successions[0];
+        if (!again) throw e;
+        const doc = authenticateSuccession(again.wire, this.trust, this.now());
+        if (!sameTransition(transitionOf(doc), transitionOf(link.doc)) || !equalBytes(again.certificate, link.certificate)) throw new KavachError("EQUIVOCATION", stage, "the re-attested link is a different transition");
+        verified[i] = { doc, wire: again.wire, certificate: link.certificate };
+      }
+    }
     if (!current) {
       if (progress) await this.store.transaction((tx) => tx.delete("chainProgress", accountHex));
       return { pin: undefined, verified, accepted: [] };

@@ -2,14 +2,15 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { fromHex, toHex } from "../src/bytes.js";
 import { open } from "../src/client.js";
-import { DocumentType, buildCircleSnapshot, expectType, parseDocument, verifyDocument, type AccountDevice, type CircleSnapshot } from "../src/codec.js";
-import { randomBytes, ready } from "../src/crypto.js";
+import { DocumentType, buildCircleSnapshot, buildResetKeyList, buildSuccession, expectType, parseDocument, verifyDocument, type AccountDevice, type AccountSuccession, type CircleSnapshot } from "../src/codec.js";
+import { C, H, randomBytes, ready, signingKeypairFromSeed } from "../src/crypto.js";
 import { certify, newAccountSeed, newDevice, openAccount, pinFromCertificate } from "../src/identity.js";
 import { MemorySecretStore, MemoryStore } from "../src/store.js";
 import { testPolicy } from "../src/testing/clock.js";
 import { MemoryPlatformProvider } from "../src/testing/providers.js";
 import { hostTransport } from "../src/testing/sweep.js";
-import { pair, resetTrust, thrown, world, type Dev, type World } from "./clientWorld.js";
+import type { Transport } from "../src/transport.js";
+import { DAY, management, pair, resetTrust, thrown, world, type Dev, type World } from "./clientWorld.js";
 
 beforeAll(() => ready());
 
@@ -195,6 +196,115 @@ describe("second review: chains over time", () => {
     expect(ar.errors.map((e) => e.code)).toContain("SUPERSEDED_IDENTITY");
     expect((await a.store.read((tx) => tx.get("pins", toHex(bobId))))?.generation).toBe("1");
     expect(a.events.some((e) => e.kind === "securityError" && e.code === "SUPERSEDED_IDENTITY")).toBe(true);
+  });
+});
+
+describe("third review: chains under rotation, budgets and forgeries", () => {
+  function rotateAuthority(w: World) {
+    const key = signingKeypairFromSeed(H(C("fixture-rotated-authority-3")));
+    const keyId = new Uint8Array(16).fill(11);
+    w.host.resetSigner = { key, keyId };
+    w.host.resetKeyList = buildResetKeyList({ version: 2n, issuedAt: w.clock.now(), expiresAt: w.clock.now() + 30n * DAY, keys: [{ keyId, publicKey: key.publicKey }] }, management.secretKey);
+  }
+
+  it("1: an authority rotation after a cached page: the stale prefix is refreshed from the host, and the chain completes", async () => {
+    const w = world();
+    const { a, bobId } = await pair(w);
+    await recover(w, "bob");
+    await recover(w, "bob");
+    w.host.successionPageSize = 1;
+    const held = await a.client.sync({ catchUp: { maxRecords: 1, maxMs: 5000 } });
+    expect(held.errors.map((e) => e.code)).toEqual(["METADATA_REQUIRED"]);
+    rotateAuthority(w);
+    w.clock.advance(2n * DAY);
+    const done = await w.sync(a);
+    expect([done.errors, done.metadata.successions]).toEqual([[], 2]);
+    expect((await a.store.read((tx) => tx.get("pins", toHex(bobId))))?.generation).toBe("3");
+    // Without re-attestation the stale link stays refused, the pin stays, and nothing is recorded.
+    const w2 = world();
+    const { a: a2, bobId: bob2 } = await pair(w2);
+    await recover(w2, "bob");
+    await recover(w2, "bob");
+    w2.host.successionPageSize = 1;
+    await a2.client.sync({ catchUp: { maxRecords: 1, maxMs: 5000 } });
+    rotateAuthority(w2);
+    w2.host.reattest = false;
+    w2.clock.advance(2n * DAY);
+    const refused = await w2.sync(a2);
+    expect([refused.errors.map((e) => e.code), refused.metadata.successions]).toEqual([["RESET_KEY_REVOKED"], 0]);
+    expect((await a2.store.read((tx) => tx.get("pins", toHex(bob2))))?.generation).toBe("1");
+  });
+
+  it("2: with one-link pages and a budget of one, a peer that accepted two replacements still reaches the third", async () => {
+    const w = world();
+    const { a, bobId } = await pair(w);
+    await recover(w, "bob");
+    await w.sync(a);
+    await recover(w, "bob");
+    await w.sync(a);
+    expect((await a.store.read((tx) => tx.get("pins", toHex(bobId))))?.generation).toBe("3");
+    await recover(w, "bob");
+    w.host.successionPageSize = 1;
+    let generation = "3";
+    for (let i = 0; i < 5 && generation !== "4"; i++) {
+      await a.client.sync({ catchUp: { maxRecords: 1, maxMs: 5000 } });
+      generation = (await a.store.read((tx) => tx.get("pins", toHex(bobId))))?.generation ?? "";
+    }
+    expect(generation).toBe("4");
+    expect(await a.store.read((tx) => tx.get("chainProgress", toHex(bobId)))).toBeUndefined();
+  });
+
+  it("3: a forged change to an accepted transition is a bad signature, never evidence of equivocation", async () => {
+    const w = world();
+    const { a, bobId } = await pair(w);
+    await recover(w, "bob");
+    await w.sync(a);
+    await recover(w, "bob");
+    const rogue = signingKeypairFromSeed(H(C("fixture-forger")));
+    const forgeFirst = (links: readonly { wire: Uint8Array; certificate: Uint8Array }[]) => {
+      const [first, ...rest] = links;
+      if (!first) return links;
+      const doc = expectType<AccountSuccession>(parseDocument(first.wire), DocumentType.AccountSuccession);
+      const { type: _t, ...f } = doc;
+      void _t;
+      // The same succession id and state, a different successor certificate, signed by nobody the list allows.
+      const wire = buildSuccession({ ...f, newCertificateHash: randomBytes(32) }, rogue.secretKey);
+      return [{ wire, certificate: first.certificate }, ...rest];
+    };
+    const inner = a.t;
+    const transport: Transport = {
+      directory: new Proxy(inner.directory, {
+        get: (d, prop) =>
+          prop === "resolveIdentities"
+            ? async (ids: readonly Uint8Array[]) => (await d.resolveIdentities(ids)).map((r) => (r.accountName === "bob" && r.successions ? { ...r, successions: forgeFirst(r.successions) } : r))
+            : Reflect.get(d, prop)
+      }),
+      relay: inner.relay
+    };
+    const alice = await open({ accountName: "alice", retentionPolicy: testPolicy, recoveryProvider: a.provider, resetTrust, secretStore: a.secrets, store: a.store, transport, now: w.clock.now });
+    const events: string[] = [];
+    alice.subscribe((e) => {
+      if (e.kind === "securityError") events.push(e.code);
+    });
+    w.clock.advance(1_000n);
+    const r = await alice.sync();
+    expect(r.errors.map((e) => e.code)).toEqual(["BAD_SIGNATURE"]);
+    expect(events).toEqual([]);
+    expect((await a.store.read((tx) => tx.get("pins", toHex(bobId))))?.generation).toBe("2");
+  });
+
+  it("4: a recovery code is issued only where identity continuity can use it", async () => {
+    const recovery = { ...testPolicy, replacement: "recovery" as const };
+    const w = world(recovery);
+    const bare = await open({ accountName: "alice", retentionPolicy: recovery, resetTrust, secretStore: new MemorySecretStore(), store: new MemoryStore(), transport: hostTransport(w.host, "alice"), now: w.clock.now });
+    await bare.initializeAccount();
+    expect(await thrown(() => bare.recoveryCode())).toBe("NOT_AUTHORIZED");
+    const withProvider = await w.device("bob");
+    await withProvider.client.initializeAccount();
+    expect(await thrown(() => withProvider.client.recoveryCode())).toBe("NOT_AUTHORIZED");
+    const both = world();
+    const { a } = await pair(both);
+    expect((await a.client.recoveryCode()).startsWith("KV1R-")).toBe(true);
   });
 });
 
