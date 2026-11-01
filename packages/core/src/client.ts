@@ -184,6 +184,13 @@ export interface SyncError {
   readonly code: ErrorCode | "ACTIVATION_PENDING" | "UNEXPECTED";
   readonly stage: string;
   readonly retryable: boolean;
+  /**
+   * On an `inbox` entry: the stream whose download or processing failed and its author, so the
+   * host can tell which sender is affected. Identifying metadata (protocol section 14): keep it
+   * local or pseudonymise it before logging.
+   */
+  readonly streamId?: Uint8Array;
+  readonly authorIdentityId?: Uint8Array;
 }
 
 function syncError(operation: string, e: unknown): SyncError {
@@ -811,7 +818,7 @@ class ClientImpl implements Client {
         if (r.acked !== undefined) report.inbox.acked++;
         if (r.hasMore) report.inbox.hasMore = true;
       } catch (e) {
-        report.errors.push(syncError("inbox", e));
+        report.errors.push({ ...syncError("inbox", e), streamId: s.streamId, authorIdentityId: s.authorIdentityId });
       }
     }
     report.purged = (await purgeHistory(this.store, this.policy, this.now())) + (await purgeOutbox(this.store, this.policy, this.now()));

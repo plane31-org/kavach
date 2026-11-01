@@ -246,12 +246,17 @@ describe("feedback findings", () => {
     // The first read of this sync fails before reaching the host; the second stream is served.
     const relay = b.t.relay as { readRecords: Relay["readRecords"] };
     const read = relay.readRecords;
-    relay.readRecords = async () => {
+    let failedStream = "";
+    let failedAuthor = "";
+    relay.readRecords = async (streamId) => {
       relay.readRecords = read;
+      failedStream = toHex(streamId);
+      const owner = w.host.streams.get(toHex(streamId))?.accountName === "alice" ? a : c;
+      failedAuthor = toHex((await owner.client.inspect()).identityId ?? new Uint8Array());
       throw new KavachError("NETWORK", "transport", "network unreachable");
     };
     const r = await w.sync(b);
-    expect(r.errors).toEqual([{ operation: "inbox", code: "NETWORK", stage: "transport", retryable: true }]);
+    expect(r.errors.map((e) => ({ ...e, streamId: e.streamId && toHex(e.streamId), authorIdentityId: e.authorIdentityId && toHex(e.authorIdentityId) }))).toEqual([{ operation: "inbox", code: "NETWORK", stage: "transport", retryable: true, streamId: failedStream, authorIdentityId: failedAuthor }]);
     expect([r.inbox.streams, r.inbox.stored]).toEqual([1, 1]);
     const again = await w.sync(b);
     expect([again.errors, again.inbox.streams, again.inbox.stored]).toEqual([[], 2, 1]);
