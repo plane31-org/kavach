@@ -2,6 +2,10 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
+## Unreleased
+
+- The portable crypto backend reads `crypto.getRandomValues` when bytes are needed, not when the module is imported. `@noble/hashes` captures the global at import, which on Hermes is before the app has installed a source (the Expo helper installs expo-crypto's inside `openKavach`), so every draw of randomness after enrollment failed with noble's own error; a circle could not be created. Reported by the first product's developer.
+
 ## 0.2.0
 
 Protocol revision 9: account recovery (amendment A1, adopted). No existing wire byte or vector changes; a revision 8 device interoperates with a revision 9 host and with revision 9 peers until a succession occurs, which a revision 8 peer sees as a bare key change.

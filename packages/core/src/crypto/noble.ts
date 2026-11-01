@@ -4,7 +4,24 @@ import { hsalsa, xsalsa20poly1305 } from "@noble/ciphers/salsa";
 import { ed25519, x25519 } from "@noble/curves/ed25519";
 import { blake2b } from "@noble/hashes/blake2b";
 import { sha512 } from "@noble/hashes/sha512";
-import { randomBytes } from "@noble/hashes/utils";
+import { KavachError } from "../errors.js";
+
+/**
+ * Randomness from the Web Crypto global, read at every call. `@noble/hashes` captures
+ * `globalThis.crypto` once when it is imported, which on Hermes is before the app has installed
+ * a source (the Expo helper installs expo-crypto's inside `openKavach`), so noble's own
+ * `randomBytes` would throw for the life of the process. Reading the global here, when the bytes
+ * are needed, sees whatever is installed by then.
+ */
+function randomBytes(length: number): Uint8Array {
+  const g = globalThis as { crypto?: { getRandomValues?: (array: Uint8Array) => Uint8Array } };
+  const get = g.crypto?.getRandomValues;
+  if (typeof get !== "function") throw new KavachError("INVALID_KEY", "randomBytes", "no crypto.getRandomValues: install a secure random source before opening Kavach");
+  const out = new Uint8Array(length);
+  // Web Crypto caps one call at 65,536 bytes; nothing here is near it, but the rule is kept.
+  for (let offset = 0; offset < length; offset += 65_536) get.call(g.crypto, out.subarray(offset, Math.min(length, offset + 65_536)));
+  return out;
+}
 import type { BoxKeypair, CryptoBackend, SignKeypair } from "./backend.js";
 
 // "expand 32-byte k" as little-endian u32 words: the Salsa constant.
