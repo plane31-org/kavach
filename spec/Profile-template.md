@@ -14,7 +14,7 @@ For each kind: the payload codec (byte layout, version byte, bounds, what it mus
 
 ## 1a. Replacement model
 
-Which replacement models the product enables, `continuity`, `recovery` or `both` (amendment A1 while it is a draft; section 4 once adopted), and the resulting promise in one sentence; where the authority key is custodied and how fresh authentication is enforced before it signs, when `recovery` or `both` is enabled; and the product's record of amendment decisions D1 to D5. These are the product's decisions and live here, never in the SDK.
+Which replacement models the product enables, `continuity`, `recovery` or `both` (specification section 4, from amendment A1), and the resulting promise in one sentence; where the authority key is custodied and how fresh authentication is enforced before it signs, when `recovery` or `both` is enabled; and the product's record of amendment decisions D1 to D5. These are the product's decisions and live here, never in the SDK.
 
 ## 2. Notifications by header class
 

@@ -2,6 +2,18 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
+## Unreleased
+
+Protocol revision 9: account recovery (amendment A1, adopted). No existing wire byte or vector changes; a revision 8 device interoperates with a revision 9 host and with revision 9 peers until a succession occurs, which a revision 8 peer sees as a bare key change.
+
+- A profile declares `replacement: "continuity" | "recovery" | "both"` in its retention policy; the SDK supports every model and records no product's choice. Peers enforce the declaration: a continuity-only deployment refuses every succession and keeps a changed key quarantined.
+- `prepareReplacement()` and `completeReplacement({ successionId, authorization })` replace an account's keys on a device with no secret from the old one, under a succession the host's authority signs after the product's fresh authentication; the device then discovers its circles through the host inside `sync()`. `restoreAccount()` (identity continuity) stays and now resolves the account id through the chain.
+- Accounts are named by an account id, constant across successions; `ClientState.identityId` and `Inspection.identityId` are that id, and `keyIdentityId` is the identity of the current key. `keyChanges()` reads the accepted key changes; `inspect()` reports the replacement model, a pending proposal and bootstrap progress; the sync report gains `metadata.successions` and `bootstrap`.
+- Transport: `succeedAccount`, `getSuccessions`, `listCircles`, `setSharingPreference`; `ResolvedAccount` carries the chain's first page, the next generation and a certificate under the root key. The fake host and the reference Worker implement them, with a test endpoint standing in for the product's authorization. A retired device's reads are refused as well as its writes.
+- The sharing preference is held at the host too, written at the join request, at circle creation and on every change, ordered by a host revision so a delayed enable never overrides a later disable.
+- Error codes `SUCCESSION_BINDING`, `SUPERSEDED_IDENTITY`, `AUTHORIZATION_REQUIRED`, `AUTHORIZATION_EXPIRED`, `REPLACEMENT_CONFLICT`, `SUCCESSION_PENDING`; state `replacementPrepared`. A device retired by a succession erases its account seed and reports `SUPERSEDED_DEVICE`.
+- Fixture: a type 9 vector, four negatives (26 in all) and ten verifier cases, verified by the Python checker.
+
 ## 0.1.3
 
 - No code change. The first release published through npm trusted publishing: the workflow proves its GitHub identity to npm instead of using a stored token, and npm attaches provenance itself.
