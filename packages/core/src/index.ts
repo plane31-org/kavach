@@ -23,8 +23,6 @@ export {
   type HistoryPage,
   type HistoryQuery,
   type Inspection,
-  type Latest,
-  type LatestStatus,
   type Newest,
   type OpenOptions,
   type PauseReason,
@@ -38,9 +36,7 @@ export {
 export { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 
 // Locations ----------------------------------------------------------------------------------------
-export { locationFromDegrees, locationToDegrees } from "./record.js";
-/** The 22-byte location codec (protocol section 9), for reading history plaintext and building payloads. */
-export { decodeLocation, encodeLocation, type Location, type LocationStatus, type RecordKind } from "./codec.js";
+export type { RecordKind } from "./codec.js";
 
 // Configuration ------------------------------------------------------------------------------------
 export { validatePolicy, type KindDeclaration, type RetentionPolicy } from "./policy.js";

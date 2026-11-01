@@ -72,7 +72,7 @@ interface StreamState {
 }
 
 export interface Notification {
-  kind: "joinRequest" | "leaveRequest" | "checkIn" | "wake";
+  kind: "joinRequest" | "leaveRequest" | "visible" | "wake";
   to: string;
   from: string;
   circleId?: string;
@@ -420,7 +420,7 @@ export class FakeHost {
             const to = host.accountByIdentity(r.identityId)?.accountName ?? r.identityId;
             // By header class, as the test profile declares them: 1 is a visible notification, 2 is
             // silent and needs no wake-up, anything else is a wake-up. The host never sees the kind.
-            if (rec.headerClass !== 2) host.notifications.push({ kind: rec.headerClass === 1 ? "checkIn" : "wake", to, from: a.accountName });
+            if (rec.headerClass !== 2) host.notifications.push({ kind: rec.headerClass === 1 ? "visible" : "wake", to, from: a.accountName });
           }
           if (required.size === 0) s.records.delete(seq);
           return outcome;

@@ -12,7 +12,7 @@ Deletion runs in the same transaction as the cursor advance that completes a rec
 ## What a production host replaces
 
 - **Login.** The bearer `accountName:certificateHash` stands in for the host's own authentication. A real host authenticates the account and binds the session to the device's certificate hash, then hands those two facts to the same handlers.
-- **Notifications.** `notifications` rows become pushes: visible for a join request (to the owner) and a check-in (to each recipient), silent otherwise. Nothing in a row is a coordinate or a payload.
+- **Notifications.** `notifications` rows become pushes, decided from the record's header class as the product declares it: visible for a join request (to the owner) and a class 1 append (to each recipient), nothing for class 2, a silent wake-up otherwise. The host never sees a kind, and nothing in a row is a coordinate or a payload.
 - **Reset authority.** `RESET_OPERATIONAL_SEED` and `RESET_KEY_ID` are Worker secrets; `RESET_KEY_LIST` is the management-signed list, renewed by the offline process the profile describes.
 - **The test clock.** `ALLOW_TEST_CLOCK` must be unset; with it, `X-Test-Now` drives the host clock and the alarm defers to `/expire`.
 

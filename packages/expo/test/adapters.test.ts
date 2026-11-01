@@ -1,11 +1,9 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import type { Client } from "@kavach/core";
 import { MemorySecretStore, randomBytes, ready, toHex } from "@kavach/core/adapters";
 import { ExpoSecretStore, type SecureStoreLike, type SecureStoreOptions } from "../src/secretStore.js";
 import { BlockStoreRecoveryProvider, blockStoreKey, decodeBlockStoreValue, encodeBlockStoreValue, type BlockStoreLike } from "../src/recovery/android.js";
 import { AppleKeychainRecoveryProvider, keychainAccount, type SyncedKeychainLike } from "../src/recovery/apple.js";
 import { TrustedClock, highWaterInSecretStore } from "../src/clock.js";
-import { defineLocationTask, handleBackgroundLocations, type TaskManagerLike } from "../src/background.js";
 
 beforeAll(() => ready());
 
@@ -179,51 +177,5 @@ describe("TrustedClock", () => {
     const later = new TrustedClock(storage, () => 1_700_000_000_500n, () => 0);
     await later.load();
     expect(await later.trustedNow()).toBeUndefined();
-  });
-});
-
-describe("background location glue", () => {
-  function fakeClient(): Client & { calls: string[] } {
-    const calls: string[] = [];
-    return {
-      calls,
-      enqueueLocation: async (l, options) => {
-        calls.push(`enqueue:${l.status}:${l.latitudeE7}:${options?.idempotencyKey ?? "-"}`);
-        return { recordId: new Uint8Array(32), duplicate: false };
-      },
-      sync: async () => {
-        calls.push("sync");
-        return { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false }, purged: 0, errors: [] };
-      }
-    } as unknown as Client & { calls: string[] };
-  }
-
-  it("enqueues each new sample in time order, then syncs once, and skips redelivered samples", async () => {
-    const client = fakeClient();
-    const last = { timestamp: 0 };
-    const batch = [
-      { coords: { latitude: 2, longitude: 2, accuracy: 5 }, timestamp: 2000 },
-      { coords: { latitude: 1, longitude: 1, accuracy: 5 }, timestamp: 1000 },
-      { coords: { latitude: 3, longitude: 3, accuracy: null }, timestamp: 3000 }
-    ];
-    const r = await handleBackgroundLocations(client, batch, last);
-    expect(r).toEqual({ enqueued: 3, skipped: 0, synced: true, hasMore: false, error: undefined });
-    expect(client.calls).toEqual(["enqueue:0:10000000:bg:1000", "enqueue:0:20000000:bg:2000", "enqueue:2:0:bg:3000", "sync"]);
-    const again = await handleBackgroundLocations(client, batch, last);
-    expect(again).toMatchObject({ enqueued: 0, skipped: 3, synced: true });
-  });
-
-  it("registers the task and ignores error bodies and empty batches", async () => {
-    const tasks = new Map<string, (body: { data: unknown; error: { message: string } | null }) => void | Promise<void>>();
-    const tm: TaskManagerLike = { defineTask: (name, executor) => tasks.set(name, executor) };
-    const client = fakeClient();
-    defineLocationTask(tm, "kavach-location", async () => client);
-    const run = tasks.get("kavach-location");
-    if (!run) throw new Error("not registered");
-    await run({ data: undefined, error: { message: "denied" } });
-    await run({ data: { locations: [] }, error: null });
-    expect(client.calls).toEqual([]);
-    await run({ data: { locations: [{ coords: { latitude: 1, longitude: 1, accuracy: 1 }, timestamp: 5 }] }, error: null });
-    expect(client.calls).toEqual(["enqueue:0:10000000:bg:5", "sync"]);
   });
 });

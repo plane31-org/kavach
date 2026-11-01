@@ -27,6 +27,7 @@ import {
 import { accountKeypair, deviceSigningKeypair, identityId, ready, signingKeypairFromSeed, wrapHash, keyCommitment, type SigningKeypair } from "../src/crypto.js";
 import { KavachError } from "../src/errors.js";
 import { fixture, hex, str } from "./fixture.js";
+import { decodeLocation, encodeLocation } from "./location.js";
 
 
 interface Extra {

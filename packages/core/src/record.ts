@@ -7,16 +7,12 @@ import {
   DocumentType,
   buildRecordWire,
   decodeEnvelope,
-  decodeLocation,
-  encodeLocation,
   expectType,
   openRecord as openRecordBody,
   parseDocument,
   verifyDocument,
   type EncryptedRecord,
   type HeaderClass,
-  type Location,
-  type LocationStatus,
   type Parsed,
   type RecordKind
 } from "./codec.js";
@@ -103,28 +99,6 @@ export function compareSlots(a: PinSlot, b: PinSlot): number {
   if (a.generation !== b.generation) return a.generation < b.generation ? -1 : 1;
   if (a.epoch !== b.epoch) return a.epoch - b.epoch;
   return a.counter - b.counter;
-}
-
-// Location helpers -----------------------------------------------------------------------------
-
-export { decodeLocation, encodeLocation };
-export type { Location, LocationStatus };
-
-/** Build a location payload from floating-point degrees and metres. */
-export function locationFromDegrees(
-  latitude: number,
-  longitude: number,
-  accuracyMetres: number,
-  capturedAt: bigint,
-  status: LocationStatus = 0
-): Location {
-  const e7 = (v: number): number => Math.round(v * 1e7);
-  if (status === 2) return { latitudeE7: 0, longitudeE7: 0, accuracyMm: 0, capturedAt, status };
-  return { latitudeE7: e7(latitude), longitudeE7: e7(longitude), accuracyMm: Math.round(accuracyMetres * 1000), capturedAt, status };
-}
-
-export function locationToDegrees(l: Location): { latitude: number; longitude: number; accuracyMetres: number } {
-  return { latitude: l.latitudeE7 / 1e7, longitude: l.longitudeE7 / 1e7, accuracyMetres: l.accuracyMm / 1000 };
 }
 
 export function slotKey(streamId: Uint8Array, epoch: number, counter: number): string {

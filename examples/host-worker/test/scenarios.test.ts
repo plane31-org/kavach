@@ -1,7 +1,8 @@
 /** The core's client scenarios, unchanged in substance, against the real Worker. */
 import { describe, expect, it } from "vitest";
-import { locationFromDegrees, toHex } from "@kavach/core";
+import { toHex } from "@kavach/core";
 import { circleOfTwo, clock, device } from "./world.js";
+import { enqueueLocation, latest, locationFromDegrees } from "./location.js";
 
 const loc = (lat = 37.7749) => locationFromDegrees(lat, -122.4194, 5, clock.now());
 
@@ -9,14 +10,14 @@ describe("client scenarios over HTTP", () => {
   it("1 and 2: create, request, approve, deliver; an offline requester shares on return", async () => {
     const { a, b, aliceId, bobId } = await circleOfTwo();
     expect((await b.client.getState()).circles[0]?.status).toBe("member");
-    await a.client.enqueueLocation(loc(1));
+    await enqueueLocation(a.client, loc(1));
     await a.client.sync();
     await b.client.sync();
-    expect(await b.client.latest(aliceId)).toBeDefined();
-    await b.client.enqueueLocation(loc(2));
+    expect(await latest(b.client, aliceId)).toBeDefined();
+    await enqueueLocation(b.client, loc(2));
     await b.client.sync();
     await a.client.sync();
-    expect(await a.client.latest(bobId)).toBeDefined();
+    expect(await latest(a.client, bobId)).toBeDefined();
   });
 
   it("3 and 4: device replacement on either side keeps membership and rotates the other", async () => {
@@ -30,10 +31,10 @@ describe("client scenarios over HTTP", () => {
     expect((await a.client.getState()).status).toBe("retired");
     await b.client.sync();
     expect(b.events.some((e) => e.kind === "deviceChanged")).toBe(true);
-    await a2.client.enqueueLocation(loc(3));
+    await enqueueLocation(a2.client, loc(3));
     await a2.client.sync();
     await b.client.sync();
-    expect(await b.client.latest(restored.identityId)).toBeDefined();
+    expect(await latest(b.client, restored.identityId)).toBeDefined();
     void circleId;
   });
 
@@ -43,7 +44,7 @@ describe("client scenarios over HTTP", () => {
     await b2.client.restoreAccount();
     await b2.client.sync();
     await a.client.sync();
-    await a.client.enqueueLocation(loc(3));
+    await enqueueLocation(a.client, loc(3));
     await a.client.sync();
     const before = (await b.client.history({ authorIdentityId: aliceId })).length;
     await b.client.sync();
@@ -65,7 +66,7 @@ describe("client scenarios over HTTP", () => {
     const circleId = (await a.client.circles.list())[0]?.circleId ?? new Uint8Array();
     await a.client.circles.remove(circleId, bobId);
     await a.client.sync();
-    await a.client.enqueueLocation(loc(9));
+    await enqueueLocation(a.client, loc(9));
     await a.client.sync();
     const r = await b.client.sync();
     expect((await b.client.circles.list())[0]?.status).toBe("left");

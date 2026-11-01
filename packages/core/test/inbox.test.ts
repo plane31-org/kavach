@@ -1,13 +1,13 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { toHex } from "../src/bytes.js";
 import { createCircleSnapshot, newCircleId, successorSnapshot } from "../src/circle.js";
-import { buildRecordWire, encodeLocation } from "../src/codec.js";
+import { buildRecordWire } from "../src/codec.js";
 import { randomBytes, ready } from "../src/crypto.js";
 import { history, newestSlot, purgeHistory, receive, syncStream } from "../src/inbox.js";
 import { drain, enqueue } from "../src/outbox.js";
-import { locationFromDegrees } from "../src/record.js";
 import { FakeHost } from "../src/testing/fakeHost.js";
 import { Clock, setupDevice, type Device } from "./harness.js";
+import { encodeLocation, locationFromDegrees } from "./location.js";
 
 beforeAll(() => ready());
 

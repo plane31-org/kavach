@@ -197,7 +197,7 @@ export class StreamDO extends DurableObject<Env> {
     void this.ctx.storage.setAlarm(Number(acceptedAt + BigInt(this.env.DELIVERY_WINDOW_MS)));
     // By header class, the one thing the relay sees of a record's kind: the profile declares 1 as a
     // visible notification, 2 as silent with no wake-up, and anything else as a wake-up.
-    const notify = rec.headerClass === 2 ? [] : rows.filter((r) => r.identityId !== b.callerIdentityId).map((r) => ({ identityId: r.identityId, kind: rec.headerClass === 1 ? "checkIn" : "wake" }));
+    const notify = rec.headerClass === 2 ? [] : rows.filter((r) => r.identityId !== b.callerIdentityId).map((r) => ({ identityId: r.identityId, kind: rec.headerClass === 1 ? "visible" : "wake" }));
     return { status: "ACCEPTED", deliverySeq: String(seq), notify };
   }
 

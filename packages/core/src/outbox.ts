@@ -20,7 +20,8 @@ export interface OutboxEvents {
   accepted?(recordId: Uint8Array): void;
   cancelled?(recordId: Uint8Array, reason: string): void;
   /** A location's acceptance is unknown or it was cancelled: the host should supply a fresh sample. */
-  needsLocation?(reason: string): void;
+  /** A record of a kind with a newest slot was cancelled or is in doubt: the app may resend its current state of that kind. */
+  refresh?(reason: string): void;
   securityError?(code: string, detail: string): void;
 }
 
@@ -253,7 +254,7 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
     // same transaction. A backlog of dead rows costs one scan, not one transaction per row.
     const live: [string, OutboxRow][] = [];
     let cancelled = 0;
-    let needsLocation = false;
+    let refresh = false;
     for (const [key, row] of [...tx.list("outbox")].sort(([, a], [, b]) => a.epoch - b.epoch || a.counter - b.counter)) {
       if (row.status !== "queued" && row.status !== "inflight") continue;
       const reason = cancelled >= CANCEL_BATCH ? undefined : unbig(row.desiredRevision) !== revision ? "rotation" : unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now ? "expired" : undefined;
@@ -264,10 +265,10 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
       tx.put("outbox", key, terminal(row, "cancelled", reason));
       cancelled++;
       after.push(() => deps.events?.cancelled?.(fromHex(row.recordId), reason));
-      if (reason === "rotation" && row.kind === 0) needsLocation = true;
+      if (reason === "rotation" && kindOf(deps.policy, row.kind)?.newest) refresh = true;
     }
     summary.cancelled += cancelled;
-    if (needsLocation) after.push(() => deps.events?.needsLocation?.("rotation"));
+    if (refresh) after.push(() => deps.events?.refresh?.("rotation"));
     // A full batch means unchecked rows remain: finish them in the next handoff before sending.
     if (cancelled >= CANCEL_BATCH) return { kind: "skipped" };
     const next = live.find(([, r]) => r.status === "inflight") ?? live[0];
@@ -316,7 +317,7 @@ export async function recordOutcome(deps: OutboxDeps, key: string, outcome: Appe
       case "STALE_APPEND":
         tx.put("outbox", key, terminal(row, "unknown", "STALE_APPEND"));
         after.push(() => deps.events?.cancelled?.(id, "acceptanceUnknown"));
-        if (row.kind === 0) after.push(() => deps.events?.needsLocation?.("acceptanceUnknown"));
+        if (kindOf(deps.policy, row.kind)?.newest) after.push(() => deps.events?.refresh?.("acceptanceUnknown"));
         return "unknown";
       case "EQUIVOCATION":
         cancel("EQUIVOCATION");
@@ -327,7 +328,7 @@ export async function recordOutcome(deps: OutboxDeps, key: string, outcome: Appe
       case "UNAUTHORIZED":
         cancel(outcome.status);
         after.push(() => deps.events?.cancelled?.(id, outcome.status));
-        if (row.kind === 0) after.push(() => deps.events?.needsLocation?.(outcome.status));
+        if (kindOf(deps.policy, row.kind)?.newest) after.push(() => deps.events?.refresh?.(outcome.status));
         return "cancelled";
     }
   });

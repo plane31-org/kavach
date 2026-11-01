@@ -14,6 +14,7 @@ import { MemorySecretStore, MemoryStore, type TableName } from "../src/store.js"
 import { testPolicy } from "../src/testing/clock.js";
 import { MemoryPlatformProvider } from "../src/testing/providers.js";
 import { DAY, codes, management, pair, resetTrust, rotate, thrown, world } from "./clientWorld.js";
+import { enqueueLocation, latest } from "./location.js";
 
 beforeAll(() => ready());
 
@@ -21,23 +22,23 @@ describe("tampered documents", () => {
   it("a record with a flipped byte is BAD_SIGNATURE, stores nothing, and later records flow", async () => {
     const w = world();
     const { a, b, aliceId } = await pair(w);
-    const pinBefore = toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array());
+    const pinBefore = toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array());
     b.t.knobs.tamper.add("record");
-    await a.client.enqueueLocation(w.loc(2));
+    await enqueueLocation(a.client, w.loc(2));
     await w.sync(a);
     const n = b.events.length;
     const r = await w.sync(b);
     expect([...codes(r, b.events, n)]).toEqual(["BAD_SIGNATURE"]);
     expect(r.inbox.stored).toBe(0);
     expect((await b.client.history({ authorIdentityId: aliceId })).length).toBe(1);
-    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(pinBefore);
+    expect(toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array())).toBe(pinBefore);
     b.t.knobs.tamper.delete("record");
-    await a.client.enqueueLocation(w.loc(3));
+    await enqueueLocation(a.client, w.loc(3));
     await w.sync(a);
     const r2 = await w.sync(b);
     expect(r2.inbox.stored).toBeGreaterThanOrEqual(1);
     const last = [...w.host.appendLog].reverse().find((x) => x.status === "ACCEPTED");
-    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(last?.recordId);
+    expect(toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array())).toBe(last?.recordId);
   });
 
   it("a tampered manifest or wrap never yields a key: the record waits as keyPending and opens once the bytes are honest", async () => {
@@ -46,7 +47,7 @@ describe("tampered documents", () => {
       const { a, b, aliceId, circleId } = await pair(w);
       const epoch = await rotate(w, a, circleId);
       expect(epoch).toBeGreaterThan(1);
-      await a.client.enqueueLocation(w.loc(5));
+      await enqueueLocation(a.client, w.loc(5));
       await w.sync(a);
       b.t.knobs.tamper.add(kind);
       const n = b.events.length;
@@ -139,7 +140,7 @@ describe("replayed documents", () => {
     const { a, b, aliceId, circleId } = await pair(w);
     expect(await rotate(w, a, circleId)).toBeGreaterThan(1);
     b.t.knobs.replay.currentEpoch = { epoch: 1, manifestHash: new Uint8Array(32) };
-    await a.client.enqueueLocation(w.loc(9));
+    await enqueueLocation(a.client, w.loc(9));
     await w.sync(a);
     const r = await w.sync(b);
     expect(r.inbox.stored).toBe(1);
@@ -152,7 +153,7 @@ describe("withholding, duplication and reordering", () => {
     const w = world();
     const { a, b, aliceId, circleId } = await pair(w);
     b.t.knobs.withhold.add("records");
-    await a.client.enqueueLocation(w.loc(2));
+    await enqueueLocation(a.client, w.loc(2));
     await w.sync(a);
     const stream = [...w.host.streams.values()].find((s) => s.accountName === "alice");
     const cursorBefore = [...(stream?.subscriptions.values() ?? [])][0]?.cursor;
@@ -171,11 +172,11 @@ describe("withholding, duplication and reordering", () => {
     expect(c?.status).toBe("member");
     expect(c?.snapshotAgeMs ?? 0n).toBeGreaterThanOrEqual(3_600_000n);
     // Alice's next epoch excludes Bob regardless.
-    await a.client.enqueueLocation(w.loc(3));
+    await enqueueLocation(a.client, w.loc(3));
     await w.sync(a);
-    const pin = toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array());
+    const pin = toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array());
     await w.sync(b);
-    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(pin);
+    expect(toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array())).toBe(pin);
     b.t.knobs.withhold.delete("snapshots");
     await w.sync(b);
     expect((await b.client.circles.list())[0]?.status).toBe("left");
@@ -184,7 +185,7 @@ describe("withholding, duplication and reordering", () => {
   it("duplicated pages and records served newest first: each record once, the pin at the newest, the cursor at the tail", async () => {
     const w = world();
     const { a, b, aliceId } = await pair(w);
-    for (const lat of [2, 3, 4]) await a.client.enqueueLocation(w.loc(lat));
+    for (const lat of [2, 3, 4]) await enqueueLocation(a.client, w.loc(lat));
     await w.sync(a);
     b.t.knobs.duplicate = true;
     b.t.knobs.reorder = true;
@@ -194,7 +195,7 @@ describe("withholding, duplication and reordering", () => {
     expect(history.length).toBe(4);
     expect(new Set(history.map((h) => toHex(h.recordId))).size).toBe(4);
     const last = [...w.host.appendLog].reverse().find((x) => x.status === "ACCEPTED");
-    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(last?.recordId);
+    expect(toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array())).toBe(last?.recordId);
     const stream = [...w.host.streams.values()].find((s) => s.accountName === "alice");
     expect([...(stream?.subscriptions.values() ?? [])][0]?.cursor).toBe(stream?.tail);
   });
@@ -232,8 +233,8 @@ describe("lost device with the complete old-device state", () => {
     await b2.client.restoreAccount();
     await w.sync(b2);
     await w.sync(a);
-    await a.client.enqueueLocation(w.loc(2));
-    await a.client.enqueueLocation(w.loc(3));
+    await enqueueLocation(a.client, w.loc(2));
+    await enqueueLocation(a.client, w.loc(3));
     await w.sync(a);
     expect((await w.sync(b2)).inbox.stored).toBe(2);
     // The attacker runs the SDK over the image with the old session.
@@ -242,7 +243,7 @@ describe("lost device with the complete old-device state", () => {
     await attacker.sync();
     expect((await attacker.getState()).status).toBe("retired");
     expect((await attacker.history({ authorIdentityId: aliceId })).length).toBe(openedBefore);
-    expect(await thrown(() => attacker.enqueueLocation(w.loc(8)))).toBe("ACCOUNT_RECOVERY_REQUIRED");
+    expect(await thrown(() => enqueueLocation(attacker, w.loc(8)))).toBe("ACCOUNT_RECOVERY_REQUIRED");
     // Bypassing the SDK: the relay answers the old certificate with nothing, and the new epoch's
     // wrap for Bob's identity is sealed to the new phone's key.
     const aliceStream = [...w.host.streams.entries()].find(([, s]) => s.accountName === "alice");

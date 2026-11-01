@@ -6,7 +6,6 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { toHex } from "../src/bytes.js";
 import { open } from "../src/client.js";
 import { ready } from "../src/crypto.js";
-import { locationFromDegrees } from "../src/record.js";
 import { testPolicy } from "../src/testing/clock.js";
 import { FaultyStore } from "../src/testing/faults.js";
 import { KavachError } from "../src/errors.js";
@@ -14,6 +13,7 @@ import { MemoryStore, type Store, type Tx } from "../src/store.js";
 import type { Directory, Relay } from "../src/transport.js";
 import { META, VAULT } from "../src/transactions.js";
 import { pair, resetTrust, thrown, world, type World } from "./clientWorld.js";
+import { enqueueCheckIn, enqueueLocation, enqueueStatus, latest, latestStatus, locationFromDegrees } from "./location.js";
 
 beforeAll(() => ready());
 
@@ -145,7 +145,7 @@ describe("feedback findings", () => {
       if (e.kind === "accepted") throw new Error("boom");
     });
     a.client.subscribe((e) => seen.push(e.kind));
-    await a.client.enqueueLocation(w.loc(2));
+    await enqueueLocation(a.client, w.loc(2));
     const r = await w.sync(a);
     expect([r.errors, r.outbox.accepted]).toEqual([[], 1]);
     expect(await a.store.read((tx) => tx.count("outbox"))).toBe(0);
@@ -156,7 +156,7 @@ describe("feedback findings", () => {
   it("7: a cancelled record keeps only its summary and goes after the delivery window", async () => {
     const w = world();
     const { a, circleId } = await pair(w);
-    const { recordId } = await a.client.enqueueLocation(w.loc(2));
+    const { recordId } = await enqueueLocation(a.client, w.loc(2));
     await a.client.circles.setEnabled(circleId, false);
     const row = await a.store.read((tx) => tx.get("outbox", toHex(recordId)));
     expect([row?.status, row?.reason, row?.wire]).toEqual(["cancelled", "rotation", ""]);
@@ -173,7 +173,7 @@ describe("feedback findings", () => {
   it("8: inspect shows the outbox by state, the oldest pending age and the vault's state, never a secret", async () => {
     const w = world();
     const { a } = await pair(w);
-    await a.client.enqueueLocation(w.loc(3));
+    await enqueueLocation(a.client, w.loc(3));
     w.clock.advance(5_000n);
     const i = await a.client.inspect();
     expect([i.outbox.queued, i.outbox.inflight, i.outbox.oldestPendingAgeMs, i.pendingEpoch, i.paused]).toEqual([1, 0, 5_000n, undefined, undefined]);
@@ -187,13 +187,13 @@ describe("feedback findings", () => {
   it("9: an expired backlog does not delay a fresh location: one sync cancels the old rows and delivers the new one", async () => {
     const w = world();
     const { a, b, aliceId } = await pair(w);
-    for (const lat of [2, 3, 4]) await a.client.enqueueLocation(w.loc(lat));
+    for (const lat of [2, 3, 4]) await enqueueLocation(a.client, w.loc(lat));
     w.clock.advance(86_400_000n + 1n);
-    const fresh = await a.client.enqueueLocation(w.loc(5));
+    const fresh = await enqueueLocation(a.client, w.loc(5));
     const r = await w.sync(a);
     expect([r.errors, r.outbox.cancelled, r.outbox.sent, r.outbox.accepted]).toEqual([[], 3, 1, 1]);
     expect((await w.sync(b)).inbox.stored).toBe(1);
-    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
+    expect(toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
   });
 
   it("10: a throwing subscriber is reported through onListenerError, with the event, and the call still succeeds", async () => {
@@ -204,7 +204,7 @@ describe("feedback findings", () => {
     client.subscribe((e) => {
       if (e.kind === "queued") throw new Error("boom");
     });
-    await client.enqueueLocation(w.loc(6));
+    await enqueueLocation(client, w.loc(6));
     expect(seen).toEqual(["queued:boom"]);
   });
 
@@ -222,9 +222,9 @@ describe("feedback findings", () => {
   it("12: a backlog of a thousand expired rows is cancelled in a handful of transactions, and the fresh location still goes out", async () => {
     const w = world();
     const { a, b, aliceId } = await pair(w);
-    for (let i = 0; i < 1000; i++) await a.client.enqueueLocation(w.loc(1 + (i % 80)));
+    for (let i = 0; i < 1000; i++) await enqueueLocation(a.client, w.loc(1 + (i % 80)));
     w.clock.advance(86_400_000n + 1n);
-    const fresh = await a.client.enqueueLocation(w.loc(5));
+    const fresh = await enqueueLocation(a.client, w.loc(5));
     const faulty = new FaultyStore(a.store.fork());
     const counted = await open({ accountName: "alice", retentionPolicy: testPolicy, recoveryProvider: a.provider, resetTrust, secretStore: a.secrets, store: faulty, transport: a.t, now: w.clock.now });
     const before = faulty.transactions;
@@ -232,15 +232,15 @@ describe("feedback findings", () => {
     expect([r.errors, r.outbox.cancelled, r.outbox.accepted]).toEqual([[], 1000, 1]);
     expect(faulty.transactions - before).toBeLessThan(40);
     expect((await w.sync(b)).inbox.stored).toBe(1);
-    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
+    expect(toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
   });
 
   it("13: a stream whose download fails is named in the sync report, is not counted as synced, and the other streams are still read", async () => {
     const w = world();
     const { a, b } = await pair(w);
     const c = await thirdAuthor(w, b);
-    await a.client.enqueueLocation(w.loc(2));
-    await c.client.enqueueLocation(w.loc(3));
+    await enqueueLocation(a.client, w.loc(2));
+    await enqueueLocation(c.client, w.loc(3));
     await w.sync(a);
     await w.sync(c);
     // The first read of this sync fails before reaching the host; the second stream is served.
@@ -260,19 +260,19 @@ describe("feedback findings", () => {
   it("14: the same idempotency key from a retry or another runtime yields the one record; a new key or an expired one makes a new record", async () => {
     const w = world();
     const { a, b, aliceId } = await pair(w);
-    const first = await a.client.enqueueLocation(w.loc(4), { idempotencyKey: "fix:1" });
-    const retry = await a.client.enqueueLocation(w.loc(4), { idempotencyKey: "fix:1" });
+    const first = await enqueueLocation(a.client, w.loc(4), { idempotencyKey: "fix:1" });
+    const retry = await enqueueLocation(a.client, w.loc(4), { idempotencyKey: "fix:1" });
     expect([retry.duplicate, toHex(retry.recordId)]).toEqual([true, toHex(first.recordId)]);
     // Another runtime on the same store, as the background task would be.
     const other = await open({ accountName: "alice", retentionPolicy: testPolicy, recoveryProvider: a.provider, resetTrust, secretStore: a.secrets, store: a.store.fork(), transport: a.t, now: w.clock.now });
-    const fromOther = await other.enqueueLocation(w.loc(4), { idempotencyKey: "fix:1" });
+    const fromOther = await enqueueLocation(other, w.loc(4), { idempotencyKey: "fix:1" });
     expect([fromOther.duplicate, toHex(fromOther.recordId)]).toEqual([true, toHex(first.recordId)]);
     expect(a.events.filter((e) => e.kind === "queued").length).toBe(2); // the pair's location and this one
     expect(await a.store.read((tx) => tx.list("outbox").filter(([, r]) => r.status === "queued").length)).toBe(1);
-    const second = await a.client.enqueueLocation(w.loc(4), { idempotencyKey: "fix:2" });
+    const second = await enqueueLocation(a.client, w.loc(4), { idempotencyKey: "fix:2" });
     expect([second.duplicate, toHex(second.recordId) === toHex(first.recordId)]).toEqual([false, false]);
-    expect(await thrown(() => a.client.enqueueLocation(w.loc(4), { idempotencyKey: "" }))).toBe("MALFORMED");
-    expect(await thrown(() => a.client.enqueueLocation(w.loc(4), { idempotencyKey: "k".repeat(129) }))).toBe("MALFORMED");
+    expect(await thrown(() => enqueueLocation(a.client, w.loc(4), { idempotencyKey: "" }))).toBe("MALFORMED");
+    expect(await thrown(() => enqueueLocation(a.client, w.loc(4), { idempotencyKey: "k".repeat(129) }))).toBe("MALFORMED");
     await w.sync(a);
     expect((await w.sync(b)).inbox.stored).toBe(2);
     expect((await b.client.history({ authorIdentityId: aliceId })).length).toBe(3);
@@ -280,7 +280,7 @@ describe("feedback findings", () => {
     w.clock.advance(testPolicy.deliveryWindowMs + 1n);
     await w.sync(a);
     expect(await a.store.read((tx) => tx.count("enqueueKeys"))).toBe(0);
-    const later = await a.client.enqueueLocation(w.loc(4), { idempotencyKey: "fix:1" });
+    const later = await enqueueLocation(a.client, w.loc(4), { idempotencyKey: "fix:1" });
     expect([later.duplicate, toHex(later.recordId) === toHex(first.recordId)]).toEqual([false, false]);
   });
 
@@ -293,7 +293,7 @@ describe("feedback findings", () => {
     const sent: string[] = [];
     for (let i = 0; i < 6; i++) {
       w.clock.advance(60_000n);
-      const r = i % 3 === 2 ? await a.client.enqueueCheckIn(w.loc(10 + i)) : await (i % 2 ? c : a).client.enqueueLocation(w.loc(10 + i));
+      const r = i % 3 === 2 ? await enqueueCheckIn(a.client, w.loc(10 + i)) : await enqueueLocation((i % 2 ? c : a).client, w.loc(10 + i));
       sent.push(toHex(r.recordId));
     }
     await w.sync(a);
@@ -311,7 +311,7 @@ describe("feedback findings", () => {
       pages.push(page.entries.map((h) => toHex(h.recordId)));
       cursor = page.cursor;
       // A record arriving mid-pagination does not move the cursor's position.
-      if (pages.length === 1) await c.client.enqueueLocation(w.loc(30));
+      if (pages.length === 1) await enqueueLocation(c.client, w.loc(30));
     } while (cursor);
     expect(pages.flat()).toEqual([...sent].reverse().concat([pairRecord]));
     expect(pages.map((p) => p.length)).toEqual([3, 3, 1]);
@@ -321,7 +321,7 @@ describe("feedback findings", () => {
     expect((await historyPage(guarded, testPolicy, { kind: 2 })).entries).toEqual([]);
     expect(toHex((await newest(guarded, testPolicy, { authorIdentityId: aliceId }))?.recordId ?? new Uint8Array())).toBe(sent[5] ?? "");
     expect(toHex((await newest(guarded, testPolicy, { kind: 0 }))?.recordId ?? new Uint8Array())).toBe(sent[4] ?? "");
-    expect(toHex((await b.client.newest())?.recordId ?? new Uint8Array())).toBe(sent[5] ?? "");
+    expect(toHex((await b.client.newestEntry())?.recordId ?? new Uint8Array())).toBe(sent[5] ?? "");
     // Expiry removes the index entries with the rows, and the payload of the slot that pointed at one of them.
     w.clock.advance((testPolicy.kinds[0]?.retentionMs ?? 0n));
     const r = await w.sync(b);
@@ -352,7 +352,7 @@ describe("feedback findings", () => {
     const w = world();
     const { a, b, aliceId } = await pair(w);
     const other = await open({ accountName: "alice", retentionPolicy: testPolicy, recoveryProvider: a.provider, resetTrust, secretStore: a.secrets, store: a.store.fork(), transport: a.t, now: w.clock.now });
-    const [x, y] = await Promise.all([a.client.enqueueLocation(w.loc(7), { idempotencyKey: "race" }), other.enqueueLocation(w.loc(7), { idempotencyKey: "race" })]);
+    const [x, y] = await Promise.all([enqueueLocation(a.client, w.loc(7), { idempotencyKey: "race" }), enqueueLocation(other, w.loc(7), { idempotencyKey: "race" })]);
     expect(toHex(x.recordId)).toBe(toHex(y.recordId));
     expect([x.duplicate, y.duplicate].sort()).toEqual([false, true]);
     // The record is durable before either call returned.
@@ -362,15 +362,15 @@ describe("feedback findings", () => {
     expect((await w.sync(b)).inbox.stored).toBe(1);
     expect((await b.client.history({ authorIdentityId: aliceId })).length).toBe(2);
     // A refused enqueue stores no key: the retry is checked again, not answered from the key.
-    for (let i = 0; i < testPolicy.maxOutboxRecords; i++) await a.client.enqueueLocation(w.loc(1 + (i % 80)));
-    expect(await thrown(() => a.client.enqueueLocation(w.loc(8), { idempotencyKey: "full" }))).toBe("QUEUE_FULL");
+    for (let i = 0; i < testPolicy.maxOutboxRecords; i++) await enqueueLocation(a.client, w.loc(1 + (i % 80)));
+    expect(await thrown(() => enqueueLocation(a.client, w.loc(8), { idempotencyKey: "full" }))).toBe("QUEUE_FULL");
     expect(await a.store.read((tx) => tx.get("enqueueKeys", "full"))).toBeUndefined();
   });
 
   it("18: a backlog is read in pages within the sync's budget, hasMore says when to come back, and the rest follows", async () => {
     const w = world();
     const { a, b, aliceId } = await pair(w);
-    for (let i = 0; i < 250; i++) await a.client.enqueueLocation(w.loc(1 + (i % 80)));
+    for (let i = 0; i < 250; i++) await enqueueLocation(a.client, w.loc(1 + (i % 80)));
     expect((await w.sync(a)).outbox.accepted).toBe(250);
     // No time left after the first page: one page per stream, and the report asks for another sync.
     const timed = await b.client.sync({ catchUp: { maxMs: 0 } });
@@ -388,31 +388,31 @@ describe("feedback findings", () => {
     const w = world();
     const { a, b, aliceId } = await pair(w);
     const at = (lat: number, capturedAt: bigint) => locationFromDegrees(lat, -122.4194, 5, capturedAt);
-    const fresh = await a.client.enqueueLocation(at(10, w.clock.now()));
-    const stale = await a.client.enqueueLocation(at(11, w.clock.now() - 60_000n)); // a buffered sample flushed later, higher counter
+    const fresh = await enqueueLocation(a.client, at(10, w.clock.now()));
+    const stale = await enqueueLocation(a.client, at(11, w.clock.now() - 60_000n)); // a buffered sample flushed later, higher counter
     await w.sync(a);
     await w.sync(b);
-    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
+    expect(toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
     expect((await b.client.history({ authorIdentityId: aliceId })).map((h) => toHex(h.recordId))).toContain(toHex(stale.recordId));
-    expect(b.events.filter((e) => e.kind === "latestUpdated").length).toBe(2); // the pair's location and the fresh one
+    expect(b.events.filter((e) => e.kind === "recordStored" && e.recordKind === 0 && e.tookSlot).length).toBe(2); // the pair's location and the fresh one
     // A sample claiming to be captured a day ahead counts as captured when sent, so the next honest sample still wins.
     w.clock.advance(1_000n);
-    const ahead = await a.client.enqueueLocation(at(12, w.clock.now() + 86_400_000n));
+    const ahead = await enqueueLocation(a.client, at(12, w.clock.now() + 86_400_000n));
     await w.sync(a);
     await w.sync(b);
-    const pinned = await b.client.latest(aliceId);
+    const pinned = await latest(b.client, aliceId);
     expect([toHex(pinned?.recordId ?? new Uint8Array()), pinned?.eventTime]).toEqual([toHex(ahead.recordId), pinned?.sentAt]);
     w.clock.advance(1_000n);
-    const honest = await a.client.enqueueLocation(at(13, w.clock.now()));
+    const honest = await enqueueLocation(a.client, at(13, w.clock.now()));
     await w.sync(a);
     await w.sync(b);
-    expect(toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(honest.recordId));
+    expect(toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(honest.recordId));
   });
 
   it("20: a store from before the slot table rebuilds its newest slots from history on open", async () => {
     const w = world();
     const { b, aliceId } = await pair(w);
-    const before = toHex((await b.client.latest(aliceId))?.recordId ?? new Uint8Array());
+    const before = toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array());
     await b.store.transaction((tx) => {
       for (const [k] of tx.list("newest")) tx.delete("newest", k);
       const meta = tx.get("meta", META);
@@ -421,9 +421,9 @@ describe("feedback findings", () => {
       delete legacy.newest;
       tx.put("meta", META, legacy);
     });
-    expect(await b.client.latest(aliceId)).toBeUndefined();
+    expect(await latest(b.client, aliceId)).toBeUndefined();
     const reopened = await open({ accountName: "bob", retentionPolicy: testPolicy, recoveryProvider: b.provider, resetTrust, secretStore: b.secrets, store: b.store.fork(), transport: b.t, now: w.clock.now });
-    expect(toHex((await reopened.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(before);
+    expect(toHex((await latest(reopened, aliceId))?.recordId ?? new Uint8Array())).toBe(before);
     expect(await b.store.read((tx) => tx.get("meta", META)?.newest)).toBe(1);
   });
 
@@ -431,38 +431,42 @@ describe("feedback findings", () => {
     const w = world();
     const { a, aliceId } = await pair(w);
     const at = (lat: number, capturedAt: bigint) => locationFromDegrees(lat, -122.4194, 5, capturedAt);
-    const own = await a.client.latest(aliceId);
+    const own = await latest(a.client, aliceId);
     expect(own).toBeDefined(); // the pair's location already pinned itself
-    const fresh = await a.client.enqueueLocation(at(10, w.clock.now()));
-    expect(toHex((await a.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
-    await a.client.enqueueLocation(at(11, w.clock.now() - 60_000n)); // measured earlier, sent later: history only
-    expect(toHex((await a.client.latest(aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
-    expect(await a.client.latestStatus(aliceId)).toBeUndefined();
-    await a.client.enqueueStatus(Uint8Array.of(1, 80, 0, 3));
-    expect(Array.from((await a.client.latestStatus(aliceId))?.payload ?? [])).toEqual([1, 80, 0, 3]);
-    await a.client.enqueueStatus(Uint8Array.of(1, 79, 0, 3));
-    expect(Array.from((await a.client.latestStatus(aliceId))?.payload ?? [])).toEqual([1, 79, 0, 3]);
-    const self = (e: { kind: string; identityId?: Uint8Array }) => e.identityId !== undefined && toHex(e.identityId) === toHex(aliceId);
-    expect(a.events.filter((e) => e.kind === "latestUpdated" && self(e)).length).toBe(2); // the pair's location and the fresh one
-    expect(a.events.filter((e) => e.kind === "statusUpdated" && self(e)).length).toBe(2);
+    const fresh = await enqueueLocation(a.client, at(10, w.clock.now()));
+    expect(toHex((await latest(a.client, aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
+    await enqueueLocation(a.client, at(11, w.clock.now() - 60_000n)); // measured earlier, sent later: history only
+    expect(toHex((await latest(a.client, aliceId))?.recordId ?? new Uint8Array())).toBe(toHex(fresh.recordId));
+    expect(await latestStatus(a.client, aliceId)).toBeUndefined();
+    await enqueueStatus(a.client, Uint8Array.of(1, 80, 0, 3));
+    expect(Array.from((await latestStatus(a.client, aliceId))?.payload ?? [])).toEqual([1, 80, 0, 3]);
+    await enqueueStatus(a.client, Uint8Array.of(1, 79, 0, 3));
+    expect(Array.from((await latestStatus(a.client, aliceId))?.payload ?? [])).toEqual([1, 79, 0, 3]);
+    const self = (e: { kind: string; authorIdentityId?: Uint8Array }) => e.authorIdentityId !== undefined && toHex(e.authorIdentityId) === toHex(aliceId);
+    expect(a.events.filter((e) => e.kind === "recordStored" && e.recordKind === 0 && e.tookSlot && self(e)).length).toBe(2); // the pair's location and the fresh one
+    expect(a.events.filter((e) => e.kind === "recordStored" && e.recordKind === 2 && e.tookSlot && self(e)).length).toBe(2);
     // The same key answered twice moves nothing twice.
     const before = a.events.length;
-    await a.client.enqueueLocation(at(12, w.clock.now()), { idempotencyKey: "k" });
-    await a.client.enqueueLocation(at(12, w.clock.now()), { idempotencyKey: "k" });
-    expect(a.events.slice(before).filter((e) => e.kind === "latestUpdated").length).toBe(1);
+    await enqueueLocation(a.client, at(12, w.clock.now()), { idempotencyKey: "k" });
+    await enqueueLocation(a.client, at(12, w.clock.now()), { idempotencyKey: "k" });
+    expect(a.events.slice(before).filter((e) => e.kind === "recordStored" && e.recordKind === 0 && e.tookSlot).length).toBe(1);
     // Expiry treats the own row like any author's.
     w.clock.advance((testPolicy.kinds[0]?.retentionMs ?? 0n) + 1n);
     await w.sync(a);
-    expect(await a.client.latest(aliceId)).toBeUndefined();
-    expect(await a.client.latestStatus(aliceId)).toBeUndefined();
+    expect(await latest(a.client, aliceId)).toBeUndefined();
+    expect(await latestStatus(a.client, aliceId)).toBeUndefined();
   });
 
-  it("22: the public entry points carry the location codec and the key-list builder", async () => {
-    const pub = await import("../src/index.js");
+  it("22: the public entry carries no product codec or product-named call; the adapters entry carries the key-list builder", async () => {
+    const pub = (await import("../src/index.js")) as Record<string, unknown>;
     const adapters = await import("../src/adapters/index.js");
-    const loc = locationFromDegrees(1, 2, 3, 4n);
-    expect(pub.decodeLocation(pub.encodeLocation(loc))).toEqual(loc);
+    for (const gone of ["encodeLocation", "decodeLocation", "locationFromDegrees", "locationToDegrees"]) expect(pub[gone]).toBeUndefined();
     expect(typeof adapters.buildResetKeyList).toBe("function");
+    const w = world();
+    const { a } = await pair(w);
+    const c = a.client as unknown as Record<string, unknown>;
+    for (const gone of ["enqueueLocation", "enqueueCheckIn", "enqueueStatus", "latest", "latestStatus", "newestOf"]) expect(c[gone]).toBeUndefined();
+    expect([typeof c.enqueue, typeof c.newest, typeof c.newestEntry]).toEqual(["function", "function", "function"]);
   });
 
   it("23: every per-kind behaviour follows the declaration, not the kind number, and an undeclared kind is refused on both sides", async () => {
@@ -478,27 +482,27 @@ describe("feedback findings", () => {
     };
     const w = world(policy);
     const { a, b, aliceId } = await pair(w);
-    const first = await a.client.enqueueCheckIn(Uint8Array.of(1));
-    await a.client.enqueueCheckIn(Uint8Array.of(2));
+    const first = await enqueueCheckIn(a.client, Uint8Array.of(1));
+    await enqueueCheckIn(a.client, Uint8Array.of(2));
     expect(await a.store.read((tx) => tx.get("outbox", toHex(first.recordId))?.reason)).toBe("superseded"); // latest wins for kind 1 now
-    const s1 = await a.client.enqueueStatus(Uint8Array.of(9));
-    const s2 = await a.client.enqueueStatus(Uint8Array.of(8));
+    const s1 = await enqueueStatus(a.client, Uint8Array.of(9));
+    const s2 = await enqueueStatus(a.client, Uint8Array.of(8));
     expect(await a.store.read((tx) => [tx.get("outbox", toHex(s1.recordId))?.status, tx.get("outbox", toHex(s2.recordId))?.status])).toEqual(["queued", "queued"]); // keep all for kind 2 now
     await w.sync(a);
     const r = await w.sync(b);
     expect([r.inbox.stored, r.inbox.invalid]).toEqual([3, 0]);
     expect((await b.client.history({ authorIdentityId: aliceId })).map((h) => h.kind).sort()).toEqual([0, 2, 2]); // kind 1 keeps no history, kind 2 does
-    expect(Array.from((await b.client.newestOf(aliceId, 1))?.payload ?? [])).toEqual([2]);
-    expect(await b.client.newestOf(aliceId, 2)).toBeUndefined(); // no slot for kind 2
-    expect(Array.from((await a.client.newestOf(aliceId, 1))?.payload ?? [])).toEqual([2]); // the sender's own slot too
+    expect(Array.from((await b.client.newest(aliceId, 1))?.payload ?? [])).toEqual([2]);
+    expect(await b.client.newest(aliceId, 2)).toBeUndefined(); // no slot for kind 2
+    expect(Array.from((await a.client.newest(aliceId, 1))?.payload ?? [])).toEqual([2]); // the sender's own slot too
     // Retention per kind: one hour clears kind 0, two hours kind 1's slot, three hours kind 2's history.
     w.clock.advance(3_600_000n + 1n);
     await w.sync(b);
-    expect([await b.client.newestOf(aliceId, 0), (await b.client.history({ authorIdentityId: aliceId })).map((h) => h.kind).sort()]).toEqual([undefined, [2, 2]]);
-    expect(await b.client.newestOf(aliceId, 1)).toBeDefined();
+    expect([await b.client.newest(aliceId, 0), (await b.client.history({ authorIdentityId: aliceId })).map((h) => h.kind).sort()]).toEqual([undefined, [2, 2]]);
+    expect(await b.client.newest(aliceId, 1)).toBeDefined();
     w.clock.advance(3_600_000n);
     await w.sync(b);
-    expect(await b.client.newestOf(aliceId, 1)).toBeUndefined();
+    expect(await b.client.newest(aliceId, 1)).toBeUndefined();
     expect((await b.client.history({ authorIdentityId: aliceId })).length).toBe(2);
     w.clock.advance(3_600_000n);
     await w.sync(b);
@@ -507,7 +511,7 @@ describe("feedback findings", () => {
     const narrow = { ...policy, kinds: policy.kinds.filter((k) => k.kind !== 2) };
     const c = await w.device("carol", undefined, undefined, undefined, narrow);
     await c.client.initializeAccount();
-    expect(await thrown(() => c.client.enqueueStatus(Uint8Array.of(1)))).toBe("MALFORMED");
+    expect(await thrown(() => enqueueStatus(c.client, Uint8Array.of(1)))).toBe("MALFORMED");
     const d = await w.device("dave", undefined, undefined, undefined, narrow);
     await d.client.initializeAccount();
     const { circleId } = await a.client.circles.create();
@@ -517,7 +521,7 @@ describe("feedback findings", () => {
     await w.sync(a);
     await w.sync(d);
     await w.sync(a);
-    await a.client.enqueueStatus(Uint8Array.of(7));
+    await enqueueStatus(a.client, Uint8Array.of(7));
     await w.sync(a);
     const rd = await w.sync(d);
     expect([rd.inbox.stored, rd.inbox.invalid]).toEqual([0, 1]);
@@ -529,17 +533,17 @@ describe("feedback findings", () => {
     const { a, b, aliceId } = await pair(w);
     const t = w.clock.now();
     // A byte payload with an event time: the reader orders by it and reports it; without one, it orders at sentAt.
-    const older = await a.client.enqueueCheckIn(Uint8Array.of(1), { eventTime: t - 5_000n });
-    await a.client.enqueueCheckIn(Uint8Array.of(2));
+    const older = await enqueueCheckIn(a.client, Uint8Array.of(1), { eventTime: t - 5_000n });
+    await enqueueCheckIn(a.client, Uint8Array.of(2));
     await w.sync(a);
     await w.sync(b);
     const entries = await b.client.history({ authorIdentityId: aliceId, kind: 1 });
     expect(entries.map((h) => [toHex(h.recordId) === toHex(older.recordId), h.eventTime])).toEqual([[true, t - 5_000n], [false, undefined]]);
     // An event time ahead of the send time is clamped: the slot never trusts it past sentAt.
-    const ahead = await a.client.enqueueLocation(locationFromDegrees(1, 2, 3, t + 999_999n));
+    const ahead = await enqueueLocation(a.client, locationFromDegrees(1, 2, 3, t + 999_999n));
     await w.sync(a);
     await w.sync(b);
-    const pin = await b.client.latest(aliceId);
+    const pin = await latest(b.client, aliceId);
     expect([toHex(pin?.recordId ?? new Uint8Array()), pin?.eventTime]).toEqual([toHex(ahead.recordId), pin?.sentAt]);
     // The relay notifies by header class, never by kind: the same kind 1 declared with class 0 is a plain wake-up.
     const hidden = { ...testPolicy, kinds: testPolicy.kinds.map((k) => (k.kind === 1 ? { ...k, headerClass: 0 as const } : k)) };
@@ -554,11 +558,11 @@ describe("feedback findings", () => {
     await w.sync(b);
     await w.sync(c);
     const before = w.host.notifications.length;
-    await a.client.enqueueCheckIn(Uint8Array.of(3));
-    await c.client.enqueueCheckIn(Uint8Array.of(4));
+    await enqueueCheckIn(a.client, Uint8Array.of(3));
+    await enqueueCheckIn(c.client, Uint8Array.of(4));
     await w.sync(a);
     await w.sync(c);
-    expect(w.host.notifications.slice(before).filter((n) => n.to === "bob").map((n) => n.kind).sort()).toEqual(["checkIn", "wake"]);
+    expect(w.host.notifications.slice(before).filter((n) => n.to === "bob").map((n) => n.kind).sort()).toEqual(["visible", "wake"]);
   });
 });
 

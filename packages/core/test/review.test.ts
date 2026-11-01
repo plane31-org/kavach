@@ -9,6 +9,7 @@ import { ready } from "../src/crypto.js";
 import { testPolicy } from "../src/testing/clock.js";
 import { FaultyStore } from "../src/testing/faults.js";
 import { pair, resetTrust, thrown, world } from "./clientWorld.js";
+import { enqueueLocation } from "./location.js";
 
 beforeAll(() => ready());
 
@@ -19,7 +20,7 @@ describe("review findings", () => {
     // Invalidate the active epoch so both enqueues race through epoch publication.
     await a.client.circles.setEnabled(circleId, false);
     await a.client.circles.setEnabled(circleId, true);
-    const [x, y] = await Promise.all([a.client.enqueueLocation(w.loc(2)), a.client.enqueueLocation(w.loc(3))]);
+    const [x, y] = await Promise.all([enqueueLocation(a.client, w.loc(2)), enqueueLocation(a.client, w.loc(3))]);
     expect(toHex(x.recordId)).not.toBe(toHex(y.recordId));
     const counters = await a.store.read((tx) => tx.list("outbox").map(([, r]) => r.counter).sort());
     expect(counters).toEqual([0, 1]);
@@ -56,7 +57,7 @@ describe("review findings", () => {
     await w.sync(b);
     expect((await b.client.circles.list())[0]?.status).toBe("left");
     // Nothing after the removal is readable by Bob.
-    await a.client.enqueueLocation(w.loc(4));
+    await enqueueLocation(a.client, w.loc(4));
     await w.sync(a);
     expect((await w.sync(b)).inbox.stored).toBe(0);
   });
@@ -96,12 +97,12 @@ describe("review findings", () => {
     await w.sync(b);
     const paused = await b.client.getState();
     expect([paused.status, paused.paused]).toEqual(["paused", "metadata"]);
-    expect(await thrown(() => b.client.enqueueLocation(w.loc(5)))).toBe("METADATA_REQUIRED");
+    expect(await thrown(() => enqueueLocation(b.client, w.loc(5)))).toBe("METADATA_REQUIRED");
     b.t.knobs.withhold.delete("certificates");
     const r = await w.sync(b);
     expect(r.epoch).toBe("prepared");
     expect((await b.client.getState()).status).toBe("ready");
-    expect(await thrown(() => b.client.enqueueLocation(w.loc(6)))).toBe("OK");
+    expect(await thrown(() => enqueueLocation(b.client, w.loc(6)))).toBe("OK");
   });
 });
 
@@ -122,7 +123,7 @@ describe("second review findings", () => {
     await approving;
     const circle = (await a.client.circles.list())[0];
     expect([circle?.enabled, circle?.members.length]).toEqual([false, 3]);
-    await a.client.enqueueLocation(w.loc(2));
+    await enqueueLocation(a.client, w.loc(2));
     await w.sync(a);
     const stream = [...w.host.streams.values()].find((s) => s.accountName === "alice");
     const others = stream?.epochs.get(stream.currentEpoch)?.rows.filter((r) => r.identityId !== toHex(aliceId)) ?? [];

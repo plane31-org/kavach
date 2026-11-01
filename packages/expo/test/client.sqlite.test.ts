@@ -3,11 +3,12 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
-import { open, locationFromDegrees, toHex, type Client, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@kavach/core";
+import { open, toHex, type Client, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@kavach/core";
 import { MemorySecretStore, ready } from "@kavach/core/adapters";
 import { FakeHost, TestClock, testPolicy, testResetKeyList, testResetKeys } from "@kavach/core/testing";
 import { SqliteStore, nodeSqliteDriver } from "../src/sqliteStore.js";
 import { openNodeDatabase } from "./sqlite.js";
+import { enqueueLocation, latest, locationFromDegrees } from "./location.js";
 
 beforeAll(() => ready());
 
@@ -65,11 +66,11 @@ describe("client on SqliteStore", () => {
     await alice.circles.approve(circleId, "bob");
     await bob.sync();
     await alice.sync();
-    await alice.enqueueLocation(locationFromDegrees(37.7749, -122.4194, 5, clock.now()));
+    await enqueueLocation(alice, locationFromDegrees(37.7749, -122.4194, 5, clock.now()));
     await alice.sync();
     const report = await bob.sync();
     expect(report.inbox.stored).toBe(1);
-    const pin = await bob.latest(aliceId);
+    const pin = await latest(bob, aliceId);
     expect(pin).toBeDefined();
     expect(toHex(pin?.payload ?? new Uint8Array()).length).toBe(44);
     expect(host.retainedCount([...host.streams.keys()].map((k) => Uint8Array.from(Buffer.from(k, "hex")))[0] ?? new Uint8Array())).toBeGreaterThanOrEqual(0);

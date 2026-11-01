@@ -4,11 +4,12 @@ import { createCircleSnapshot, newCircleId } from "../src/circle.js";
 import { ready } from "../src/crypto.js";
 import { KavachError } from "../src/errors.js";
 import { drain, enqueue, outboxCount } from "../src/outbox.js";
-import { encodeLocation } from "../src/codec.js";
-import { locationFromDegrees } from "../src/record.js";
+
+
 import { t3ApplyChange } from "../src/transactions.js";
 import { FakeHost } from "../src/testing/fakeHost.js";
 import { Clock, setupDevice, type Device } from "./harness.js";
+import { encodeLocation, locationFromDegrees } from "./location.js";
 
 beforeAll(() => ready());
 
@@ -117,7 +118,7 @@ describe("the sender (T6h)", () => {
     expect(await outboxCount(alice.store)).toBe(0);
     const s = host.streams.get(toHex(alice.pin.streamId));
     expect([...(s?.records.values() ?? [])].map((r) => r.recordId)).toEqual([toHex(a.recordId), toHex(b.recordId)]);
-    expect(host.notifications.filter((n) => n.to === "bob").map((n) => n.kind)).toEqual(["wake", "checkIn"]);
+    expect(host.notifications.filter((n) => n.to === "bob").map((n) => n.kind)).toEqual(["wake", "visible"]);
   });
 
   it("a crash after T6 and before the send retries the exact wire", async () => {
@@ -171,7 +172,7 @@ describe("the sender (T6h)", () => {
   it("STALE_APPEND is recorded as acceptance unknown with a request for a fresh location, and never re-creates a check-in", async () => {
     const { alice, clock } = await pair();
     const events: string[] = [];
-    const deps = { ...alice.outbox, events: { needsLocation: (r: string) => events.push("needsLocation:" + r), cancelled: (_: Uint8Array, r: string) => events.push("cancelled:" + r) } };
+    const deps = { ...alice.outbox, events: { refresh: (r: string) => events.push("refresh:" + r), cancelled: (_: Uint8Array, r: string) => events.push("cancelled:" + r) } };
     await enqueue(deps, 0, sample(clock));
     await enqueue(deps, 1, sample(clock));
     // The relay rule itself is covered by the fake host; here the client-side disposition is exercised
@@ -185,7 +186,7 @@ describe("the sender (T6h)", () => {
     expect(outcome).toBe("unknown");
     const outcome2 = await recordOutcomeForTest(deps, rows[1]?.[0] ?? "", { status: "STALE_APPEND" });
     expect(outcome2).toBe("unknown");
-    expect(events).toEqual(["cancelled:acceptanceUnknown", "needsLocation:acceptanceUnknown", "cancelled:acceptanceUnknown"]);
+    expect(events).toEqual(["cancelled:acceptanceUnknown", "refresh:acceptanceUnknown", "cancelled:acceptanceUnknown"]);
     expect(await alice.store.read((tx) => tx.list("outbox").map(([, r]) => r.status))).toEqual(["unknown", "unknown"]);
     expect(await alice.store.read((tx) => tx.list("history").length)).toBe(2);
   });

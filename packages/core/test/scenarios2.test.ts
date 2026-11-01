@@ -4,11 +4,11 @@ import { toHex } from "../src/bytes.js";
 import { open, type Client, type ClientEvent } from "../src/client.js";
 import { buildResetKeyList } from "../src/codec.js";
 import { C, H, ready, signingKeypairFromSeed } from "../src/crypto.js";
-import { locationFromDegrees } from "../src/record.js";
 import { MemorySecretStore, MemoryStore } from "../src/store.js";
 import type { ProviderLoadResult, ProviderSaveResult, ProviderStatusResult, RecoveryProvider } from "../src/vault.js";
 import { FakeHost } from "../src/testing/fakeHost.js";
 import { Clock, policy } from "./harness.js";
+import { enqueueLocation, latest, locationFromDegrees } from "./location.js";
 
 beforeAll(() => ready());
 
@@ -141,7 +141,7 @@ describe("step 12: an expired list defers a reset without pausing sharing", () =
     expect((await b.client.circles.list())[0]?.status).toBe("member");
     expect(report.metadata.resets).toBe(0);
     // Sharing is not paused: Bob's next location is sealed, sent and accepted.
-    await b.client.enqueueLocation(loc(w.clock));
+    await enqueueLocation(b.client, loc(w.clock));
     const next = await b.client.sync();
     expect(next.outbox.accepted).toBe(1);
     expect((await b.client.getState()).status).not.toBe("paused");
@@ -168,7 +168,7 @@ describe("step 13: remaining appendix scenarios through the client", () => {
   it("20: delivered out of counter order, both in history and the pin stays at the newer", async () => {
     const w = world();
     const { a, b, aliceId } = await pair(w);
-    for (let i = 0; i < 8; i++) await a.client.enqueueLocation(loc(w.clock, i));
+    for (let i = 0; i < 8; i++) await enqueueLocation(a.client, loc(w.clock, i));
     await a.client.sync();
     // Reorder the relay's retained records so 7 is read before 6.
     const stream = [...w.host.streams.values()].find((s) => s.accountName === "alice");
@@ -182,8 +182,8 @@ describe("step 13: remaining appendix scenarios through the client", () => {
     await b.client.sync();
     const h = await b.client.history({ authorIdentityId: aliceId });
     expect(h.length).toBe(8);
-    const pin = await b.client.latest(aliceId);
-    expect(pin && toHex(pin.payload)).toBe(toHex((await import("../src/codec.js")).encodeLocation(loc(w.clock, 7))));
+    const pin = await latest(b.client, aliceId);
+    expect(pin && toHex(pin.payload)).toBe(toHex((await import("./location.js")).encodeLocation(loc(w.clock, 7))));
   });
 
   it("25: two execution contexts enqueue concurrently: counters are unique and the order is preserved", async () => {
@@ -199,8 +199,8 @@ describe("step 13: remaining appendix scenarios through the client", () => {
     const bg = await w.device("alice", store.fork(), secrets);
     expect((await bg.client.getState()).status).toBe("ready");
     const ids = await Promise.all([
-      ...Array.from({ length: 10 }, (_, i) => fg.client.enqueueLocation(loc(w.clock, i))),
-      ...Array.from({ length: 10 }, (_, i) => bg.client.enqueueLocation(loc(w.clock, 50 + i)))
+      ...Array.from({ length: 10 }, (_, i) => enqueueLocation(fg.client, loc(w.clock, i))),
+      ...Array.from({ length: 10 }, (_, i) => enqueueLocation(bg.client, loc(w.clock, 50 + i)))
     ]);
     const rows = await store.read((tx) => tx.list("outbox").map(([, r]) => r.counter).sort((x, y) => x - y));
     expect(rows).toEqual(Array.from({ length: 20 }, (_, i) => i));
@@ -217,20 +217,20 @@ describe("step 13: remaining appendix scenarios through the client", () => {
   it("27: a superseded device sends after its replacement activated: the relay refuses; a reader keeps the pin", async () => {
     const w = world();
     const { a, b, aliceId } = await pair(w);
-    await a.client.enqueueLocation(loc(w.clock, 1));
+    await enqueueLocation(a.client, loc(w.clock, 1));
     await a.client.sync();
     await b.client.sync();
     const a2 = await w.device("alice");
     await a2.client.restoreAccount();
     await a2.client.sync();
     // The old phone, not yet aware, queues and tries to send.
-    await a.client.enqueueLocation(loc(w.clock, 2));
+    await enqueueLocation(a.client, loc(w.clock, 2));
     const report = await a.client.sync();
     expect((await a.client.getState()).status).toBe("retired");
     expect(report.outbox.accepted).toBe(0);
     await b.client.sync();
-    const pin = await b.client.latest(aliceId);
-    expect(pin && toHex(pin.payload)).toBe(toHex((await import("../src/codec.js")).encodeLocation(loc(w.clock, 1))));
+    const pin = await latest(b.client, aliceId);
+    expect(pin && toHex(pin.payload)).toBe(toHex((await import("./location.js")).encodeLocation(loc(w.clock, 1))));
   });
 
   it("every state transition is emitted only after its durable commit", async () => {

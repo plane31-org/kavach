@@ -8,7 +8,6 @@
 import { fromHex, toHex } from "../bytes.js";
 import { open, type Client, type ClientEvent } from "../client.js";
 import { KavachError } from "../errors.js";
-import { locationFromDegrees } from "../record.js";
 import { MemorySecretStore, type Store } from "../store.js";
 import type { Transport } from "../transport.js";
 import { TestClock, testPolicy } from "./clock.js";
@@ -129,7 +128,8 @@ function scenario(rt: Runtime, stores: SweepStores, run: string): Scenario {
   };
   let circleId: Uint8Array = new Uint8Array(16);
   let aliceId: Uint8Array = new Uint8Array(32);
-  const loc = (lat: number): ReturnType<typeof locationFromDegrees> => locationFromDegrees(lat, -122.4194, 5, rt.clock.now());
+  // Distinct opaque payloads with the clock as the event time: the sweep needs bytes, not a codec.
+  const loc = (n: number): [Uint8Array, { eventTime: bigint }] => [Uint8Array.of(1, n), { eventTime: rt.clock.now() }];
   const sync = (n: DeviceName) => async (): Promise<unknown> => {
     rt.clock.advance(1_000n);
     return d(n).client.sync();
@@ -150,11 +150,11 @@ function scenario(rt: Runtime, stores: SweepStores, run: string): Scenario {
     { name: "alice.sync#2", run: sync("alice") },
     { name: "bob.sync#1", run: sync("bob") },
     { name: "alice.sync#3", run: sync("alice") },
-    { name: "alice.enqueue#1", run: () => d("alice").client.enqueueLocation(loc(1)) },
-    { name: "alice.enqueue#2", run: () => d("alice").client.enqueueLocation(loc(2)) },
+    { name: "alice.enqueue#1", run: () => d("alice").client.enqueue(0, ...loc(1)) },
+    { name: "alice.enqueue#2", run: () => d("alice").client.enqueue(0, ...loc(2)) },
     { name: "alice.sync#4", run: sync("alice") },
     { name: "bob.sync#2", run: sync("bob") },
-    { name: "bob.checkIn", run: () => d("bob").client.enqueueCheckIn(loc(3)) },
+    { name: "bob.checkIn", run: () => d("bob").client.enqueue(1, ...loc(3)) },
     { name: "bob.sync#3", run: sync("bob") },
     { name: "alice.sync#5", run: sync("alice") },
     {
@@ -164,18 +164,18 @@ function scenario(rt: Runtime, stores: SweepStores, run: string): Scenario {
         // The background location task: a second client over another handle on the same store.
         const a = d("alice");
         const bg = await open({ accountName: "alice", retentionPolicy: testPolicy, recoveryProvider: a.provider, resetTrust, secretStore: a.secrets, store: a.store.fork(), transport: a.transport, now: rt.clock.now });
-        await Promise.all([a.client.sync(), bg.enqueueLocation(loc(4)), bg.enqueueLocation(loc(5))]);
+        await Promise.all([a.client.sync(), bg.enqueue(0, ...loc(4)), bg.enqueue(0, ...loc(5))]);
         await a.client.sync();
       }
     },
     { name: "bob2.restore", run: () => d("bob2").client.restoreAccount() },
     { name: "bob2.sync#1", run: sync("bob2") },
     { name: "alice.sync#6", run: sync("alice") },
-    { name: "alice.enqueue#3", run: () => d("alice").client.enqueueLocation(loc(6)) },
+    { name: "alice.enqueue#3", run: () => d("alice").client.enqueue(0, ...loc(6)) },
     { name: "alice.sync#7", run: sync("alice") },
     { name: "bob2.sync#2", run: sync("bob2") },
     { name: "bob.sync#4", run: sync("bob") },
-    { name: "bob2.checkIn", run: () => d("bob2").client.enqueueCheckIn(loc(7)) },
+    { name: "bob2.checkIn", run: () => d("bob2").client.enqueue(1, ...loc(7)) },
     { name: "bob2.sync#3", run: sync("bob2") },
     { name: "alice.sync#8", run: sync("alice") }
   ];
@@ -332,7 +332,7 @@ async function checkInvariants(rt: Runtime, label: string): Promise<void> {
   }
   // Delivery: bob2 holds alice's newest location; alice has bob's check-ins.
   const aliceId = fromHex(alice.identityId);
-  const pin = await d("bob2").client.latest(aliceId);
+  const pin = await d("bob2").client.newest(aliceId, 0);
   const aliceStream = host.streams.get((await d("alice").store.inner.read((tx) => tx.get("self", "self")))?.streamId ?? "");
   const accepted = host.appendLog.filter((a) => a.streamId === (aliceStream ? [...host.streams.entries()].find(([, s]) => s === aliceStream)?.[0] : "") && (a.status === "ACCEPTED" || a.status === "ALREADY_ACCEPTED"));
   const lastLocation = [...accepted].reverse().find((a) => a.epoch === aliceStream?.currentEpoch);

@@ -21,6 +21,8 @@ export const READ_BATCH = 100;
 export type ReceiveResult =
   | { readonly result: "updated"; readonly recordId: Uint8Array; readonly authorIdentityId: Uint8Array; readonly kind: RecordKind }
   | { readonly result: "history"; readonly recordId: Uint8Array; readonly authorIdentityId: Uint8Array; readonly kind: RecordKind }
+  /** Verified, of a slot-only kind, and older than the slot's holder (or from a retired device): nothing kept. */
+  | { readonly result: "older"; readonly recordId: Uint8Array; readonly authorIdentityId: Uint8Array; readonly kind: RecordKind }
   | { readonly result: "duplicate"; readonly recordId: Uint8Array }
   | { readonly result: "keyPending"; readonly streamId: Uint8Array; readonly epoch: number }
   | { readonly result: "expired"; readonly reason: "window" | "CLOCK_SKEW" }
@@ -134,8 +136,8 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
       if (current.bodyHash === hash) return { result: "duplicate", recordId: opened.recordId };
       return { result: "invalid", reason: "EQUIVOCATION" };
     }
-    if (!fromCurrentDevice) return { result: "history", ...base };
-    return takeSlot(tx, authorHex, kind, candidate, toHex) ? { result: "updated", ...base } : { result: "history", ...base };
+    if (!fromCurrentDevice) return { result: "older", ...base };
+    return takeSlot(tx, authorHex, kind, candidate, toHex) ? { result: "updated", ...base } : { result: "older", ...base };
   }
   const existing = tx.get("history", id);
   if (existing) {

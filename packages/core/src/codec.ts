@@ -475,45 +475,6 @@ export function buildResetKeyList(f: Omit<ResetKeyList, "type">, managementSecre
   return signed(encodeResetKeyListBody(f), "reset-keys-sig", managementSecretKey);
 }
 
-// Location codec -------------------------------------------------------------------------------
-
-export const LOCATION_PAYLOAD_VERSION = 1;
-export const LOCATION_PAYLOAD_BYTES = 22;
-export type LocationStatus = 0 | 1 | 2; // normal, stale, unavailable
-
-export interface Location {
-  readonly latitudeE7: number;
-  readonly longitudeE7: number;
-  readonly accuracyMm: number;
-  readonly capturedAt: bigint;
-  readonly status: LocationStatus;
-}
-
-function checkLocation(l: Location, stage: string): void {
-  const bad = (why: string): KavachError => new KavachError("BAD_PAYLOAD", stage, why);
-  if (!Number.isInteger(l.latitudeE7) || l.latitudeE7 < -900_000_000 || l.latitudeE7 > 900_000_000) throw bad("latitude");
-  if (!Number.isInteger(l.longitudeE7) || l.longitudeE7 < -1_800_000_000 || l.longitudeE7 > 1_800_000_000) throw bad("longitude");
-  if (!Number.isInteger(l.accuracyMm) || l.accuracyMm < 0 || l.accuracyMm > 100_000_000) throw bad("accuracy");
-  if (l.status !== 0 && l.status !== 1 && l.status !== 2) throw bad("status");
-  if (l.status === 2 && (l.latitudeE7 !== 0 || l.longitudeE7 !== 0 || l.accuracyMm !== 0)) throw bad("unavailable with coordinates");
-}
-
-export function encodeLocation(l: Location): Uint8Array {
-  checkLocation(l, "encodeLocation");
-  return new Writer().u8(LOCATION_PAYLOAD_VERSION).i32(l.latitudeE7).i32(l.longitudeE7).u32(l.accuracyMm).u64(l.capturedAt).u8(l.status).finish();
-}
-
-export function decodeLocation(payload: Uint8Array): Location {
-  const stage = "decodeLocation";
-  if (payload.length !== LOCATION_PAYLOAD_BYTES) throw new KavachError("BAD_PAYLOAD", stage, "length");
-  const r = new Reader(payload, stage);
-  if (r.u8() !== LOCATION_PAYLOAD_VERSION) throw new KavachError("BAD_PAYLOAD", stage, "version");
-  const l: Location = { latitudeE7: r.i32(), longitudeE7: r.i32(), accuracyMm: r.u32(), capturedAt: r.u64(), status: r.u8() as LocationStatus };
-  r.end();
-  checkLocation(l, stage);
-  return l;
-}
-
 // Account vault (type 6) -----------------------------------------------------------------------
 
 export interface VaultEntry {

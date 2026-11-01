@@ -5,7 +5,6 @@ import { open, type Client, type ClientEvent, type SyncReport } from "../src/cli
 import { buildResetKeyList, type Location } from "../src/codec.js";
 import { C, H, signingKeypairFromSeed } from "../src/crypto.js";
 import { KavachError } from "../src/errors.js";
-import { locationFromDegrees } from "../src/record.js";
 import { MemorySecretStore, MemoryStore } from "../src/store.js";
 import type { RetentionPolicy } from "../src/policy.js";
 import { TestClock, testPolicy } from "../src/testing/clock.js";
@@ -13,6 +12,7 @@ import { FakeHost } from "../src/testing/fakeHost.js";
 import { MaliciousTransport } from "../src/testing/faults.js";
 import { MemoryPlatformProvider } from "../src/testing/providers.js";
 import { hostTransport } from "../src/testing/sweep.js";
+import { enqueueLocation, locationFromDegrees, type Location } from "./location.js";
 
 export const management = signingKeypairFromSeed(H(C("identity")));
 export const operational = signingKeypairFromSeed(H(C("stream")));
@@ -101,7 +101,7 @@ export async function pair(w: World): Promise<Pair> {
   await w.sync(a);
   await w.sync(b);
   await w.sync(a);
-  await a.client.enqueueLocation(w.loc(1));
+  await enqueueLocation(a.client, w.loc(1));
   await w.sync(a);
   await w.sync(b);
   expect((await b.client.history({ authorIdentityId: aliceId })).length).toBe(1);

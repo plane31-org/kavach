@@ -1,7 +1,8 @@
 /** The relay scenarios of the appendix (21 to 23, 27) and the profile's gate table, against the real Worker. */
 import { describe, expect, it } from "vitest";
-import { locationFromDegrees, toHex } from "@kavach/core";
+import { toHex } from "@kavach/core";
 import { circleOfTwo, clock, device, hostJson, type Device } from "./world.js";
+import { enqueueCheckIn, enqueueLocation, enqueueStatus, latestStatus, locationFromDegrees } from "./location.js";
 
 interface Debug {
   tail: number;
@@ -26,7 +27,7 @@ describe("relay: deletion, expiry, cursors", () => {
   it("22: the last required reader's cursor deletes the record; epoch material goes when unreferenced and not current", async () => {
     const { a, b } = await circleOfTwo();
     const sid = await streamOf(b);
-    await a.client.enqueueLocation(loc(1));
+    await enqueueLocation(a.client, loc(1));
     await a.client.sync();
     let d = await debug(sid);
     expect(d.retained.length).toBe(1);
@@ -38,7 +39,7 @@ describe("relay: deletion, expiry, cursors", () => {
     // Alice rotates: epoch 2 is current; epoch 1 is unreferenced and gone.
     await a.client.circles.setEnabled((await a.client.circles.list())[0]?.circleId ?? new Uint8Array(), false);
     await a.client.circles.setEnabled((await a.client.circles.list())[0]?.circleId ?? new Uint8Array(), true);
-    await a.client.enqueueLocation(loc(2));
+    await enqueueLocation(a.client, loc(2));
     await a.client.sync();
     d = await debug(sid);
     expect(d.currentEpoch).toBeGreaterThan(2);
@@ -48,10 +49,10 @@ describe("relay: deletion, expiry, cursors", () => {
   it("23: a reader away past the window loses the record to expiry as a prefix, never a newer one; the author keeps history", async () => {
     const { a, b } = await circleOfTwo();
     const sid = await streamOf(b);
-    await a.client.enqueueLocation(loc(1));
+    await enqueueLocation(a.client, loc(1));
     await a.client.sync();
     clock.advance(86_400_001n);
-    await a.client.enqueueLocation(loc(2));
+    await enqueueLocation(a.client, loc(2));
     await a.client.sync();
     await hostJson(`/v1/streams/${sid}/expire`, { method: "POST", body: "{}" });
     const d = await debug(sid);
@@ -67,7 +68,7 @@ describe("relay: deletion, expiry, cursors", () => {
   it("an equal or older cursor writes nothing; a cursor above the tail is rejected; reads beyond the tail are rejected", async () => {
     const { a, b } = await circleOfTwo();
     const sid = await streamOf(b);
-    await a.client.enqueueLocation(loc());
+    await enqueueLocation(a.client, loc());
     await a.client.sync();
     await b.client.sync();
     const before = await debug(sid);
@@ -90,7 +91,7 @@ describe("relay: deletion, expiry, cursors", () => {
   it("the append checkpoint: an identical retry after deletion returns the original outcome; a stale append is refused without reinsertion", async () => {
     const { a, b } = await circleOfTwo();
     const sid = await streamOf(b);
-    const q = await a.client.enqueueLocation(loc());
+    const q = await enqueueLocation(a.client, loc());
     await a.client.sync();
     const wire = (await a.store.read((tx) => tx.list("history").find(([k]) => k === toHex(q.recordId))))?.[1];
     void wire;
@@ -108,7 +109,7 @@ describe("relay: deletion, expiry, cursors", () => {
     const tampered = exact.slice(0, -2) + (exact.endsWith("00") ? "01" : "00");
     const eq = await hostJson<{ status: string }>(`/v1/streams/${sid}/records`, { method: "POST", headers: { authorization: a.bearer() }, body: JSON.stringify({ recordId: retained.record_id, wire: tampered }) });
     expect(eq.status).toBe("EQUIVOCATION");
-    await a.client.enqueueLocation(loc(5));
+    await enqueueLocation(a.client, loc(5));
     await a.client.sync();
     const stale = await hostJson<{ status: string }>(`/v1/streams/${sid}/records`, { method: "POST", headers: { authorization: a.bearer() }, body: JSON.stringify({ recordId: "00".repeat(32), wire: exact }) });
     expect(["STALE_APPEND", "EQUIVOCATION", "ALREADY_ACCEPTED"]).toContain(stale.status);
@@ -118,7 +119,7 @@ describe("relay: deletion, expiry, cursors", () => {
   it("subscriptions: members get one when an author opens a new stream; a replacement device's starts at activation and never inherits the cursor", async () => {
     const { a, b } = await circleOfTwo();
     const sid = await streamOf(b);
-    for (let i = 0; i < 3; i++) await a.client.enqueueLocation(loc(i));
+    for (let i = 0; i < 3; i++) await enqueueLocation(a.client, loc(i));
     await a.client.sync();
     const before = await debug(sid);
     expect(before.subscriptions.length).toBe(1);
@@ -128,7 +129,7 @@ describe("relay: deletion, expiry, cursors", () => {
     await b2.client.restoreAccount();
     await b2.client.sync();
     await a.client.sync();
-    await a.client.enqueueLocation(loc(9));
+    await enqueueLocation(a.client, loc(9));
     await a.client.sync();
     const after = await debug(sid);
     const fresh = after.subscriptions.find((s) => s.cert !== bobCert);
@@ -141,7 +142,7 @@ describe("relay: deletion, expiry, cursors", () => {
     await a2.client.restoreAccount();
     await a2.client.sync();
     await b2.client.sync();
-    await a2.client.enqueueLocation(loc(10));
+    await enqueueLocation(a2.client, loc(10));
     await a2.client.sync();
     const subs = await hostJson<{ streamId: string }[]>("/v1/subscriptions", { headers: { authorization: b2.bearer() } });
     expect(subs.length).toBe(2);
@@ -151,11 +152,11 @@ describe("relay: deletion, expiry, cursors", () => {
   it("a status (kind 2) is relayed with no notification at all, and the reader keeps the newest", async () => {
     const { a, b, aliceId } = await circleOfTwo();
     const start = (await hostJson<unknown[]>("/v1/debug/notifications")).length;
-    await a.client.enqueueStatus(new Uint8Array([1, 64, 0, 3]));
+    await enqueueStatus(a.client, new Uint8Array([1, 64, 0, 3]));
     await a.client.sync();
     expect((await hostJson<unknown[]>("/v1/debug/notifications")).length).toBe(start);
     await b.client.sync();
-    const latest = await b.client.latestStatus(aliceId);
+    const latest = await latestStatus(b.client, aliceId);
     expect(latest && [...latest.payload]).toEqual([1, 64, 0, 3]);
     expect((await b.client.history({ authorIdentityId: aliceId })).some((h) => h.kind === 2)).toBe(false);
   });
@@ -163,14 +164,14 @@ describe("relay: deletion, expiry, cursors", () => {
   it("24: a check-in survives a later location end to end, and each visible notification is sent once without a coordinate", async () => {
     const { a, b, aliceId } = await circleOfTwo();
     const start = (await hostJson<unknown[]>("/v1/debug/notifications")).length;
-    await a.client.enqueueCheckIn(loc(10));
-    await a.client.enqueueLocation(loc(11));
+    await enqueueCheckIn(a.client, loc(10));
+    await enqueueLocation(a.client, loc(11));
     await a.client.sync();
     await b.client.sync();
     const h = await b.client.history({ authorIdentityId: aliceId });
     expect(h.map((x) => x.kind)).toEqual([1, 0]);
     const notes = (await hostJson<{ kind: string; to_account: string; from_account: string }[]>("/v1/debug/notifications")).slice(start);
-    expect(notes.filter((n) => n.to_account === "bob").map((n) => n.kind)).toEqual(["checkIn", "wake"]);
+    expect(notes.filter((n) => n.to_account === "bob").map((n) => n.kind)).toEqual(["visible", "wake"]);
     for (const n of notes) expect(Object.keys(n).sort()).toEqual(["circle_id", "from_account", "kind", "to_account"]);
     const joins = await hostJson<{ kind: string; to_account: string }[]>("/v1/debug/notifications");
     expect(joins.filter((n) => n.kind === "joinRequest" && n.to_account === "alice").length).toBe(1);
@@ -179,7 +180,7 @@ describe("relay: deletion, expiry, cursors", () => {
   it("27: a superseded device's append is refused by the fence", async () => {
     const { a, b } = await circleOfTwo();
     const sid = await streamOf(b);
-    await a.client.enqueueLocation(loc(1));
+    await enqueueLocation(a.client, loc(1));
     await a.client.sync();
     const page = await hostJson<{ records: { wire: string }[] }>(`/v1/streams/${sid}/records?after=0&limit=10`, { headers: { authorization: b.bearer() } });
     const exact = page.records[0]?.wire ?? "";

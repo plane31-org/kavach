@@ -6,7 +6,7 @@
 import { concat, equalBytes, fromHex, toHex } from "./bytes.js";
 import { resolveAudience, type ResolvedAudience } from "./audience.js";
 import { acceptSnapshot, checkMemberResolution, createCircleSnapshot, newCircleId, pinCircle, successorSnapshot, type CircleState } from "./circle.js";
-import { DocumentType, encodeLocation, expectType, parseVaultHeader, verifyDocument, type AccountDevice, type Location, type RecordKind } from "./codec.js";
+import { DocumentType, expectType, parseVaultHeader, verifyDocument, type AccountDevice, type RecordKind } from "./codec.js";
 import { randomBytes, ready, type BoxKeypair } from "./crypto.js";
 import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
@@ -21,7 +21,7 @@ export interface EnqueueResult {
   readonly recordId: Uint8Array;
   readonly duplicate: boolean;
 }
-import { validatePolicy, type RetentionPolicy } from "./policy.js";
+import { kindOf, validatePolicy, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
 import type { CircleRow, PendingResetRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
@@ -31,10 +31,6 @@ import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccou
 
 /** The types of the client's queries and of `receive`, defined with the inbox. */
 export type { HistoryEntry, HistoryPage, HistoryQuery, Newest, ReceiveResult } from "./inbox.js";
-/** @deprecated until the generic API of revision 8: `latest` returns `Newest` for kind 0. */
-export type Latest = Newest;
-/** @deprecated until the generic API of revision 8: `latestStatus` returns `Newest` for kind 2. */
-export type LatestStatus = Newest;
 
 /** accountSeed, deviceSeed, recoveryKey, instanceId and deviceId of a pending reset, in the secret store. */
 const RESET_ROOTS_BYTES = 32 * 3 + 16 + 16;
@@ -97,13 +93,13 @@ export interface CircleSummary {
 
 export type ClientEvent =
   | { kind: "deviceChanged"; identityId: Uint8Array; generation: bigint }
-  | { kind: "needsLocation"; reason: string }
+  /** After a rotation, or when a sent record's acceptance is in doubt: the app may resend its current state of each kind with a slot. */
+  | { kind: "refresh"; reason: string }
   | { kind: "cancelled"; recordId: Uint8Array; reason: string }
   | { kind: "queued"; recordId: Uint8Array; recordKind: RecordKind }
   | { kind: "accepted"; recordId: Uint8Array }
-  | { kind: "latestUpdated"; identityId: Uint8Array }
-  | { kind: "statusUpdated"; identityId: Uint8Array }
-  | { kind: "checkIn"; identityId: Uint8Array; recordId: Uint8Array }
+  /** A record was stored, received or the device's own; `tookSlot` when it became the author's newest of its kind. */
+  | { kind: "recordStored"; recordKind: RecordKind; authorIdentityId: Uint8Array; recordId: Uint8Array; tookSlot: boolean }
   | { kind: "waiting"; identityId: Uint8Array }
   | { kind: "joinRequests"; circleId: Uint8Array; accountNames: readonly string[] }
   | { kind: "circleChanged"; circleId: Uint8Array; revision: bigint; status: CircleState["status"] }
@@ -132,10 +128,8 @@ export interface Client {
   recoveryStatus(): Promise<ProviderStatusResult>;
   recoveryCode(): Promise<string>;
   restoreAccount(recoveryCode?: string): Promise<{ identityId: Uint8Array; generation: bigint }>;
-  enqueueLocation(location: Location, options?: EnqueueOptions): Promise<EnqueueResult>;
-  enqueueCheckIn(payload: Location | Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult>;
-  /** A status (kind 2): the sender's current state in an application payload. Latest wins in the outbox. */
-  enqueueStatus(payload: Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult>;
+  /** A durable outbound record of a declared kind; the payload is the product's bytes, never read by the SDK. */
+  enqueue(kind: RecordKind, payload: Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult>;
   /** One synchronisation; `options.catchUp` bounds how much of a backlog this call reads (`SyncReport.inbox.hasMore` says when to call again). */
   sync(options?: SyncOptions): Promise<SyncReport>;
   receive(wire: Uint8Array): Promise<ReceiveResult>;
@@ -144,13 +138,9 @@ export interface Client {
   /** One page of history in time order with a cursor for the next; served from the index. */
   historyPage(query?: HistoryQuery): Promise<HistoryPage>;
   /** The newest history entry for an author or kind, own records and superseded ones included. */
-  newest(query?: Pick<HistoryQuery, "authorIdentityId" | "kind">): Promise<HistoryEntry | undefined>;
+  newestEntry(query?: Pick<HistoryQuery, "authorIdentityId" | "kind">): Promise<HistoryEntry | undefined>;
   /** The newest record of a kind from an author's current device, self included; `undefined` when none or expired. */
-  newestOf(identityId: Uint8Array, kind: number): Promise<Newest | undefined>;
-  /** `newestOf(identityId, 0)`. */
-  latest(identityId: Uint8Array): Promise<Newest | undefined>;
-  /** `newestOf(identityId, 2)`. */
-  latestStatus(identityId: Uint8Array): Promise<Newest | undefined>;
+  newest(identityId: Uint8Array, kind: RecordKind): Promise<Newest | undefined>;
   inspect(): Promise<Inspection>;
   readonly circles: {
     create(): Promise<{ circleId: Uint8Array }>;
@@ -323,7 +313,7 @@ class ClientImpl implements Client {
         queued: (recordId: Uint8Array, recordKind: RecordKind) => this.emit({ kind: "queued", recordId, recordKind }),
         accepted: (recordId: Uint8Array) => this.emit({ kind: "accepted", recordId }),
         cancelled: (recordId: Uint8Array, reason: string) => this.emit({ kind: "cancelled", recordId, reason }),
-        needsLocation: (reason: string) => this.emit({ kind: "needsLocation", reason }),
+        refresh: (reason: string) => this.emit({ kind: "refresh", reason }),
         securityError: (code: string, detail: string) => this.emit({ kind: "securityError", code, detail })
       }
     };
@@ -338,9 +328,7 @@ class ClientImpl implements Client {
       self: () => this.selfView(),
       events: {
         received: (r: ReceiveResult) => {
-          if (r.result === "updated" && r.kind === 0) this.emit({ kind: "latestUpdated", identityId: r.authorIdentityId });
-          if (r.result === "updated" && r.kind === 1) this.emit({ kind: "checkIn", identityId: r.authorIdentityId, recordId: r.recordId });
-          if (r.result === "updated" && r.kind === 2) this.emit({ kind: "statusUpdated", identityId: r.authorIdentityId });
+          if (r.result === "updated" || r.result === "history") this.emit({ kind: "recordStored", recordKind: r.kind, authorIdentityId: r.authorIdentityId, recordId: r.recordId, tookSlot: r.result === "updated" && (kindOf(this.policy, r.kind)?.newest ?? false) });
         },
         waiting: (identityId: Uint8Array) => this.emit({ kind: "waiting", identityId }),
         securityError: (code: string, detail: string) => this.emit({ kind: "securityError", code, detail })
@@ -626,19 +614,7 @@ class ClientImpl implements Client {
 
   // Sending ---------------------------------------------------------------------------------------
 
-  async enqueueLocation(location: Location, options?: EnqueueOptions): Promise<EnqueueResult> {
-    return this.enqueueKind(0, encodeLocation(location), { eventTime: location.capturedAt, ...options });
-  }
-
-  async enqueueCheckIn(payload: Location | Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult> {
-    return payload instanceof Uint8Array ? this.enqueueKind(1, payload, options) : this.enqueueKind(1, encodeLocation(payload), { eventTime: payload.capturedAt, ...options });
-  }
-
-  async enqueueStatus(payload: Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult> {
-    return this.enqueueKind(2, payload, options);
-  }
-
-  private async enqueueKind(kind: RecordKind, payload: Uint8Array, options: EnqueueOptions = {}): Promise<EnqueueResult> {
+  async enqueue(kind: RecordKind, payload: Uint8Array, options: EnqueueOptions = {}): Promise<EnqueueResult> {
     const deps = this.outboxDeps();
     await this.ensureEpoch();
     try {
@@ -647,19 +623,16 @@ class ClientImpl implements Client {
       if (isKavachError(e, "ROTATION_REQUIRED") || isKavachError(e, "COUNTER_EXHAUSTED")) {
         await this.ensureEpoch();
         const r = await enqueue(deps, kind, payload, options);
-        this.emit({ kind: "needsLocation", reason: "rotation" });
+        this.emit({ kind: "refresh", reason: "rotation" });
         return this.enqueued(kind, r);
       }
       throw e;
     }
   }
 
-  /** After commit: the own pin or status moved, so the same events fire for self as for any author. */
+  /** After commit: the device's own record is stored like any author's, so one subscription covers self and others. */
   private enqueued(kind: RecordKind, r: { recordId: Uint8Array; duplicate: boolean; own: boolean }): EnqueueResult {
-    if (r.own && this.selfPin) {
-      if (kind === 0) this.emit({ kind: "latestUpdated", identityId: this.selfPin.identityId });
-      if (kind === 2) this.emit({ kind: "statusUpdated", identityId: this.selfPin.identityId });
-    }
+    if (!r.duplicate && this.selfPin) this.emit({ kind: "recordStored", recordKind: kind, authorIdentityId: this.selfPin.identityId, recordId: r.recordId, tookSlot: r.own });
     return { recordId: r.recordId, duplicate: r.duplicate };
   }
 
@@ -738,7 +711,7 @@ class ClientImpl implements Client {
       if (resolution === "RETRY") return "pending";
       const promoted = await this.store.transaction((tx) => t5Committed(tx, prepared.epoch, audience.key));
       if (promoted === "PROMOTED") {
-        if (attempt > 0 || stream.activeEpoch === undefined) this.emit({ kind: "needsLocation", reason: "rotation" });
+        if (attempt > 0 || stream.activeEpoch === undefined) this.emit({ kind: "refresh", reason: "rotation" });
         return "prepared";
       }
     }
@@ -1099,21 +1072,15 @@ class ClientImpl implements Client {
     return historyPage(this.store, this.policy, query);
   }
 
-  newest(query?: Pick<HistoryQuery, "authorIdentityId" | "kind">): Promise<HistoryEntry | undefined> {
+  newestEntry(query?: Pick<HistoryQuery, "authorIdentityId" | "kind">): Promise<HistoryEntry | undefined> {
     return newest(this.store, this.policy, query);
   }
 
-  newestOf(identityId: Uint8Array, kind: number): Promise<Newest | undefined> {
+  newest(identityId: Uint8Array, kind: RecordKind): Promise<Newest | undefined> {
     return newestSlot(this.store, identityId, kind, this.now());
   }
 
-  latest(identityId: Uint8Array): Promise<Newest | undefined> {
-    return this.newestOf(identityId, 0);
-  }
 
-  latestStatus(identityId: Uint8Array): Promise<Newest | undefined> {
-    return this.newestOf(identityId, 2);
-  }
 
   // Circles ---------------------------------------------------------------------------------------
 

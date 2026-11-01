@@ -8,11 +8,11 @@ import { open, type Client, type ClientEvent } from "../src/client.js";
 import { buildResetKeyList } from "../src/codec.js";
 import { randomBytes, ready, signingKeypairFromSeed, H, C } from "../src/crypto.js";
 import { KavachError } from "../src/errors.js";
-import { locationFromDegrees } from "../src/record.js";
 import { MemorySecretStore, MemoryStore } from "../src/store.js";
 import type { ProviderLoadResult, ProviderSaveResult, ProviderStatus, ProviderStatusResult, RecoveryProvider } from "../src/vault.js";
 import { FakeHost } from "../src/testing/fakeHost.js";
 import { Clock, policy } from "./harness.js";
+import { enqueueCheckIn, enqueueLocation, latest, locationFromDegrees } from "./location.js";
 
 beforeAll(() => ready());
 
@@ -154,11 +154,11 @@ describe("scenarios 1 and 2: create, request, approve", () => {
     // Bob was offline; he comes back and syncs once.
     const before = w.host.notifications.filter((n) => n.kind === "joinRequest").length;
     await b.client.sync();
-    await b.client.enqueueLocation(loc(w.clock));
+    await enqueueLocation(b.client, loc(w.clock));
     await b.client.sync();
     await a.client.sync();
     expect(w.host.notifications.filter((n) => n.kind === "joinRequest").length).toBe(before);
-    expect(await a.client.latest((await b.client.inspect()).identityId ?? new Uint8Array())).toBeDefined();
+    expect(await latest(a.client, (await b.client.inspect()).identityId ?? new Uint8Array())).toBeDefined();
   });
 });
 
@@ -188,10 +188,10 @@ describe("scenarios 3 to 7: device replacement", () => {
     // Bob returns: he rotates to Alice's new device and can read her.
     await b.client.sync();
     expect(b.events.some((e) => e.kind === "deviceChanged")).toBe(true);
-    await a2.client.enqueueLocation(loc(w.clock, 1));
+    await enqueueLocation(a2.client, loc(w.clock, 1));
     await a2.client.sync();
     await b.client.sync();
-    expect(await b.client.latest(restored.identityId)).toBeDefined();
+    expect(await latest(b.client, restored.identityId)).toBeDefined();
   });
 
   it("4: a member replaces the device while the owner is offline; online authors rotate within one sync; the old device opens nothing new", async () => {
@@ -203,10 +203,10 @@ describe("scenarios 3 to 7: device replacement", () => {
     // Alice syncs once (the owner is "offline": nothing of the owner is needed).
     await a.client.sync();
     expect(a.events.filter((e) => e.kind === "deviceChanged").length).toBe(1);
-    await a.client.enqueueLocation(loc(w.clock, 2));
+    await enqueueLocation(a.client, loc(w.clock, 2));
     await a.client.sync();
     await b2.client.sync();
-    expect(await b2.client.latest(aliceId)).toBeDefined();
+    expect(await latest(b2.client, aliceId)).toBeDefined();
     // The old phone: retired, and it never received the new epoch's wrap.
     await b.client.sync();
     expect((await b.client.getState()).status).toBe("retired");
@@ -225,7 +225,7 @@ describe("scenarios 3 to 7: device replacement", () => {
     await b2.client.restoreAccount();
     await b2.client.sync();
     await a.client.sync(); // Alice rotates to the new device
-    await a.client.enqueueLocation(loc(w.clock, 3));
+    await enqueueLocation(a.client, loc(w.clock, 3));
     await a.client.sync();
     const before = (await attacker.client.history({ authorIdentityId: aliceId })).length;
     await attacker.client.sync(); // retired: nothing is read
@@ -255,7 +255,7 @@ describe("scenarios 3 to 7: device replacement", () => {
   it("7: lose the local store, keep recovery: membership survives; the new stream starts at epoch 1, counter 0", async () => {
     const w = world();
     const { a, circleId } = await circleOfTwo(w);
-    await a.client.enqueueLocation(loc(w.clock));
+    await enqueueLocation(a.client, loc(w.clock));
     await a.client.sync();
     const again = await w.device("alice", (a.provider as Platform).twin());
     await again.client.restoreAccount();
@@ -265,7 +265,7 @@ describe("scenarios 3 to 7: device replacement", () => {
     expect(circles[0]?.status).toBe("member");
     const info = await again.client.inspect();
     expect(info.activeEpoch).toBe(1);
-    const r = await again.client.enqueueLocation(loc(w.clock));
+    const r = await enqueueLocation(again.client, loc(w.clock));
     const row = await again.store.read((tx) => tx.get("outbox", toHex(r.recordId)));
     expect([row?.epoch, row?.counter]).toEqual([1, 0]);
   });
@@ -279,7 +279,7 @@ describe("scenarios 8 to 10: enrollment and recovery", () => {
     const a = await w.device("alice", p);
     await a.client.initializeAccount();
     expect((await a.client.recoveryStatus()).backupState).toBe("unavailable");
-    await a.client.enqueueLocation(loc(w.clock));
+    await enqueueLocation(a.client, loc(w.clock));
     expect((await a.client.sync()).outbox.accepted).toBe(1);
     expect((await a.client.recoveryCode()).startsWith("SS5R-")).toBe(true);
   });
@@ -311,7 +311,7 @@ describe("scenarios 11 to 15: reset, removal, limits", () => {
     expect(b.events.some((e) => e.kind === "accountKeyChanged" && !e.quarantined)).toBe(true);
     expect((await b.client.circles.list())[0]?.status).toBe("closed");
     // Bob's audience no longer includes the old Alice; his next epoch names only himself.
-    await b.client.enqueueLocation(loc(w.clock));
+    await enqueueLocation(b.client, loc(w.clock));
     await b.client.sync();
     const bobStream = [...w.host.streams.values()].find((s) => s.accountName === "bob");
     expect(bobStream?.epochs.get(bobStream.currentEpoch)?.rows.length).toBe(1);
@@ -366,7 +366,7 @@ describe("scenarios 11 to 15: reset, removal, limits", () => {
     const stream = [...w.host.streams.values()].find((s) => s.accountName === "alice");
     expect(stream?.currentEpoch).toBe(before + 1);
     expect(stream?.epochs.get(stream.currentEpoch)?.rows.length).toBe(1);
-    await a.client.enqueueLocation(loc(w.clock, 9));
+    await enqueueLocation(a.client, loc(w.clock, 9));
     await a.client.sync();
     await b.client.sync();
     expect((await b.client.circles.list())[0]?.status).toBe("left");
@@ -386,7 +386,7 @@ describe("scenarios 11 to 15: reset, removal, limits", () => {
     const view = (await c.client.circles.list())[0];
     expect(view?.status).toBe("member");
     expect(view?.snapshotAgeMs).toBe(3_600_000n);
-    await c.client.enqueueLocation(loc(w.clock));
+    await enqueueLocation(c.client, loc(w.clock));
     expect((await c.client.sync()).outbox.accepted).toBe(1);
   });
 
@@ -429,7 +429,7 @@ describe("scenarios 11 to 15: reset, removal, limits", () => {
     const state = await a.client.getState();
     expect(state.status).toBe("paused");
     expect(state.paused).toBe("limit");
-    expect(await code(() => a.client.enqueueLocation(loc(w.clock)))).toBe("RECIPIENT_LIMIT");
+    expect(await code(() => enqueueLocation(a.client, loc(w.clock)))).toBe("RECIPIENT_LIMIT");
   }, 60_000);
 });
 
@@ -438,27 +438,27 @@ describe("scenarios 24 and 26 through the client", () => {
     const w = world();
     const { a, b, aliceId } = await circleOfTwo(w);
     const start = w.host.notifications.length;
-    await a.client.enqueueCheckIn(loc(w.clock, 10));
-    await a.client.enqueueLocation(loc(w.clock, 11));
-    await a.client.enqueueLocation(loc(w.clock, 12));
+    await enqueueCheckIn(a.client, loc(w.clock, 10));
+    await enqueueLocation(a.client, loc(w.clock, 11));
+    await enqueueLocation(a.client, loc(w.clock, 12));
     await a.client.sync();
     await b.client.sync();
     const h = await b.client.history({ authorIdentityId: aliceId });
     expect(h.map((x) => x.kind)).toEqual([1, 0, 0]);
-    expect(b.events.filter((e) => e.kind === "checkIn").length).toBe(1);
-    expect(w.host.notifications.slice(start).filter((n) => n.to === "bob").map((n) => n.kind)).toEqual(["checkIn", "wake", "wake"]);
-    const pin = await b.client.latest(aliceId);
-    expect(pin && toHex(pin.payload)).toBe(toHex((await import("../src/codec.js")).encodeLocation(loc(w.clock, 12))));
+    expect(b.events.filter((e) => e.kind === "recordStored" && e.recordKind === 1).length).toBe(1);
+    expect(w.host.notifications.slice(start).filter((n) => n.to === "bob").map((n) => n.kind)).toEqual(["visible", "wake", "wake"]);
+    const pin = await latest(b.client, aliceId);
+    expect(pin && toHex(pin.payload)).toBe(toHex((await import("./location.js")).encodeLocation(loc(w.clock, 12))));
   });
 
-  it("26: hygiene rotation at the configured interval produces a new epoch and needsLocation", async () => {
+  it("26: hygiene rotation at the configured interval produces a new epoch and refresh", async () => {
     const w = world();
     const { a } = await circleOfTwo(w);
     const before = (await a.client.inspect()).activeEpoch ?? 0;
     w.clock.advance(31n * 86_400_000n);
     a.events.length = 0;
-    await a.client.enqueueLocation(loc(w.clock));
+    await enqueueLocation(a.client, loc(w.clock));
     expect((await a.client.inspect()).activeEpoch).toBe(before + 1);
-    expect(a.events.some((e) => e.kind === "needsLocation")).toBe(true);
+    expect(a.events.some((e) => e.kind === "refresh")).toBe(true);
   });
 });

@@ -5,8 +5,9 @@ import { deviceSigningKeypair, ready } from "../src/crypto.js";
 import { MAX_COUNTER, type AuthorView } from "../src/epoch.js";
 import { KavachError } from "../src/errors.js";
 import { pinFromCertificate, type AccountPin } from "../src/identity.js";
-import { compareSlots, decodeLocation, locationFromDegrees, locationToDegrees, openRecordWire, sealRecord } from "../src/record.js";
+import { compareSlots, openRecordWire, sealRecord } from "../src/record.js";
 import { fixture, hex, str } from "./fixture.js";
+import { decodeLocation, encodeLocation, locationFromDegrees, locationToDegrees } from "./location.js";
 
 interface Extra {
   durable_events: { checkin_wire: string; following_location_wire: string };
@@ -117,7 +118,7 @@ describe("location helpers", () => {
   });
 });
 
-import { encodeLocation } from "../src/codec.js";
+
 function require_encode(l: ReturnType<typeof locationFromDegrees>): Uint8Array {
   return encodeLocation(l);
 }
