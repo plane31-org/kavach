@@ -62,6 +62,7 @@ function cipherLike(dir: string, keysByFile: Map<string, string>): (fileName: st
         inner.exec(sql);
       },
       run: (sql, params) => inner.run(sql, params),
+      close: () => inner.close?.(),
       all: <T>(sql: string, params?: readonly SqlValue[]) => {
         if (keysByFile.get(fileName) !== key) throw new Error("file is not a database");
         return inner.all<T>(sql, params);

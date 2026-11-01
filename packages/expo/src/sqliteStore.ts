@@ -19,6 +19,8 @@ export interface SqlDriver {
   exec(sql: string): void;
   run(sql: string, params?: readonly SqlValue[]): void;
   all<T = Record<string, SqlValue>>(sql: string, params?: readonly SqlValue[]): T[];
+  /** Close the connection; absent for drivers that have none to close. */
+  close?(): void;
 }
 
 export interface SqliteStoreOptions {
@@ -33,6 +35,7 @@ const SCHEMA = 1;
 
 export class SqliteStore implements Store {
   private chain: Promise<void> = Promise.resolve();
+  private closed = false;
 
   private constructor(private readonly db: SqlDriver) {}
 
@@ -57,8 +60,28 @@ export class SqliteStore implements Store {
     return new SqliteStore(db);
   }
 
-  async transaction<R>(fn: (tx: Tx) => R): Promise<R> {
+  /**
+   * Close the connection once the work queued ahead has finished; every later transaction or read
+   * is `CLOSED`. Idempotent. The client is closed first, so nothing is queued behind this.
+   */
+  async close(): Promise<void> {
+    if (this.closed) return;
     const release = await this.acquire();
+    try {
+      this.closed = true;
+      this.db.close?.();
+    } finally {
+      release();
+    }
+  }
+
+  async transaction<R>(fn: (tx: Tx) => R): Promise<R> {
+    if (this.closed) throw new KavachError("CLOSED", "sqliteStore", "the store is closed");
+    const release = await this.acquire();
+    if (this.closed) {
+      release();
+      throw new KavachError("CLOSED", "sqliteStore", "the store is closed");
+    }
     try {
       try {
         this.db.exec("BEGIN IMMEDIATE");
@@ -94,7 +117,12 @@ export class SqliteStore implements Store {
    * a transaction call observes that transaction's outcome.
    */
   async read<R>(fn: (tx: Omit<Tx, "put" | "delete" | "handoff">) => R): Promise<R> {
+    if (this.closed) throw new KavachError("CLOSED", "sqliteStore", "the store is closed");
     const release = await this.acquire();
+    if (this.closed) {
+      release();
+      throw new KavachError("CLOSED", "sqliteStore", "the store is closed");
+    }
     try {
       return fn(new SqliteTx(this.db, true));
     } finally {
@@ -215,6 +243,7 @@ export interface ExpoSqliteDatabaseLike {
   execSync(sql: string): void;
   runSync(sql: string, params: SqlValue[]): unknown;
   getAllSync<T>(sql: string, params: SqlValue[]): T[];
+  closeSync?(): void;
 }
 
 /**
@@ -228,13 +257,15 @@ export function expoSqliteDriver(db: ExpoSqliteDatabaseLike): SqlDriver {
     run: (sql, params = []) => {
       db.runSync(sql, [...params]);
     },
-    all: <T>(sql: string, params: readonly SqlValue[] = []) => db.getAllSync<T>(sql, [...params])
+    all: <T>(sql: string, params: readonly SqlValue[] = []) => db.getAllSync<T>(sql, [...params]),
+    close: () => db.closeSync?.()
   };
 }
 
 /** The subset of Node's `node:sqlite` `DatabaseSync` the test driver needs. */
 export interface NodeSqliteDatabaseLike {
   exec(sql: string): void;
+  close?(): void;
   prepare(sql: string): { run(...params: SqlValue[]): unknown; all(...params: SqlValue[]): unknown[] };
 }
 
@@ -245,6 +276,7 @@ export function nodeSqliteDriver(db: NodeSqliteDatabaseLike): SqlDriver {
     run: (sql, params = []) => {
       db.prepare(sql).run(...params);
     },
-    all: <T>(sql: string, params: readonly SqlValue[] = []) => db.prepare(sql).all(...params) as T[]
+    all: <T>(sql: string, params: readonly SqlValue[] = []) => db.prepare(sql).all(...params) as T[],
+    close: () => db.close?.()
   };
 }

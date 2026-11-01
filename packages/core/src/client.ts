@@ -167,6 +167,22 @@ export interface Client {
   completeReplacement(input: { successionId: Uint8Array; authorization: Uint8Array }): Promise<{ identityId: Uint8Array; generation: bigint }>;
   /** The key changes this device accepted for its contacts, newest first, bounded. */
   keyChanges(options?: { accountId?: Uint8Array; limit?: number }): Promise<KeyChangeEntry[]>;
+  /**
+   * Account recovery as one call over `prepareReplacement` and `completeReplacement`, with the
+   * protocol's retry rules: an earlier proposal is settled through the chain first; the same
+   * proposal is kept through an unknown outcome and a refused authorization; a new proposal is
+   * made only after a definitive conflict, and then only by the next call. The product supplies
+   * `authorize`, which obtains the host's token for a proposal after its own fresh sign-in, or
+   * answers `"reauthenticate"` when it cannot. Attempts are bounded; `pending` means call again.
+   */
+  replaceDevice(options: ReplaceDeviceOptions): Promise<ReplaceDeviceResult>;
+  /**
+   * Synchronise in rounds until nothing is left that this device can do now: the relay has no
+   * more records within the budget, bootstrap is complete, or progress needs someone else (an
+   * authorization, another person, metadata the host does not serve). Bounded by rounds and by
+   * time; the result says why it stopped and what remains.
+   */
+  syncUntilDrained(options?: DrainOptions): Promise<DrainReport>;
   /** A durable outbound record of a declared kind; the payload is the product's bytes, never read by the SDK. */
   enqueue(kind: RecordKind, payload: Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult>;
   /** One synchronisation; `options.catchUp` bounds how much of a backlog this call reads (`SyncReport.inbox.hasMore` says when to call again). */
@@ -192,7 +208,64 @@ export interface Client {
     list(): Promise<readonly CircleSummary[]>;
   };
   resetAccount(options: { confirmed: true; reauthProof?: Uint8Array }): Promise<{ identityId: Uint8Array }>;
+  /**
+   * Stop: no new operation is accepted (`CLOSED`), the operations in flight finish their current
+   * transaction and a running sync stops at its next phase boundary, then listeners are cleared
+   * so nothing is emitted afterwards. Closes nothing it did not open: the store and the secret
+   * store are the caller's. Idempotent.
+   */
   close(): Promise<void>;
+}
+
+export interface ReplaceDeviceOptions {
+  /** Obtain the host's authorization for this proposal after the product's fresh sign-in, or say that a sign-in is needed first. */
+  readonly authorize: (proposal: ReplacementProposal) => Promise<Uint8Array | "reauthenticate">;
+  /** Commit attempts per call, over unknown outcomes and refused authorizations. Default 3. */
+  readonly maxAttempts?: number;
+}
+
+export type ReplaceDeviceResult =
+  | { readonly status: "activated"; readonly identityId: Uint8Array; readonly generation: bigint }
+  /** The outcome is still unknown or the attempts are spent: the proposal is kept; call again. */
+  | { readonly status: "pending"; readonly proposal: ReplacementProposal }
+  /** The account moved under the proposal, which is discarded; the next call prepares a new one after a fresh sign-in. */
+  | { readonly status: "conflict"; readonly currentGeneration: bigint | undefined }
+  /** The product's `authorize` asked for a fresh sign-in; the proposal is kept for the next call. */
+  | { readonly status: "reauthenticate"; readonly proposal: ReplacementProposal };
+
+export interface DrainOptions {
+  readonly catchUp?: SyncOptions["catchUp"];
+  /** Rounds at most. Default 10. */
+  readonly maxRounds?: number;
+  /** Milliseconds at most across every round. Default 30,000. */
+  readonly maxMs?: number;
+}
+
+export type DrainStop =
+  /** Nothing is left that this device can do now. */
+  | "drained"
+  | "maxRounds"
+  | "maxMs"
+  /** A round changed nothing and reported the same errors as the one before. */
+  | "noProgress"
+  /** Progress needs metadata the host does not serve yet (a chain, a certificate, the key list). */
+  | "metadata"
+  /** Progress needs an authorization or a sign-in (a prepared replacement, an account to recover). */
+  | "authentication"
+  | "closed";
+
+/** The merged report of every round, with why the loop stopped and what remains. */
+export interface DrainReport extends SyncReport {
+  readonly rounds: number;
+  readonly stoppedBecause: DrainStop;
+  readonly remaining: {
+    /** The relay still holds records this device has not read. */
+    readonly inboxHasMore: boolean;
+    /** Bootstrap after account recovery has circles left to adopt. */
+    readonly bootstrapIncomplete: boolean;
+    /** Authors whose current epoch has not reached this device: nothing to do but wait for them. */
+    readonly waitingFor: number;
+  };
 }
 
 export interface SyncOptions {
@@ -292,6 +365,9 @@ class ClientImpl implements Client {
   private selfPin: AccountPin | undefined;
   private trust: ResetTrust;
   private syncing: Promise<SyncReport> | undefined;
+  private closed = false;
+  /** Every public operation in flight, so `close()` can wait for them. */
+  private readonly running = new Set<Promise<unknown>>();
   /** The current sync's reading budget: records, and the links of a succession chain, count against it. */
   private syncBudget: ReadBudget | undefined;
   private backupChecked = false;
@@ -309,15 +385,21 @@ class ClientImpl implements Client {
     this.now = options.now ?? ((): bigint => BigInt(Date.now()));
     this.trust = new ResetTrust(options.resetTrust);
     this.circles = {
-      create: () => this.createCircle(),
-      requestJoin: (c, o, opts) => this.requestJoin(c, o, opts?.shareOnApproval ?? true),
-      approve: (c, n) => this.approve(c, n),
-      remove: (c, m) => this.changeMembership(c, { remove: m }),
-      leave: (c) => this.leave(c),
-      setEnabled: (c, e) => this.setEnabled(c, e),
-      closeCircle: (c) => this.closeCircle(c),
+      create: () => this.track("createCircle", () => this.createCircle()),
+      requestJoin: (c, o, opts) => this.track("requestJoin", () => this.requestJoin(c, o, opts?.shareOnApproval ?? true)),
+      approve: (c, n) => this.track("approve", () => this.approve(c, n)),
+      remove: (c, m) => this.track("changeMembership", () => this.changeMembership(c, { remove: m })),
+      leave: (c) => this.track("leave", () => this.leave(c)),
+      setEnabled: (c, e) => this.track("setEnabled", () => this.setEnabled(c, e)),
+      closeCircle: (c) => this.track("closeCircle", () => this.closeCircle(c)),
       list: () => this.listCircles()
     };
+    // The public operations that write go through `track`, so `close()` refuses new ones and
+    // waits for those in flight. Reads stay unguarded.
+    for (const name of ["enqueue", "receive", "initializeAccount", "restoreAccount", "prepareReplacement", "completeReplacement", "resetAccount", "replaceDevice"] as const) {
+      const method = (this[name] as (...args: unknown[]) => Promise<unknown>).bind(this);
+      (this as unknown as Record<string, unknown>)[name] = (...args: unknown[]) => this.track(name, () => method(...args));
+    }
   }
 
   // Loading ---------------------------------------------------------------------------------------
@@ -354,8 +436,18 @@ class ClientImpl implements Client {
     });
   }
 
-  /** Each listener on its own: a throwing subscriber affects neither the other listeners nor the protocol. */
+  /** Refuse after `close()`, and keep the operation's promise until it settles. */
+  private track<T>(stage: string, fn: () => Promise<T>): Promise<T> {
+    if (this.closed) return Promise.reject(new KavachError("CLOSED", stage, "the client is closed"));
+    const p = fn();
+    this.running.add(p);
+    void p.finally(() => this.running.delete(p)).catch(() => undefined);
+    return p;
+  }
+
+  /** Each listener on its own: a throwing subscriber affects neither the other listeners nor the protocol. Nothing after `close()`. */
   private emit(event: ClientEvent): void {
+    if (this.closed) return;
     for (const l of this.listeners) {
       try {
         l(event);
@@ -839,10 +931,78 @@ class ClientImpl implements Client {
 
   async sync(options: SyncOptions = {}): Promise<SyncReport> {
     if (this.syncing) return this.syncing;
-    this.syncing = this.runSync(options).finally(() => {
+    if (this.closed) throw new KavachError("CLOSED", "sync", "the client is closed");
+    this.syncing = this.track("sync", () => this.runSync(options)).finally(() => {
       this.syncing = undefined;
     });
     return this.syncing;
+  }
+
+  async syncUntilDrained(options: DrainOptions = {}): Promise<DrainReport> {
+    const maxRounds = Math.max(1, Math.floor(options.maxRounds ?? 10));
+    const deadline = this.now() + BigInt(Math.max(0, Math.floor(options.maxMs ?? 30_000)));
+    const merged: SyncReport = {
+      metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 },
+      epoch: "unchanged",
+      outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 },
+      inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false },
+      purged: 0,
+      errors: []
+    };
+    let rounds = 0;
+    let previousErrors: string | undefined;
+    let stop: DrainStop = "drained";
+    let last: SyncReport | undefined;
+    for (;;) {
+      if (this.closed) {
+        stop = "closed";
+        break;
+      }
+      const r = await this.sync(options.catchUp ? { catchUp: options.catchUp } : {});
+      rounds++;
+      last = r;
+      for (const k of Object.keys(merged.metadata) as (keyof SyncReport["metadata"])[]) merged.metadata[k] += r.metadata[k];
+      for (const k of Object.keys(merged.outbox) as (keyof SyncReport["outbox"])[]) merged.outbox[k] += r.outbox[k];
+      merged.inbox.streams += r.inbox.streams;
+      merged.inbox.stored += r.inbox.stored;
+      merged.inbox.keyPending += r.inbox.keyPending;
+      merged.inbox.invalid += r.inbox.invalid;
+      merged.inbox.acked += r.inbox.acked;
+      merged.purged += r.purged;
+      merged.epoch = r.epoch;
+      merged.errors.push(...r.errors);
+      if (r.bootstrap) merged.bootstrap = r.bootstrap;
+      const bootstrapIncomplete = (await this.inspect()).bootstrap?.complete === false;
+      const more = r.inbox.hasMore || bootstrapIncomplete;
+      const status = (await this.getState()).status;
+      if (status === "replacementPrepared" || status === "accountRecoveryRequired") {
+        stop = "authentication";
+        break;
+      }
+      if (!more) {
+        stop = "drained";
+        break;
+      }
+      const signature = r.errors.map((e) => `${e.operation}:${e.code}`).sort().join(",");
+      const changed = r.inbox.stored + r.metadata.certificates + r.metadata.snapshots + r.metadata.successions + (r.bootstrap?.circles ?? 0) + (r.bootstrap?.pending ?? 0) > 0;
+      if (!changed && signature !== "" && signature === previousErrors) {
+        stop = r.errors.some((e) => e.code === "METADATA_REQUIRED" || e.code === "RESET_KEYS_REQUIRED" || e.code === "RESET_CLOCK_UNTRUSTED") ? "metadata" : "noProgress";
+        break;
+      }
+      previousErrors = signature;
+      if (rounds >= maxRounds) {
+        stop = "maxRounds";
+        break;
+      }
+      if (this.now() >= deadline) {
+        stop = "maxMs";
+        break;
+      }
+    }
+    merged.inbox.hasMore = last?.inbox.hasMore ?? false;
+    const bootstrapIncomplete = (await this.inspect()).bootstrap?.complete === false;
+    const waitingFor = this.closed ? 0 : (await this.getState()).waitingFor.length;
+    return { ...merged, rounds, stoppedBecause: stop, remaining: { inboxHasMore: merged.inbox.hasMore, bootstrapIncomplete, waitingFor } };
   }
 
   private async runSync(options: SyncOptions): Promise<SyncReport> {
@@ -914,17 +1074,19 @@ class ClientImpl implements Client {
       report.errors.push(syncError("preference", e));
     }
     const after = await this.store.read((tx) => tx.get("meta", META));
-    if (after?.state === "RETIRED") return report;
+    if (after?.state === "RETIRED" || this.closed) return report;
     try {
       report.epoch = await this.ensureEpoch();
     } catch (e) {
       report.errors.push(syncError("epoch", e));
     }
+    if (this.closed) return report;
     try {
       report.outbox = await drain(this.outboxDeps());
     } catch (e) {
       report.errors.push(syncError("outbox", e));
     }
+    if (this.closed) return report;
     let subs: Awaited<ReturnType<Relay["listSubscriptions"]>> = [];
     try {
       subs = await this.transport.relay.listSubscriptions();
@@ -937,6 +1099,7 @@ class ClientImpl implements Client {
     const budget: ReadBudget = this.syncBudget;
     if (budget.remainingRecords < 1) budget.remainingRecords = 1; // every stream reads at least one page
     for (const s of subs) {
+      if (this.closed) return report;
       try {
         const known = await this.store.read((tx) => tx.list("certificates").some(([, c]) => c.streamId === toHex(s.streamId)));
         if (!known) continue;
@@ -2227,7 +2390,50 @@ class ClientImpl implements Client {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
+    // Everything in flight finishes its current transaction; a sync stops at its next boundary.
+    while (this.running.size > 0) await Promise.allSettled([...this.running]);
     this.listeners.clear();
+  }
+
+  // The replacement helper ------------------------------------------------------------------------
+
+  async replaceDevice(options: ReplaceDeviceOptions): Promise<ReplaceDeviceResult> {
+    const maxAttempts = Math.max(1, Math.floor(options.maxAttempts ?? 3));
+    const activated = (): ReplaceDeviceResult | undefined => (this.selfPin && this.account && !this.retired ? { status: "activated", identityId: this.selfPin.identityId, generation: this.selfPin.generation } : undefined);
+    const done = activated();
+    if (done) return done;
+    // A proposal left by an earlier run may have committed: the chain settles it before anything else.
+    const existing = await this.store.read((tx) => tx.get("replacement", "pending"));
+    if (existing && !existing.stale) {
+      await this.sync();
+      const settled = activated();
+      if (settled) return settled;
+    }
+    const proposal = await this.prepareReplacement();
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const authorization = await options.authorize(proposal);
+      if (authorization === "reauthenticate") return { status: "reauthenticate", proposal };
+      for (;;) {
+        try {
+          const r = await this.completeReplacement({ successionId: proposal.successionId, authorization });
+          return { status: "activated", identityId: r.identityId, generation: r.generation };
+        } catch (e) {
+          if (isKavachError(e, "SUCCESSION_PENDING")) {
+            // The same call again with the same bytes; the host answers a committed id first.
+            if (++attempt >= maxAttempts) return { status: "pending", proposal };
+            continue;
+          }
+          if (isKavachError(e, "AUTHORIZATION_REQUIRED")) break; // a fresh token for the same proposal
+          if (isKavachError(e, "REPLACEMENT_CONFLICT")) {
+            const conflict = (await this.inspect()).replacement;
+            return { status: "conflict", currentGeneration: conflict?.conflictGeneration };
+          }
+          throw e;
+        }
+      }
+    }
+    return { status: "pending", proposal };
   }
 }
 

@@ -113,3 +113,4 @@ export type { BackupState, ProviderLoadResult, ProviderSaveResult, ProviderStatu
 
 // The transactions an adapter test drives against a store -----------------------------------------
 export { openStore, t1Activate, t1Header, t1Secrets, t3ApplyChange, type ChangeResult, type OpenedState } from "../transactions.js";
+export { SECRET_NAMES } from "../store.js";

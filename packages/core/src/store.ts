@@ -19,6 +19,9 @@ export interface SecretStore {
 
 export type SecretName = "accountSeed" | "deviceSeed" | "recoveryKey" | "storageKey" | "instanceId" | "pendingReset" | "pendingReplacement";
 
+/** Every secret the SDK keeps for an account, in the order an erasure deletes them: the account's roots first, the storage key last, so an interrupted erasure leaves a store that refuses to open rather than one that re-enrolls under old roots. */
+export const SECRET_NAMES: readonly SecretName[] = ["accountSeed", "deviceSeed", "recoveryKey", "instanceId", "pendingReset", "pendingReplacement", "storageKey"];
+
 // Logical tables. Rows are JSON-safe: bytes as hex strings, u64 as decimal strings.
 
 export type StoreState = "INITIALIZING" | "ACTIVE" | "ACTIVATION_PENDING" | "RETIRED";

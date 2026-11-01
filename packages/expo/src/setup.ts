@@ -5,13 +5,15 @@
  * adapters stay exported for apps that need a different arrangement.
  */
 import { KavachError, open, type Client, type ClientEvent, type RecoveryProvider, type ResetTrustConfig, type RetentionPolicy } from "@plane31/blind-relay";
-import { randomBytes, type SecretStore, type Transport } from "@plane31/blind-relay/adapters";
+import { SECRET_NAMES, randomBytes, type SecretStore, type Transport } from "@plane31/blind-relay/adapters";
 import { ExpoSecretStore, type SecureStoreLike } from "./secretStore.js";
 import { SqliteStore, expoSqliteDriver, type ExpoSqliteDatabaseLike, type SqlDriver } from "./sqliteStore.js";
 
 /** The subset of `expo-sqlite` the helper uses. */
 export interface ExpoSqliteLike {
   openDatabaseSync(name: string, options?: { useNewConnection?: boolean }): ExpoSqliteDatabaseLike;
+  /** Delete a database file and its journal; `eraseKavach` needs it. */
+  deleteDatabaseSync?(name: string): void;
 }
 
 export interface KavachSetupOptions {
@@ -69,6 +71,18 @@ export interface KavachSetup {
   readonly secretStore: SecretStore;
   /** The database file to exclude from backups, with its `-wal` and `-shm` companions. */
   readonly databaseFileName: string;
+  /** Close the client (operations in flight finish, nothing is emitted afterwards), then the database connection this call opened. Idempotent. */
+  close(): Promise<void>;
+}
+
+export interface KavachEraseOptions {
+  readonly accountName: string;
+  readonly secrets: KavachSetupOptions["secrets"];
+  /** `expo-sqlite` (its `deleteDatabaseSync` removes the file), or the test driver factory with `deleteDatabase` beside it. */
+  readonly database: ExpoSqliteLike | ((fileName: string) => SqlDriver);
+  /** With a driver factory: how to remove the database file and its `-wal` and `-shm` companions. */
+  readonly deleteDatabase?: (fileName: string) => void;
+  readonly namespace?: string;
 }
 
 const NAME_RULE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -133,5 +147,39 @@ export async function openKavach(options: KavachSetupOptions): Promise<KavachSet
     ...(options.now ? { now: options.now } : {}),
     ...(options.onListenerError ? { onListenerError: options.onListenerError } : {})
   });
-  return { client, store, secretStore, databaseFileName: fileName };
+  let closed: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    closed ??= (async () => {
+      await client.close();
+      await store.close();
+    })();
+    return closed;
+  };
+  return { client, store, secretStore, databaseFileName: fileName, close };
+}
+
+/**
+ * Erase one account from this device: every secret the SDK keeps for it, then its database with
+ * the journal files. Close the account's `KavachSetup` first; this touches nothing it did not
+ * open and nothing of another account, and never the platform's synced recovery item. The
+ * account's roots go first and the storage key last, so an erasure interrupted halfway leaves a
+ * database that refuses to open (`RECOVERY_REQUIRED`) rather than secrets that would re-enroll
+ * under old roots; running it again finishes it. Idempotent.
+ */
+export async function eraseKavach(options: KavachEraseOptions): Promise<void> {
+  const namespace = options.namespace ?? "kavach";
+  const fileName = databaseFileName(options.accountName, namespace);
+  const secretStore =
+    "secureStore" in options.secrets
+      ? new ExpoSecretStore(options.secrets.secureStore, { thisDeviceOnly: options.secrets.thisDeviceOnly, namespace: `${namespace}.${options.accountName}`, ...(options.secrets.keychainService ? { keychainService: options.secrets.keychainService } : {}) })
+      : options.secrets;
+  for (const name of SECRET_NAMES) await secretStore.delete(name);
+  const database = options.database;
+  const remove = typeof database === "function" ? options.deleteDatabase : database.deleteDatabaseSync ? (name: string) => database.deleteDatabaseSync?.(name) : undefined;
+  if (!remove) throw new KavachError("MALFORMED", "eraseKavach", "no way to delete the database: pass expo-sqlite, or deleteDatabase with a driver factory");
+  try {
+    remove(fileName);
+  } catch {
+    /* already gone */
+  }
 }

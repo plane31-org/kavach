@@ -49,6 +49,7 @@ export type ErrorCode =
   | "STALE_APPEND"
   // Storage and transport
   | "LOCKED"
+  | "CLOSED"
   | "RECOVERY_REQUIRED"
   | "STORAGE_FAILURE"
   /** The host could not be reached or did not answer in time; the same call may succeed later. A transport raises it, never a plain error. */
