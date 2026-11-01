@@ -12,6 +12,10 @@ One row per kind the product uses, as declared in the retention policy passed to
 
 For each kind: the payload codec (byte layout, version byte, bounds, what it must never carry), how the product sends it (`enqueue(kind, payload, { eventTime, idempotencyKey })`) and how it reads it (`newest(identityId, kind)`, `historyPage`), and how the product answers `recordStored` and `refresh`.
 
+## 1a. Replacement model
+
+Which replacement models the product enables, `continuity`, `recovery` or `both` (amendment A1 while it is a draft; section 4 once adopted), and the resulting promise in one sentence; where the authority key is custodied and how fresh authentication is enforced before it signs, when `recovery` or `both` is enabled; and the product's record of amendment decisions D1 to D5. These are the product's decisions and live here, never in the SDK.
+
 ## 2. Notifications by header class
 
 For each header class the kinds use: visible push, silent wake-up, or nothing; the wording of a visible push, which never carries content; and the join-request notification to an owner.

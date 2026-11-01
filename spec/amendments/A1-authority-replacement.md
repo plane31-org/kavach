@@ -1,6 +1,6 @@
 # Amendment A1: account replacement authorized by the host's signing authority
 
-Status: **draft, revision 5, not adopted; the fourth review approves the design for implementation once a product records D1 to D5**. Nothing in the SDK, the hosts or the fixture implements it. Revisions 2 to 5 answer the four reviews in turn; section 10 lists every change. Approval of the design is not the trust choice: a product still records D1 to D5, and `replacement` is `continuity`, `recovery` or `both` by its decision alone. It proposes protocol revision 9 on wire version 5. Section numbers refer to `spec/Kavach-v1.md` at revision 8. Where this document and the specification disagree today, the specification wins; if the amendment is adopted, its text replaces the sections it names.
+Status: **draft, revision 5, not adopted; the fourth review approves the design for implementation once a product records D1 to D5 in its own profile**. Nothing in the SDK, the hosts or the fixture implements it. Revisions 2 to 5 answer the four reviews in turn; section 10 lists every change. Approval of the design is not the trust choice: each product records D1 to D5 in its implementation profile, which lives in the product's repository and never in the SDK's, and `replacement` is `continuity`, `recovery` or `both` by its decision alone. The SDK implements every model a profile may choose and holds no product's choice. It proposes protocol revision 9 on wire version 5. Section numbers refer to `spec/Kavach-v1.md` at revision 8. Where this document and the specification disagree today, the specification wins; if the amendment is adopted, its text replaces the sections it names.
 
 ## 0. What this changes, in one paragraph
 
@@ -162,7 +162,7 @@ Wire version stays 5; every existing vector stays byte for byte. Added: a type 9
 
 ## 9. Delivery, if adopted
 
-1. This amendment reviewed by the external reviewer, and D1 to D5 recorded, before code.
+1. This amendment reviewed by the external reviewer before code. A product records D1 to D5 in its own profile before it enables the feature; the SDK's implementation does not wait for any product's decisions, since it must support every model.
 2. Core: `accountId` through pins, snapshots, audience and manifests; the type 9 codec and verifier; the chain store; T11 and the two client operations; the sync-report bootstrap section. Fixture regenerated with the added vectors only.
 3. Hosts: fake host and the reference Worker: `succeedAccount`, the succession log, `getSuccessions`, `listCircles`, preferences, fencing of retired identities.
 4. Expo: nothing new beyond the client surface; the profile template gains a section on which path a product enables and how it custodies the authority key.
