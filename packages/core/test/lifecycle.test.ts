@@ -105,6 +105,26 @@ describe("second review of 0.3.0", () => {
     expect([r.stoppedBecause, r.remaining.inboxHasMore]).toEqual(["closed", "unknown"]);
   });
 
+  it("1b: a close mid-round keeps the round's counters and errors in the report", async () => {
+    const w = world();
+    const { a, b } = await pair(w);
+    await enqueueLocation(b.client, w.loc(3));
+    await w.sync(b);
+    await enqueueLocation(a.client, w.loc(2)); // handed off now; the round's outbox phase settles it as accepted
+    // The round's acknowledgement of Bob's record is held while close() lands, so the round ends
+    // inside its inbox phase. What its outbox settled must still be in the report.
+    let release: () => void = () => undefined;
+    a.t.knobs.hold.set("ackThrough", new Promise<void>((res) => (release = res)));
+    const drain = a.client.syncUntilDrained();
+    await new Promise((r) => setTimeout(r, 20));
+    const closing = a.client.close();
+    release();
+    await closing;
+    const r = await drain;
+    expect([r.stoppedBecause, r.outbox.accepted, r.rounds, r.remaining.inboxHasMore]).toEqual(["closed", 1, 1, "unknown"]);
+    expect(w.host.appendLog.filter((x) => x.status === "ACCEPTED").length).toBeGreaterThanOrEqual(2);
+  });
+
   it("2: an unfinished chain is remaining work, and its pages advancing is progress", async () => {
     const w = world();
     const { a, bobId } = await pair(w);

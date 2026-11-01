@@ -1013,11 +1013,8 @@ class ClientImpl implements Client {
       const r = await this.sync({ catchUp: { maxMs: roundMs, ...(options.catchUp?.maxRecords !== undefined ? { maxRecords: options.catchUp.maxRecords } : {}) } });
       rounds++;
       last = r;
-      if (this.closed) {
-        // The round may have stopped at a boundary before its inbox: nothing it reports is complete.
-        stop = "closed";
-        break;
-      }
+      // The round's work counts whether or not it was the last: what it accepted, stored and failed
+      // is merged first, and only then is a close that landed meanwhile reported.
       for (const k of Object.keys(merged.metadata) as (keyof SyncReport["metadata"])[]) merged.metadata[k] += r.metadata[k];
       for (const k of Object.keys(merged.outbox) as (keyof SyncReport["outbox"])[]) merged.outbox[k] += r.outbox[k];
       merged.inbox.streams += r.inbox.streams;
@@ -1029,6 +1026,11 @@ class ClientImpl implements Client {
       merged.epoch = r.epoch;
       merged.errors.push(...r.errors);
       if (r.bootstrap) merged.bootstrap = r.bootstrap;
+      if (this.closed) {
+        // The round may have stopped at a boundary before its inbox: nothing it reports is complete.
+        stop = "closed";
+        break;
+      }
       const bootstrapIncomplete = (await this.inspect()).bootstrap?.complete === false;
       const currentChains = await chains();
       const more = r.inbox.hasMore || bootstrapIncomplete || currentChains.size > 0;
