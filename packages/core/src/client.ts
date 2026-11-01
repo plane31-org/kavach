@@ -252,6 +252,8 @@ export type DrainStop =
   | "metadata"
   /** Progress needs an authorization or a sign-in (a prepared replacement, an account to recover). */
   | "authentication"
+  /** Nothing more is reported, but a round could not read its inbox fully (discovery or a stream failed), so emptiness is not established. */
+  | "incomplete"
   | "closed";
 
 /** The merged report of every round, with why the loop stopped and what remains. */
@@ -259,8 +261,8 @@ export interface DrainReport extends SyncReport {
   readonly rounds: number;
   readonly stoppedBecause: DrainStop;
   readonly remaining: {
-    /** The relay still holds records this device has not read. */
-    readonly inboxHasMore: boolean;
+    /** The relay still holds records this device has not read; `"unknown"` when the last round could not read its inbox fully. */
+    readonly inboxHasMore: boolean | "unknown";
     /** Bootstrap after account recovery has circles left to adopt. */
     readonly bootstrapIncomplete: boolean;
     /** Authors whose current epoch has not reached this device: nothing to do but wait for them. */
@@ -394,12 +396,45 @@ class ClientImpl implements Client {
       closeCircle: (c) => this.track("closeCircle", () => this.closeCircle(c)),
       list: () => this.listCircles()
     };
-    // The public operations that write go through `track`, so `close()` refuses new ones and
-    // waits for those in flight. Reads stay unguarded.
-    for (const name of ["enqueue", "receive", "initializeAccount", "restoreAccount", "prepareReplacement", "completeReplacement", "resetAccount", "replaceDevice"] as const) {
-      const method = (this[name] as (...args: unknown[]) => Promise<unknown>).bind(this);
-      (this as unknown as Record<string, unknown>)[name] = (...args: unknown[]) => this.track(name, () => method(...args));
-    }
+  }
+
+  // Every public operation that writes enters through `track`, explicitly and typed, so `close()`
+  // refuses new ones and waits for those in flight. Reads stay untracked.
+
+  initializeAccount(): Promise<{ identityId: Uint8Array }> {
+    return this.track("initializeAccount", () => this.initializeAccountNow());
+  }
+
+  restoreAccount(recoveryCode?: string): Promise<{ identityId: Uint8Array; generation: bigint }> {
+    return this.track("restoreAccount", () => this.restoreAccountNow(recoveryCode));
+  }
+
+  enqueue(kind: RecordKind, payload: Uint8Array, options: EnqueueOptions = {}): Promise<EnqueueResult> {
+    return this.track("enqueue", () => this.enqueueNow(kind, payload, options));
+  }
+
+  receive(wire: Uint8Array): Promise<ReceiveResult> {
+    return this.track("receive", () => receiveRecord(this.inboxDeps(), wire));
+  }
+
+  prepareReplacement(): Promise<ReplacementProposal> {
+    return this.track("prepareReplacement", () => this.prepareReplacementNow());
+  }
+
+  completeReplacement(input: { successionId: Uint8Array; authorization: Uint8Array }): Promise<{ identityId: Uint8Array; generation: bigint }> {
+    return this.track("completeReplacement", () => this.completeReplacementNow(input));
+  }
+
+  resetAccount(options: { confirmed: true; reauthProof?: Uint8Array }): Promise<{ identityId: Uint8Array }> {
+    return this.track("resetAccount", () => this.resetAccountNow(options));
+  }
+
+  replaceDevice(options: ReplaceDeviceOptions): Promise<ReplaceDeviceResult> {
+    return this.track("replaceDevice", () => this.replaceDeviceNow(options));
+  }
+
+  syncUntilDrained(options: DrainOptions = {}): Promise<DrainReport> {
+    return this.track("syncUntilDrained", () => this.drainNow(options));
   }
 
   // Loading ---------------------------------------------------------------------------------------
@@ -581,7 +616,7 @@ class ClientImpl implements Client {
 
   // Enrollment ------------------------------------------------------------------------------------
 
-  async initializeAccount(): Promise<{ identityId: Uint8Array }> {
+  private async initializeAccountNow(): Promise<{ identityId: Uint8Array }> {
     const stage = "initializeAccount";
     const opened = await openStore(this.store, this.secrets, this.accountName);
     if (opened.kind !== "fresh" && opened.kind !== "initializing") throw new KavachError("MALFORMED", stage, "an account already exists on this device");
@@ -643,7 +678,7 @@ class ClientImpl implements Client {
     return encodeRecoveryCode(key);
   }
 
-  async restoreAccount(recoveryCode?: string): Promise<{ identityId: Uint8Array; generation: bigint }> {
+  private async restoreAccountNow(recoveryCode?: string): Promise<{ identityId: Uint8Array; generation: bigint }> {
     const stage = "restoreAccount";
     const opened = await openStore(this.store, this.secrets, this.accountName);
     if (opened.kind === "ACTIVE" || opened.kind === "RETIRED") throw new KavachError("MALFORMED", stage, "an account already exists on this device");
@@ -812,7 +847,7 @@ class ClientImpl implements Client {
 
   // Sending ---------------------------------------------------------------------------------------
 
-  async enqueue(kind: RecordKind, payload: Uint8Array, options: EnqueueOptions = {}): Promise<EnqueueResult> {
+  private async enqueueNow(kind: RecordKind, payload: Uint8Array, options: EnqueueOptions): Promise<EnqueueResult> {
     const deps = this.outboxDeps();
     // A key answered before anything that may need the network: the record it names is already
     // durable, so a retry offline, or with a rotation due, returns it. The outbox checks the key
@@ -938,9 +973,10 @@ class ClientImpl implements Client {
     return this.syncing;
   }
 
-  async syncUntilDrained(options: DrainOptions = {}): Promise<DrainReport> {
+  private async drainNow(options: DrainOptions): Promise<DrainReport> {
     const maxRounds = Math.max(1, Math.floor(options.maxRounds ?? 10));
-    const deadline = this.now() + BigInt(Math.max(0, Math.floor(options.maxMs ?? 30_000)));
+    const maxMs = Math.max(0, Math.floor(options.maxMs ?? 30_000));
+    const deadline = this.now() + BigInt(maxMs);
     const merged: SyncReport = {
       metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 },
       epoch: "unchanged",
@@ -953,12 +989,23 @@ class ClientImpl implements Client {
     let previousErrors: string | undefined;
     let stop: DrainStop = "drained";
     let last: SyncReport | undefined;
+    // An inbox this device could not fully read this round: discovery or a stream failed, or metadata it
+    // depends on did. Such a round never establishes that the inbox is empty.
+    const inboxUncertain = (r: SyncReport): boolean => r.errors.some((e) => e.operation === "listSubscriptions" || e.operation === "inbox" || e.operation === "metadata");
     for (;;) {
       if (this.closed) {
         stop = "closed";
         break;
       }
-      const r = await this.sync(options.catchUp ? { catchUp: options.catchUp } : {});
+      // The time left is this round's reading budget too, so a round never starts work the deadline
+      // does not cover; a transport call already in flight ends on its own timeout.
+      const remainingMs = Number(deadline - this.now());
+      if (rounds > 0 && remainingMs <= 0) {
+        stop = "maxMs";
+        break;
+      }
+      const roundMs = Math.max(0, Math.min(remainingMs, options.catchUp?.maxMs ?? DEFAULT_CATCH_UP.maxMs));
+      const r = await this.sync({ catchUp: { maxMs: roundMs, ...(options.catchUp?.maxRecords !== undefined ? { maxRecords: options.catchUp.maxRecords } : {}) } });
       rounds++;
       last = r;
       for (const k of Object.keys(merged.metadata) as (keyof SyncReport["metadata"])[]) merged.metadata[k] += r.metadata[k];
@@ -980,7 +1027,7 @@ class ClientImpl implements Client {
         break;
       }
       if (!more) {
-        stop = "drained";
+        stop = inboxUncertain(r) ? "incomplete" : "drained";
         break;
       }
       const signature = r.errors.map((e) => `${e.operation}:${e.code}`).sort().join(",");
@@ -1000,9 +1047,10 @@ class ClientImpl implements Client {
       }
     }
     merged.inbox.hasMore = last?.inbox.hasMore ?? false;
-    const bootstrapIncomplete = (await this.inspect()).bootstrap?.complete === false;
+    const bootstrapIncomplete = this.closed ? false : (await this.inspect()).bootstrap?.complete === false;
     const waitingFor = this.closed ? 0 : (await this.getState()).waitingFor.length;
-    return { ...merged, rounds, stoppedBecause: stop, remaining: { inboxHasMore: merged.inbox.hasMore, bootstrapIncomplete, waitingFor } };
+    const inboxHasMore = !last || inboxUncertain(last) || stop === "closed" ? "unknown" : merged.inbox.hasMore;
+    return { ...merged, rounds, stoppedBecause: stop, remaining: { inboxHasMore, bootstrapIncomplete, waitingFor } };
   }
 
   private async runSync(options: SyncOptions): Promise<SyncReport> {
@@ -1643,10 +1691,6 @@ class ClientImpl implements Client {
 
   // Receiving and reads ---------------------------------------------------------------------------
 
-  receive(wire: Uint8Array): Promise<ReceiveResult> {
-    return receiveRecord(this.inboxDeps(), wire);
-  }
-
   history(query?: HistoryQuery): Promise<HistoryEntry[]> {
     return history(this.store, this.policy, query);
   }
@@ -2011,7 +2055,7 @@ class ClientImpl implements Client {
 
   // Account recovery (amendment A1) ---------------------------------------------------------------
 
-  async prepareReplacement(): Promise<ReplacementProposal> {
+  private async prepareReplacementNow(): Promise<ReplacementProposal> {
     const stage = "prepareReplacement";
     if (!acceptsSuccession(this.policy)) throw new KavachError("NOT_AUTHORIZED", stage, "this deployment does not use account recovery");
     const opened = await openStore(this.store, this.secrets, this.accountName);
@@ -2056,7 +2100,7 @@ class ClientImpl implements Client {
     return proposalOf(row);
   }
 
-  async completeReplacement(input: { successionId: Uint8Array; authorization: Uint8Array }): Promise<{ identityId: Uint8Array; generation: bigint }> {
+  private async completeReplacementNow(input: { successionId: Uint8Array; authorization: Uint8Array }): Promise<{ identityId: Uint8Array; generation: bigint }> {
     const stage = "completeReplacement";
     // Already activated (by an earlier call, or by a sync that found the commit on the chain): idempotent.
     if (this.selfPin && this.account && !this.retired) return { identityId: this.selfPin.identityId, generation: this.selfPin.generation };
@@ -2306,7 +2350,7 @@ class ClientImpl implements Client {
 
   // Reset -----------------------------------------------------------------------------------------
 
-  async resetAccount(options: { confirmed: true; reauthProof?: Uint8Array }): Promise<{ identityId: Uint8Array }> {
+  private async resetAccountNow(options: { confirmed: true; reauthProof?: Uint8Array }): Promise<{ identityId: Uint8Array }> {
     const stage = "resetAccount";
     if (!options.confirmed) throw new KavachError("NOT_AUTHORIZED", stage, "reset requires confirmation");
     const { pin } = this.requireAccount(stage);
@@ -2398,7 +2442,7 @@ class ClientImpl implements Client {
 
   // The replacement helper ------------------------------------------------------------------------
 
-  async replaceDevice(options: ReplaceDeviceOptions): Promise<ReplaceDeviceResult> {
+  private async replaceDeviceNow(options: ReplaceDeviceOptions): Promise<ReplaceDeviceResult> {
     const maxAttempts = Math.max(1, Math.floor(options.maxAttempts ?? 3));
     const activated = (): ReplaceDeviceResult | undefined => (this.selfPin && this.account && !this.retired ? { status: "activated", identityId: this.selfPin.identityId, generation: this.selfPin.generation } : undefined);
     const done = activated();
@@ -2410,13 +2454,13 @@ class ClientImpl implements Client {
       const settled = activated();
       if (settled) return settled;
     }
-    const proposal = await this.prepareReplacement();
+    const proposal = await this.prepareReplacementNow();
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const authorization = await options.authorize(proposal);
       if (authorization === "reauthenticate") return { status: "reauthenticate", proposal };
       for (;;) {
         try {
-          const r = await this.completeReplacement({ successionId: proposal.successionId, authorization });
+          const r = await this.completeReplacementNow({ successionId: proposal.successionId, authorization });
           return { status: "activated", identityId: r.identityId, generation: r.generation };
         } catch (e) {
           if (isKavachError(e, "SUCCESSION_PENDING")) {

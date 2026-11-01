@@ -173,13 +173,23 @@ export async function eraseKavach(options: KavachEraseOptions): Promise<void> {
     "secureStore" in options.secrets
       ? new ExpoSecretStore(options.secrets.secureStore, { thisDeviceOnly: options.secrets.thisDeviceOnly, namespace: `${namespace}.${options.accountName}`, ...(options.secrets.keychainService ? { keychainService: options.secrets.keychainService } : {}) })
       : options.secrets;
-  for (const name of SECRET_NAMES) await secretStore.delete(name);
+  // The capability first, before anything is deleted: an erasure that cannot finish must not start.
   const database = options.database;
   const remove = typeof database === "function" ? options.deleteDatabase : database.deleteDatabaseSync ? (name: string) => database.deleteDatabaseSync?.(name) : undefined;
   if (!remove) throw new KavachError("MALFORMED", "eraseKavach", "no way to delete the database: pass expo-sqlite, or deleteDatabase with a driver factory");
+  for (const name of SECRET_NAMES) await secretStore.delete(name);
   try {
     remove(fileName);
-  } catch {
-    /* already gone */
+  } catch (e) {
+    // Only a file that is already gone is success. Anything else (permissions, a busy file) is
+    // reported; the secrets are gone, the database stays unreadable, and running this again finishes.
+    if (isMissingFile(e)) return;
+    throw new KavachError("STORAGE_FAILURE", "eraseKavach", `the database could not be deleted (${e instanceof Error ? e.message : String(e)}); run eraseKavach again`);
   }
+}
+
+function isMissingFile(e: unknown): boolean {
+  const code = typeof e === "object" && e !== null && "code" in e ? String((e as { code: unknown }).code) : "";
+  const message = e instanceof Error ? e.message : String(e);
+  return code === "ENOENT" || /no such file|not found|does not exist|doesn't exist/i.test(message);
 }

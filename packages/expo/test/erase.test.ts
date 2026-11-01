@@ -81,7 +81,34 @@ describe("eraseKavach", () => {
     await fresh.close();
   });
 
-  it("refuses to erase when it has no way to delete the database", async () => {
-    await expect(eraseKavach({ accountName: "alice", secrets: new MemorySecretStore(), database: () => ({ exec() {}, run() {}, all: () => [] }) as SqlDriver })).rejects.toMatchObject({ code: "MALFORMED" });
+  it("refuses to erase when it has no way to delete the database, before touching any secret", async () => {
+    const secrets = new MemorySecretStore();
+    await secrets.set("accountSeed", new Uint8Array(32));
+    await expect(eraseKavach({ accountName: "alice", secrets, database: () => ({ exec() {}, run() {}, all: () => [] }) as SqlDriver })).rejects.toMatchObject({ code: "MALFORMED" });
+    expect(await secrets.get("accountSeed")).toBeDefined();
+  });
+
+  it("reports a deletion that failed for any reason but a missing file, and a second run finishes", async () => {
+    const w = world();
+    const dir = mkdtempSync(join(tmpdir(), "kavach-erase-"));
+    const secrets = new MemorySecretStore();
+    const open = () => openKavach({ accountName: "alice", transport: w.transport("alice"), retentionPolicy: { ...testPolicy, replacement: "recovery" }, resetTrust: w.resetTrust, secrets, database: files(dir), context: "foreground", now: w.clock.now });
+    const s = await open();
+    await s.client.initializeAccount();
+    await s.close();
+    const denied = () => {
+      throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+    };
+    await expect(eraseKavach({ accountName: "alice", secrets, database: files(dir), deleteDatabase: denied })).rejects.toMatchObject({ code: "STORAGE_FAILURE" });
+    expect(existsSync(join(dir, databaseFileName("alice")))).toBe(true);
+    const gone = () => {
+      throw Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" });
+    };
+    await expect(eraseKavach({ accountName: "bob", secrets: new MemorySecretStore(), database: files(dir), deleteDatabase: gone })).resolves.toBeUndefined();
+    await eraseKavach({ accountName: "alice", secrets, database: files(dir), deleteDatabase: deleteFiles(dir) });
+    expect(existsSync(join(dir, databaseFileName("alice")))).toBe(false);
+    const fresh = await open();
+    expect((await fresh.client.getState()).status).toBe("fresh");
+    await fresh.close();
   });
 });

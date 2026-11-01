@@ -47,6 +47,51 @@ describe("close()", () => {
   });
 });
 
+describe("review of 0.3.0", () => {
+  it("2: close() waits for the whole drain; no store read follows its return", async () => {
+    const w = world();
+    const { a, b } = await pair(w);
+    for (let i = 0; i < 250; i++) await enqueueLocation(a.client, w.loc(i % 90));
+    await w.sync(a);
+    const drain = b.client.syncUntilDrained({ catchUp: { maxRecords: 100, maxMs: 5000 }, maxRounds: 10 });
+    await new Promise((r) => setTimeout(r, 5));
+    await b.client.close();
+    let readsAfterClose = 0;
+    const read = b.store.read.bind(b.store);
+    b.store.read = ((fn: Parameters<typeof read>[0]) => {
+      readsAfterClose++;
+      return read(fn);
+    }) as typeof read;
+    const r = await drain;
+    // close() returned only after the drain settled: either it ran to its end first, or it stopped as closed.
+    expect(readsAfterClose).toBe(0);
+    expect(["closed", "drained"]).toContain(r.stoppedBecause);
+  });
+
+  it("3: maxMs bounds the rounds and the reading inside them", async () => {
+    const w = world();
+    const { a, b } = await pair(w);
+    for (let i = 0; i < 250; i++) await enqueueLocation(a.client, w.loc(i % 90));
+    await w.sync(a);
+    // No time at all: one round, whose inbox budget expires after its first page, then maxMs.
+    const r = await b.client.syncUntilDrained({ catchUp: { maxRecords: 100 }, maxMs: 0 });
+    expect([r.stoppedBecause, r.rounds, r.remaining.inboxHasMore]).toEqual(["maxMs", 1, true]);
+  });
+
+  it("4: a round whose discovery failed is incomplete, never drained", async () => {
+    const w = world();
+    const { a, b } = await pair(w);
+    for (let i = 0; i < 3; i++) await enqueueLocation(a.client, w.loc(i));
+    await w.sync(a);
+    b.t.knobs.withhold.add("subscriptions");
+    const r = await b.client.syncUntilDrained();
+    expect([r.stoppedBecause, r.remaining.inboxHasMore, r.errors.map((e) => e.operation)]).toEqual(["incomplete", "unknown", ["listSubscriptions"]]);
+    b.t.knobs.withhold.delete("subscriptions");
+    const ok = await b.client.syncUntilDrained();
+    expect([ok.stoppedBecause, ok.remaining.inboxHasMore, ok.inbox.stored]).toEqual(["drained", false, 3]);
+  });
+});
+
 describe("syncUntilDrained", () => {
   it("drains a backlog larger than one budget in one call and reports the rounds", async () => {
     const w = world();

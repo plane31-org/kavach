@@ -112,7 +112,7 @@ export interface MaliciousKnobs {
   /** Mutations whose next response waits for the given promise after the host committed (consumed once). */
   readonly hold: Map<MutationName, Promise<void>>;
   /** Reads that answer "nothing" while present. */
-  readonly withhold: Set<"snapshots" | "epochs" | "records" | "requests" | "currentEpoch" | "keyList" | "certificates" | "successions" | "circleList">;
+  readonly withhold: Set<"snapshots" | "epochs" | "records" | "requests" | "currentEpoch" | "keyList" | "certificates" | "successions" | "circleList" | "subscriptions">;
   /** Older documents served instead of the current ones. */
   readonly replay: {
     vault?: Uint8Array;
@@ -328,6 +328,7 @@ export class MaliciousTransport implements Transport {
       ackThrough: (streamId, cursor) => this.mutate("ackThrough", () => r().ackThrough(streamId, cursor)),
       listSubscriptions: async () => {
         this.calls.push("listSubscriptions");
+        if (k.withhold.has("subscriptions")) throw new KavachError("NETWORK", "transport", "network unreachable");
         return r().listSubscriptions();
       }
     };
