@@ -237,7 +237,7 @@ export interface DrainOptions {
   readonly catchUp?: SyncOptions["catchUp"];
   /** Rounds at most. Default 10. */
   readonly maxRounds?: number;
-  /** Milliseconds at most across every round. Default 30,000. */
+  /** A soft bound in milliseconds across every round: no round starts past it and each round's reading budget is the time left, but a transport call already in flight ends on its own timeout. Default 30,000. */
   readonly maxMs?: number;
 }
 
@@ -265,6 +265,8 @@ export interface DrainReport extends SyncReport {
     readonly inboxHasMore: boolean | "unknown";
     /** Bootstrap after account recovery has circles left to adopt. */
     readonly bootstrapIncomplete: boolean;
+    /** Contacts whose succession chain this device has verified only partly; the next rounds continue them. */
+    readonly chainsIncomplete: number;
     /** Authors whose current epoch has not reached this device: nothing to do but wait for them. */
     readonly waitingFor: number;
   };
@@ -992,6 +994,9 @@ class ClientImpl implements Client {
     // An inbox this device could not fully read this round: discovery or a stream failed, or metadata it
     // depends on did. Such a round never establishes that the inbox is empty.
     const inboxUncertain = (r: SyncReport): boolean => r.errors.some((e) => e.operation === "listSubscriptions" || e.operation === "inbox" || e.operation === "metadata");
+    // Chains verified only partly: remaining work, and their cursors moving is progress.
+    const chains = (): Promise<Map<string, string>> => this.store.read((tx) => new Map(tx.list("chainProgress").filter(([, c]) => !c.complete).map(([k, c]) => [k, c.nextGeneration])));
+    let previousChains = await chains();
     for (;;) {
       if (this.closed) {
         stop = "closed";
@@ -1008,6 +1013,11 @@ class ClientImpl implements Client {
       const r = await this.sync({ catchUp: { maxMs: roundMs, ...(options.catchUp?.maxRecords !== undefined ? { maxRecords: options.catchUp.maxRecords } : {}) } });
       rounds++;
       last = r;
+      if (this.closed) {
+        // The round may have stopped at a boundary before its inbox: nothing it reports is complete.
+        stop = "closed";
+        break;
+      }
       for (const k of Object.keys(merged.metadata) as (keyof SyncReport["metadata"])[]) merged.metadata[k] += r.metadata[k];
       for (const k of Object.keys(merged.outbox) as (keyof SyncReport["outbox"])[]) merged.outbox[k] += r.outbox[k];
       merged.inbox.streams += r.inbox.streams;
@@ -1020,7 +1030,8 @@ class ClientImpl implements Client {
       merged.errors.push(...r.errors);
       if (r.bootstrap) merged.bootstrap = r.bootstrap;
       const bootstrapIncomplete = (await this.inspect()).bootstrap?.complete === false;
-      const more = r.inbox.hasMore || bootstrapIncomplete;
+      const currentChains = await chains();
+      const more = r.inbox.hasMore || bootstrapIncomplete || currentChains.size > 0;
       const status = (await this.getState()).status;
       if (status === "replacementPrepared" || status === "accountRecoveryRequired") {
         stop = "authentication";
@@ -1031,7 +1042,9 @@ class ClientImpl implements Client {
         break;
       }
       const signature = r.errors.map((e) => `${e.operation}:${e.code}`).sort().join(",");
-      const changed = r.inbox.stored + r.metadata.certificates + r.metadata.snapshots + r.metadata.successions + (r.bootstrap?.circles ?? 0) + (r.bootstrap?.pending ?? 0) > 0;
+      const chainsAdvanced = [...currentChains].some(([k, next]) => previousChains.get(k) !== next) || [...previousChains.keys()].some((k) => !currentChains.has(k));
+      previousChains = currentChains;
+      const changed = chainsAdvanced || r.inbox.stored + r.metadata.certificates + r.metadata.snapshots + r.metadata.successions + (r.bootstrap?.circles ?? 0) + (r.bootstrap?.pending ?? 0) > 0;
       if (!changed && signature !== "" && signature === previousErrors) {
         stop = r.errors.some((e) => e.code === "METADATA_REQUIRED" || e.code === "RESET_KEYS_REQUIRED" || e.code === "RESET_CLOCK_UNTRUSTED") ? "metadata" : "noProgress";
         break;
@@ -1048,9 +1061,10 @@ class ClientImpl implements Client {
     }
     merged.inbox.hasMore = last?.inbox.hasMore ?? false;
     const bootstrapIncomplete = this.closed ? false : (await this.inspect()).bootstrap?.complete === false;
+    const chainsIncomplete = this.closed ? previousChains.size : (await chains()).size;
     const waitingFor = this.closed ? 0 : (await this.getState()).waitingFor.length;
     const inboxHasMore = !last || inboxUncertain(last) || stop === "closed" ? "unknown" : merged.inbox.hasMore;
-    return { ...merged, rounds, stoppedBecause: stop, remaining: { inboxHasMore, bootstrapIncomplete, waitingFor } };
+    return { ...merged, rounds, stoppedBecause: stop, remaining: { inboxHasMore, bootstrapIncomplete, chainsIncomplete, waitingFor } };
   }
 
   private async runSync(options: SyncOptions): Promise<SyncReport> {

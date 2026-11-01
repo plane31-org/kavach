@@ -92,6 +92,38 @@ describe("review of 0.3.0", () => {
   });
 });
 
+describe("second review of 0.3.0", () => {
+  it("1: a close that lands during a round's metadata phase is reported as closed, never drained", async () => {
+    const w = world();
+    const { a, b } = await pair(w);
+    await enqueueLocation(a.client, w.loc(1));
+    await w.sync(a);
+    // Close as soon as the round has started: it stops at its next boundary, before the inbox.
+    const drain = b.client.syncUntilDrained();
+    await b.client.close();
+    const r = await drain;
+    expect([r.stoppedBecause, r.remaining.inboxHasMore]).toEqual(["closed", "unknown"]);
+  });
+
+  it("2: an unfinished chain is remaining work, and its pages advancing is progress", async () => {
+    const w = world();
+    const { a, bobId } = await pair(w);
+    const recover = async () => {
+      const d = await fresh(w, "bob");
+      const p = await d.client.prepareReplacement();
+      const token = w.host.authorizeReplacement({ accountName: "bob", successionId: p.successionId, expectedCertificateHash: p.expectedCertificateHash, certificate: p.certificate });
+      await d.client.completeReplacement({ successionId: p.successionId, authorization: token });
+    };
+    await recover();
+    await recover();
+    w.host.successionPageSize = 1;
+    const r = await a.client.syncUntilDrained({ catchUp: { maxRecords: 1, maxMs: 5000 } });
+    expect([r.stoppedBecause, r.remaining.chainsIncomplete, r.metadata.successions]).toEqual(["drained", 0, 2]);
+    expect(r.rounds).toBeGreaterThan(1);
+    expect((await a.store.read((tx) => tx.get("pins", toHex(bobId))))?.generation).toBe("3");
+  });
+});
+
 describe("syncUntilDrained", () => {
   it("drains a backlog larger than one budget in one call and reports the rounds", async () => {
     const w = world();
