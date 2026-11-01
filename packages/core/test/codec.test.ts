@@ -23,7 +23,7 @@ import {
   type EncryptedRecord,
   type EpochManifest,
   type ResetKeyList,
-  type AccountResetReceipt, decodeEnvelope, encodeRecordHeader, type HeaderClass } from "../src/codec.js";
+  type AccountResetReceipt, type AccountSuccession, SUCCESSION_WIRE_BYTES_WITHOUT_NAME, buildSuccession, decodeEnvelope, encodeRecordHeader, type HeaderClass } from "../src/codec.js";
 import { accountKeypair, deviceSigningKeypair, identityId, ready, signingKeypairFromSeed, wrapHash, keyCommitment, type SigningKeypair } from "../src/crypto.js";
 import { KavachError } from "../src/errors.js";
 import { fixture, hex, str } from "./fixture.js";
@@ -45,6 +45,7 @@ interface Extra {
     expected_sizes: number[];
   };
   account_reset: { authority_seed: string; authority_public: string; authority_key_id: string; new_account_certificate: string; receipt_wire: string };
+  account_succession: { authority_public: string; authority_key_id: string; standby_public: string; standby_key_id: string; account_id: string; successor_certificate: string; succession_wire: string; reattested_wire: string; forked_wire: string; expected: { wire_bytes: number; previous_generation: number; new_generation: number } };
   recovery_vault: { recovery_code: string; empty_vault: string; sharing_disabled_vault: string; recovery_key: string; nonce: string; plaintext: string; aad: string; wire: string };
   durable_events: { checkin_wire: string; following_location_wire: string };
   record: { payload: string; kind: number; event_time_ms: number; header_class: number; decoded: { latitude_e7: number; longitude_e7: number; accuracy_mm: number; captured_at_ms: number; status: number } };
@@ -184,7 +185,7 @@ describe("slot-only records and header classes (revisions 6 and 8)", () => {
   });
 });
 
-describe("all 22 negative vectors", () => {
+describe("all 26 negative vectors", () => {
   for (const n of fixture.negative_vectors) {
     it(`${n.name} -> ${n.expected}`, () => {
       const wire = hex(n.wire);
@@ -244,6 +245,33 @@ describe("100-account boundary", () => {
       const cur = m.audience[i];
       expect(prev && cur && compareBytes(prev.identityId, cur.identityId)).toBeLessThan(0);
     }
+  });
+});
+
+describe("account succession (type 9, revision 9)", () => {
+  it("parses the succession vector, binds it to the successor certificate, has the stated length, and rebuilds byte for byte", () => {
+    const v = fx.account_succession;
+    const wire = hex(v.succession_wire);
+    expect(wire.length).toBe(v.expected.wire_bytes);
+    expect(wire.length).toBe(SUCCESSION_WIRE_BYTES_WITHOUT_NAME + "alice".length);
+    const doc = expectType<AccountSuccession>(verifyDocument(wire, hex(v.authority_public)), DocumentType.AccountSuccession);
+    const cert = expectType<AccountDevice>(verifyDocument(hex(v.successor_certificate)), DocumentType.AccountDevice);
+    expect([doc.accountName, toHex(doc.accountId), toHex(doc.previousIdentityId), doc.previousGeneration, doc.newGeneration]).toEqual(["alice", v.account_id, v.account_id, BigInt(v.expected.previous_generation), BigInt(v.expected.new_generation)]);
+    expect(toHex(doc.newCertificateHash)).toBe(toHex(cert.bodyHash));
+    expect(toHex(doc.newIdentityId)).toBe(toHex(identityId(cert.accountName, cert.accountKey)));
+    expect(toHex(doc.authorityKeyId)).toBe(v.authority_key_id);
+    const authority = signingKeypairFromSeed(hex(fx.account_reset.authority_seed));
+    expect(toHex(buildSuccession(doc, authority.secretKey))).toBe(v.succession_wire);
+    // A re-attestation under the standby key carries the same transition and a different attestation.
+    const re = expectType<AccountSuccession>(verifyDocument(hex(v.reattested_wire), hex(v.standby_public)), DocumentType.AccountSuccession);
+    const transition = (d: AccountSuccession) => [d.accountName, toHex(d.accountId), toHex(d.successionId), toHex(d.previousIdentityId), toHex(d.newIdentityId), d.previousGeneration, d.newGeneration, toHex(d.newCertificateHash)];
+    expect(transition(re)).toEqual(transition(doc));
+    expect([toHex(re.authorityKeyId) === toHex(doc.authorityKeyId), re.issuedAt === doc.issuedAt]).toEqual([false, false]);
+    // The fork shares the previous state and differs in the transition.
+    const fork = expectType<AccountSuccession>(verifyDocument(hex(v.forked_wire), hex(v.authority_public)), DocumentType.AccountSuccession);
+    expect([toHex(fork.previousIdentityId), fork.previousGeneration]).toEqual([toHex(doc.previousIdentityId), doc.previousGeneration]);
+    expect(transition(fork)).not.toEqual(transition(doc));
+    expect(code(() => verifyDocument(wire, hex(v.standby_public)))).toBe("BAD_SIGNATURE");
   });
 });
 

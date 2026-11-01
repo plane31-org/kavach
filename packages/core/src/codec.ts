@@ -69,6 +69,8 @@ export enum DocumentType {
   EncryptedRecord = 4,
   AccountVault = 6,
   AccountResetReceipt = 7,
+  /** Revision 9 (amendment A1): the host's authority binds an account to new keys with continuity of its relationships. */
+  AccountSuccession = 9,
   ResetKeyList = 8
 }
 
@@ -136,6 +138,27 @@ export interface AccountResetReceipt {
   readonly authorityKeyId: Uint8Array;
 }
 
+/**
+ * Type 9. The transition (every field but the last two and the signature) says what happened to
+ * the account; the attestation (`issuedAt`, `authorityKeyId`, the signature) says who vouched for
+ * it. Two documents with one transition are one succession.
+ */
+export interface AccountSuccession {
+  readonly type: DocumentType.AccountSuccession;
+  readonly accountName: string;
+  readonly accountId: Uint8Array;
+  readonly previousIdentityId: Uint8Array;
+  readonly newIdentityId: Uint8Array;
+  readonly previousGeneration: bigint;
+  readonly newGeneration: bigint;
+  readonly newCertificateHash: Uint8Array;
+  readonly successionId: Uint8Array;
+  readonly issuedAt: bigint;
+  readonly authorityKeyId: Uint8Array;
+}
+
+export const SUCCESSION_WIRE_BYTES_WITHOUT_NAME = 251;
+
 export interface ResetKeyEntry {
   readonly keyId: Uint8Array;
   readonly publicKey: Uint8Array;
@@ -149,7 +172,7 @@ export interface ResetKeyList {
   readonly keys: readonly ResetKeyEntry[];
 }
 
-export type SignedDocument = AccountDevice | CircleSnapshot | EpochManifest | EncryptedRecord | AccountResetReceipt | ResetKeyList;
+export type SignedDocument = AccountDevice | CircleSnapshot | EpochManifest | EncryptedRecord | AccountResetReceipt | ResetKeyList | AccountSuccession;
 
 /** A parsed signed document together with the exact body and signature bytes. */
 export type Parsed<T extends SignedDocument = SignedDocument> = T & {
@@ -164,6 +187,7 @@ export const LABEL_BY_TYPE: Readonly<Record<number, Label>> = {
   [DocumentType.EpochManifest]: "epoch-sig",
   [DocumentType.EncryptedRecord]: "record-sig",
   [DocumentType.AccountResetReceipt]: "reset-sig",
+  [DocumentType.AccountSuccession]: "succession-sig",
   [DocumentType.ResetKeyList]: "reset-keys-sig"
 };
 
@@ -266,6 +290,23 @@ export function parseDocument(wire: Uint8Array): Parsed {
       const authorityKeyId = r.take(16);
       if (equalBytes(oldIdentityId, newIdentityId)) throw malformed(stage, "old and new identity equal");
       fields = { type, accountName, oldIdentityId, newIdentityId, resetId, issuedAt, authorityKeyId };
+      break;
+    }
+    case DocumentType.AccountSuccession: {
+      const accountName = r.name();
+      const accountId = r.take(HASH_BYTES);
+      const previousIdentityId = r.take(HASH_BYTES);
+      const newIdentityId = r.take(HASH_BYTES);
+      const previousGeneration = r.u64();
+      const newGeneration = r.u64();
+      const newCertificateHash = r.take(HASH_BYTES);
+      const successionId = r.take(16);
+      const issuedAt = r.u64();
+      const authorityKeyId = r.take(16);
+      if (equalBytes(previousIdentityId, newIdentityId)) throw malformed(stage, "previous and new identity equal");
+      if (previousGeneration < 1n || newGeneration !== previousGeneration + 1n) throw malformed(stage, "new generation must be previous plus one");
+      if (successionId.every((b) => b === 0)) throw malformed(stage, "succession id zero");
+      fields = { type, accountName, accountId, previousIdentityId, newIdentityId, previousGeneration, newGeneration, newCertificateHash, successionId, issuedAt, authorityKeyId };
       break;
     }
     case DocumentType.ResetKeyList: {
@@ -467,6 +508,28 @@ export function encodeResetReceiptBody(f: Omit<AccountResetReceipt, "type">): Ui
 
 export function buildResetReceipt(f: Omit<AccountResetReceipt, "type">, resetSecretKey: Uint8Array): Uint8Array {
   return signed(encodeResetReceiptBody(f), "reset-sig", resetSecretKey);
+}
+
+export function encodeSuccessionBody(f: Omit<AccountSuccession, "type">): Uint8Array {
+  return new Writer()
+    .u8(WIRE_VERSION)
+    .u8(DocumentType.AccountSuccession)
+    .name(f.accountName)
+    .bytes(f.accountId)
+    .bytes(f.previousIdentityId)
+    .bytes(f.newIdentityId)
+    .u64(f.previousGeneration)
+    .u64(f.newGeneration)
+    .bytes(f.newCertificateHash)
+    .bytes(f.successionId)
+    .u64(f.issuedAt)
+    .bytes(f.authorityKeyId)
+    .finish();
+}
+
+/** Signed by an operational key the current reset-key list allows; the host signs it when it commits a succession. */
+export function buildSuccession(f: Omit<AccountSuccession, "type">, authoritySecretKey: Uint8Array): Uint8Array {
+  return signed(encodeSuccessionBody(f), "succession-sig", authoritySecretKey);
 }
 
 export function encodeResetKeyListBody(f: Omit<ResetKeyList, "type">): Uint8Array {

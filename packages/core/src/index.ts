@@ -7,7 +7,7 @@
  * `@plane31/blind-relay/sodium`. Everything else is internal and reachable only by relative import.
  */
 export const PROTOCOL_NAME = "Kavach";
-export const PROTOCOL_REVISION = 8;
+export const PROTOCOL_REVISION = 9;
 
 // The client ---------------------------------------------------------------------------------------
 export {

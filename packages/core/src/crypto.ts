@@ -40,6 +40,7 @@ export type Label =
   | "epoch-sig"
   | "record-sig"
   | "reset-sig"
+  | "succession-sig"
   | "reset-keys-sig"
   | "epoch-key"
   | "wrap"

@@ -88,6 +88,11 @@ def parse(wire):
         if not re.fullmatch(rb'[A-Za-z0-9_-]{1,64}',name): raise Bad('MALFORMED')
         d.update(name=name.decode(),old=r.take(32),new=r.take(32),reset_id=r.take(16),issued=r.n(8),authority_id=r.take(16))
         if d['old']==d['new']: raise Bad('MALFORMED')
+    elif t==9:
+        name=r.take(r.n(1))
+        if not re.fullmatch(rb'[A-Za-z0-9_-]{1,64}',name): raise Bad('MALFORMED')
+        d.update(name=name.decode(),account=r.take(32),previous=r.take(32),new=r.take(32),previous_generation=r.n(8),new_generation=r.n(8),certificate=r.take(32),succession_id=r.take(16),issued=r.n(8),authority_id=r.take(16))
+        if d['previous']==d['new'] or d['previous_generation']<1 or d['new_generation']!=d['previous_generation']+1 or d['succession_id']==bytes(16): raise Bad('MALFORMED')
     elif t==8:
         d.update(version=r.n(8),issued=r.n(8),expires=r.n(8)); n=r.n(1)
         if d['version']==0 or n>8 or not 0<d['expires']-d['issued']<=2592000000: raise Bad('MALFORMED')
@@ -98,7 +103,7 @@ def parse(wire):
     else: raise Bad('UNSUPPORTED_TYPE')
     d['body']=wire[:r.i]; d['sig']=r.take(64); r.end(); return d
 
-LABELS={1:'account-sig',2:'snapshot-sig',3:'epoch-sig',4:'record-sig',7:'reset-sig',8:'reset-keys-sig'}
+LABELS={1:'account-sig',2:'snapshot-sig',3:'epoch-sig',4:'record-sig',7:'reset-sig',8:'reset-keys-sig',9:'succession-sig'}
 def verify(wire,pk=None):
     d=parse(wire)
     if d['type']==1: pk=d['ak']
@@ -600,6 +605,77 @@ def build():
     conflicting_receipt=sign(standby,'reset-sig',b'\x05\x07'+ID('alice')+bob['iid']+reset_account['iid']+bytes(range(16,32))+U64(now+10000)+standby_id)
     case('K22_reset_id_binding',lambda:trust.apply(conflicting_receipt,reset_account['wire'],'alice',reset_account['iid'],now+20000),'RESET_BINDING')
     assert len(kl1)==187 and len(kl2)==139 and len(kill)==91
+    # Revision 9 (amendment A1): the succession, type 9. Alice's keys are replaced by the authority
+    # with continuity: the transition is signed under the active operational key.
+    def succession(sk,key_id,name,account,previous,new,pgen,ngen,cert_hash,sid,issued):
+        body=b'\x05\x09'+ID(name)+account+previous+new+U64(pgen)+U64(ngen)+cert_hash+sid+U64(issued)+key_id
+        return sign(sk,'succession-sig',body)
+    successor=identity('alice',H(C('fixture-succession-account')),H(C('fixture-succession-device')),generation=2)
+    succ_cert_hash=doc_hash(successor['wire'][:-64]); succ_id=bytes(range(64,80))
+    succ=succession(authority,authority_id,'alice',alice['iid'],alice['iid'],successor['iid'],1,2,succ_cert_hash,succ_id,now+30000)
+    assert len(succ)==251+len('alice')
+    sp=verify(succ,bytes(authority.verify_key)); assert sp['account']==alice['iid'] and sp['new']==successor['iid'] and sp['new_generation']==2
+    assert Ed25519PrivateKey.from_private_bytes(bytes(authority)).sign(C('succession-sig')+succ[:-64])==succ[-64:]
+    negative('N23_succession_generation',succession(authority,authority_id,'alice',alice['iid'],alice['iid'],successor['iid'],1,3,succ_cert_hash,succ_id,now+30000),bytes(authority.verify_key),'MALFORMED')
+    negative('N24_succession_same_identity',succession(authority,authority_id,'alice',alice['iid'],alice['iid'],alice['iid'],1,2,succ_cert_hash,succ_id,now+30000),bytes(authority.verify_key),'MALFORMED')
+    negative('N25_succession_zero_id',succession(authority,authority_id,'alice',alice['iid'],alice['iid'],successor['iid'],1,2,succ_cert_hash,bytes(16),now+30000),bytes(authority.verify_key),'MALFORMED')
+    negative('N26_succession_wrong_signer',succ,bytes(alice['a'].verify_key),'BAD_SIGNATURE')
+    # The verifier's order, as a small model: accepted transitions stay trusted; a new attestation
+    # is authenticated under the current list; the transition is compared with recorded ones; only
+    # a new transition meets the pin, generation and retirement checks.
+    class SuccessionModel:
+        def __init__(self,allowed,pinned_iid,pinned_gen):
+            self.allowed=dict(allowed); self.pin=(pinned_iid,pinned_gen); self.recorded={}; self.retired=set()
+        def verify(self,wire,cert_wire):
+            p=parse(wire)
+            pk=self.allowed.get(p['authority_id'])
+            if pk is None: raise Bad('RESET_KEY_REVOKED')
+            verify(wire,pk)
+            t=(p['name'],p['account'],p['succession_id'],p['previous'],p['new'],p['previous_generation'],p['new_generation'],p['certificate'])
+            state=(p['account'],p['previous'],p['previous_generation'])
+            if t in self.recorded.values(): return 'DUPLICATE'
+            if state in self.recorded: raise Bad('EQUIVOCATION')
+            if p['previous']!=self.pin[0]: raise Bad('SUCCESSION_BINDING')
+            if p['previous_generation']<self.pin[1]: raise Bad('ROLLBACK')
+            if p['previous'] in self.retired or p['new'] in self.retired: raise Bad('SUPERSEDED_IDENTITY')
+            c=parse(cert_wire)
+            if doc_hash(cert_wire[:-64])!=p['certificate'] or identity_id(c['name'],c['ak'])!=p['new'] or c['generation']!=p['new_generation']: raise Bad('SUCCESSION_BINDING')
+            self.recorded[state]=t; self.retired.add(p['previous']); self.pin=(p['new'],p['new_generation'])
+            return 'ACCEPTED'
+    both={authority_id:bytes(authority.verify_key),standby_id:standby_pk}
+    scases=[]
+    def scase(name,fn,expected):
+        try: actual=fn()
+        except Bad as e: actual=str(e)
+        assert actual==expected,(name,actual,expected)
+        scases.append(dict(name=name,expected=expected))
+    m=SuccessionModel(both,alice['iid'],1)
+    scase('C01_succession_accepted',lambda:m.verify(succ,successor['wire']),'ACCEPTED')
+    scase('C02_same_attestation_duplicate',lambda:m.verify(succ,successor['wire']),'DUPLICATE')
+    reattested=succession(standby,standby_id,'alice',alice['iid'],alice['iid'],successor['iid'],1,2,succ_cert_hash,succ_id,now+40000)
+    scase('C03_reattestation_is_the_same_succession',lambda:m.verify(reattested,successor['wire']),'DUPLICATE')
+    other=identity('alice',H(C('fixture-succession-other')),H(C('fixture-succession-other-device')),generation=2)
+    forked=succession(authority,authority_id,'alice',alice['iid'],alice['iid'],other['iid'],1,2,doc_hash(other['wire'][:-64]),bytes(range(80,96)),now+30000)
+    scase('C04_two_successors_for_one_state',lambda:m.verify(forked,other['wire']),'EQUIVOCATION')
+    back=identity('alice',bytes(range(32)),H(C('fixture-succession-back')),generation=3)
+    back_to_a=succession(authority,authority_id,'alice',alice['iid'],successor['iid'],alice['iid'],2,3,doc_hash(back['wire'][:-64]),bytes(range(96,112)),now+50000)
+    scase('C05_back_to_a_retired_identity',lambda:m.verify(back_to_a,back['wire']),'SUPERSEDED_IDENTITY')
+    gapped=SuccessionModel(both,alice['iid'],1)
+    from_gen3=identity('alice',H(C('fixture-succession-account')),H(C('fixture-succession-device-b')),generation=4)
+    gap=succession(authority,authority_id,'alice',alice['iid'],alice['iid'],from_gen3['iid'],3,4,doc_hash(from_gen3['wire'][:-64]),bytes(range(112,128)),now+30000)
+    scase('C06_continuity_activations_between_successions',lambda:gapped.verify(gap,from_gen3['wire']),'ACCEPTED')
+    low=succession(authority,authority_id,'alice',alice['iid'],from_gen3['iid'],other['iid'],3,4,doc_hash(other['wire'][:-64]),bytes(range(128,144)),now+30000)
+    scase('C07_rollback_below_pinned_generation',lambda:gapped.verify(low,other['wire']),'ROLLBACK')
+    wrong_cert=SuccessionModel(both,alice['iid'],1)
+    scase('C08_certificate_binding',lambda:wrong_cert.verify(succ,other['wire']),'SUCCESSION_BINDING')
+    removed=SuccessionModel({standby_id:standby_pk},alice['iid'],1)
+    scase('C09_new_attestation_under_removed_key',lambda:removed.verify(succ,successor['wire']),'RESET_KEY_REVOKED')
+    removed_after=SuccessionModel(both,alice['iid'],1); removed_after.verify(succ,successor['wire']); removed_after.allowed={standby_id:standby_pk}
+    scase('C10_accepted_transition_recognised_after_key_removal',lambda:removed_after.verify(reattested,successor['wire']),'DUPLICATE')
+    vectors['account_succession']={'authority_public':bytes(authority.verify_key).hex(),'authority_key_id':authority_id.hex(),'standby_public':standby_pk.hex(),'standby_key_id':standby_id.hex(),
+        'account_id':alice['iid'].hex(),'successor_certificate':successor['wire'].hex(),'succession_wire':succ.hex(),'reattested_wire':reattested.hex(),'forked_wire':forked.hex(),'other_certificate':other['wire'].hex(),
+        'back_to_a_wire':back_to_a.hex(),'back_to_a_certificate':back['wire'].hex(),'gap_wire':gap.hex(),'gap_certificate':from_gen3['wire'].hex(),
+        'expected':{'wire_bytes':251+len('alice'),'previous_generation':1,'new_generation':2,'transition_fields':['accountName','accountId','successionId','previousIdentityId','newIdentityId','previousGeneration','newGeneration','newCertificateHash'],'attestation_fields':['authorityKeyId','issuedAt','signature']},'cases':scases}
     for wire in [kl1,kl2,kill]:
         assert Ed25519PrivateKey.from_private_bytes(bytes(root)).sign(C('reset-keys-sig')+wire[:-64])==wire[-64:]
     vectors['reset_key_management']={
@@ -619,7 +695,7 @@ def main():
         print('Generated',path)
     else:
         expected=json.loads(path.read_text()); assert actual==expected,'Frozen vectors differ from generated bytes/results'
-    print('PASS: 5 core signed documents; 2 core sealed boxes; 100-member boundary fixture; maximum-size record; encrypted storage fixture (informative); 22 negative byte vectors; 3 wrap/key checks; 17 state-model vectors; phone replacement, recovery, durable check-ins and account-reset fixtures; 22 reset-key-management cases (30-day list lifetime); independent primitive cross-checks.')
+    print('PASS: 5 core signed documents; 2 core sealed boxes; 100-member boundary fixture; maximum-size record; encrypted storage fixture (informative); 26 negative byte vectors; 3 wrap/key checks; 17 state-model vectors; phone replacement, recovery, durable check-ins, account-reset and account-succession fixtures; 22 reset-key-management cases (30-day list lifetime) and 10 succession cases; independent primitive cross-checks.')
     print('Coverage limit: reference codec/model only. No mobile SDK, database crash injection, network adapter or security audit is tested here.')
 
 if __name__=='__main__': main()
