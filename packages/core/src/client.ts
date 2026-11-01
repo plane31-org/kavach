@@ -966,7 +966,7 @@ class ClientImpl implements Client {
         // Our own key changed at the host. A succession from our identity, attested by an authority
         // we trust, retires this device (its key is no longer the account's); a bare key change or a
         // reset we did not make is ignored here, as before.
-        if (await this.supersededBySuccession(pin, me)) {
+        if (await this.supersededBySuccession(pin, me, report)) {
           await this.retire();
           // The key itself is retired, not only the device: nothing of it stays here.
           await this.secrets.delete("accountSeed");
@@ -1093,12 +1093,15 @@ class ClientImpl implements Client {
    * key has nothing left to say. Deferred (no fresh list, untrusted clock) and invalid
    * attestations leave the device as it is.
    */
-  private async supersededBySuccession(pin: AccountPin, me: ResolvedAccount): Promise<boolean> {
+  private async supersededBySuccession(pin: AccountPin, me: ResolvedAccount, report: SyncReport): Promise<boolean> {
     if (!me.successions?.length) return false;
     try {
       const r = await this.followChain({ accountId: pin.accountId, accountName: pin.accountName, current: pin, firstPage: me.successions, next: me.successionsNext, budget: this.syncBudget });
       return r.pin !== undefined && !equalBytes(r.pin.identityId, pin.identityId);
-    } catch {
+    } catch (e) {
+      // A chain this device cannot follow for its own account is a diagnostic the product must
+      // see: the host has already fenced the device, and only this report says why it still runs.
+      report.errors.push(syncError("ownSuccession", e));
       return false;
     }
   }
@@ -1971,6 +1974,21 @@ class ClientImpl implements Client {
     if (toHex(previous.bodyHash) !== row.expectedCertificateHash) throw new KavachError("SUCCESSION_BINDING", stage, "the served certificate is not the expected one");
     const accountId = fromHex(row.accountId);
     const previousPin = pinFromCertificate(previous, undefined, accountId);
+    // The account's earlier successions, if any: the chain from the root to the previous identity,
+    // verified through the one chain path and kept, so this device holds every key the account
+    // has signed with (an owned circle's snapshot from before an earlier replacement) and can
+    // follow its own chain later (to learn of its retirement).
+    const [me] = await this.transport.directory.resolveAccounts([this.accountName]);
+    const served = me?.successions ?? [];
+    const ownSuccession = authenticateSuccession(succession, this.trust, this.now());
+    const earlier = served.filter((l) => {
+      try {
+        return expectType<AccountSuccession>(parseDocument(l.wire), DocumentType.AccountSuccession, stage).newGeneration <= ownSuccession.previousGeneration;
+      } catch {
+        return false;
+      }
+    });
+    const history = earlier.length > 0 || me?.successionsNext !== undefined ? (await this.followChain({ accountId, accountName: this.accountName, finalIdentityId: previousPin.identityId, firstPage: earlier, next: earlier.length === served.length ? me?.successionsNext : undefined })).verified : [];
     const accountSeed = roots.subarray(0, 32);
     const deviceSeed = roots.subarray(32, 64);
     const recoveryKey = roots.subarray(64, 96);
@@ -1988,6 +2006,8 @@ class ClientImpl implements Client {
       // nothing is written unless the document binds this account, this generation and this key.
       tx.put("pins", toHex(accountId), pinToRow(previousPin));
       tx.put("certificates", toHex(previousPin.certificateHash), { identityId: toHex(accountId), certificateHash: toHex(previousPin.certificateHash), signingKey: toHex(previousPin.signingKey), boxKey: toHex(previousPin.boxKey), streamId: toHex(previousPin.streamId), generation: big(previous.generation), wire: toHex(previousWire), current: true });
+      recordChainIn(tx, history, this.now());
+      rootIdentityIn(tx, accountId, this.accountName, me?.rootCertificate);
       const effect = applySuccession(tx, { wire: succession, newCertificate: certificate, policy: this.policy, trust: this.trust, now: this.now() });
       if (!equalBytes(effect.newIdentityId, account.identityId) || toHex(effect.accountId) !== row.accountId) throw new KavachError("SUCCESSION_BINDING", stage, "the succession does not name this device's key");
       this.persistTrustIn(tx);

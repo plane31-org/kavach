@@ -216,7 +216,9 @@ export function rootIdentityIn(tx: Tx, accountId: Uint8Array, accountName: strin
   if (cert.accountName !== accountName || !equalBytes(identityId(cert.accountName, cert.accountKey), accountId)) return;
   const key = toHex(accountId);
   const row = tx.get("identities", key);
-  tx.put("identities", key, { accountId: key, accountName, accountKey: toHex(cert.accountKey), sinceGeneration: row?.sinceGeneration ?? big(1n), retired: row?.retired ?? true, ...(row?.resetAt !== undefined ? { resetAt: row.resetAt } : {}) });
+  // Whether the root is retired is the chain's to say (recordChainIn runs first); a root with no
+  // succession recorded yet is current.
+  tx.put("identities", key, { accountId: key, accountName, accountKey: toHex(cert.accountKey), sinceGeneration: row?.sinceGeneration ?? big(1n), retired: row?.retired ?? false, ...(row?.resetAt !== undefined ? { resetAt: row.resetAt } : {}) });
 }
 
 export function applySuccession(tx: Tx, input: SuccessionInput): SuccessionEffect {

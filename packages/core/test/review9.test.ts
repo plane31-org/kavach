@@ -308,6 +308,52 @@ describe("third review: chains under rotation, budgets and forgeries", () => {
   });
 });
 
+describe("fourth review: the replacement device holds its account's whole chain", () => {
+  it("an owner replaced twice without a bootstrap between: the newest phone still verifies the circle it owns", async () => {
+    const w = world();
+    const { b, aliceId } = await pair(w);
+    await recover(w, "alice"); // A -> B, never synced
+    const a3 = await recover(w, "alice"); // B -> C
+    const r = await w.sync(a3);
+    expect([r.errors, r.bootstrap]).toEqual([[], { circles: 1, pending: 0, failed: 0 }]);
+    expect((await a3.client.circles.list()).map((c) => [c.owned, c.revision, c.status])).toEqual([[true, 3n, "member"]]);
+    const chain = await a3.store.read((tx) => ({ successions: tx.list("successions").filter(([, s]) => s.accountId === toHex(aliceId)).map(([, s]) => s.newGeneration), keys: tx.list("identities").filter(([, i]) => i.accountId === toHex(aliceId) && !!i.accountKey).length }));
+    expect([chain.successions, chain.keys]).toEqual([["2", "3"], 3]);
+    await w.sync(b);
+    expect((await b.client.circles.list()).map((c) => [toHex(c.ownerIdentityId), c.revision])).toEqual([[toHex(aliceId), 3n]]);
+  });
+
+  it("A -> B -> C -> D: phone C follows the whole chain, retires and erases its account seed", async () => {
+    const w = world();
+    await pair(w);
+    const b2 = await recover(w, "bob");
+    await w.sync(b2);
+    const b3 = await recover(w, "bob");
+    await w.sync(b3);
+    const b4 = await recover(w, "bob");
+    await w.sync(b4);
+    const r = await w.sync(b3);
+    expect(r.errors).toEqual([]);
+    expect((await b3.client.getState()).status).toBe("retired");
+    expect(await b3.secrets.get("accountSeed")).toBeUndefined();
+    // And the first replacement phone, which never saw the later ones, retires the same way.
+    const r2 = await w.sync(b2);
+    expect([r2.errors, (await b2.client.getState()).status, await b2.secrets.get("accountSeed")]).toEqual([[], "retired", undefined]);
+  });
+
+  it("a device that cannot follow its own chain says so in the report", async () => {
+    const w = world();
+    await pair(w);
+    const b2 = await recover(w, "bob");
+    await w.sync(b2);
+    await recover(w, "bob");
+    b2.t.knobs.tamper.add("succession");
+    const r = await w.sync(b2);
+    expect(r.errors.map((e) => [e.operation, e.code])).toContainEqual(["ownSuccession", "BAD_SIGNATURE"]);
+    expect((await b2.client.getState()).status).not.toBe("retired");
+  });
+});
+
 describe("a recovery-only client without a provider has no vault", () => {
   it("registers without one, publishes none, and the host holds none", async () => {
     const recovery = { ...testPolicy, replacement: "recovery" as const };
