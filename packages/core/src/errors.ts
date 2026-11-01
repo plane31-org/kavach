@@ -31,6 +31,16 @@ export type ErrorCode =
   | "ROTATION_REQUIRED"
   | "COUNTER_EXHAUSTED"
   | "RECIPIENT_LIMIT"
+  /** A succession does not bind: certificate, identity, generation, account or previous state do not match (revision 9). */
+  | "SUCCESSION_BINDING"
+  /** A succession names a retired identity as previous or new; retirement is permanent. */
+  | "SUPERSEDED_IDENTITY"
+  /** Account recovery: the proposal has no valid authorization, or it expired, or a definitive conflict ended the proposal. */
+  | "AUTHORIZATION_REQUIRED"
+  | "AUTHORIZATION_EXPIRED"
+  | "REPLACEMENT_CONFLICT"
+  /** The outcome of a submitted succession is not yet known; retry or look it up. */
+  | "SUCCESSION_PENDING"
   // Delivery
   | "CLOCK_SKEW"
   | "EXPIRED"
@@ -51,7 +61,8 @@ const RETRYABLE: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
   "ROTATION_REQUIRED",
   "LOCKED",
   "STORAGE_FAILURE",
-  "NETWORK"
+  "NETWORK",
+  "SUCCESSION_PENDING"
 ]);
 
 /**

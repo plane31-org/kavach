@@ -39,7 +39,7 @@ export { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 export type { RecordKind } from "./codec.js";
 
 // Configuration ------------------------------------------------------------------------------------
-export { validatePolicy, type KindDeclaration, type RetentionPolicy } from "./policy.js";
+export { validatePolicy, type KindDeclaration, type ReplacementModel, type RetentionPolicy } from "./policy.js";
 export type { ResetTrustConfig } from "./reset.js";
 export { setCryptoBackend, type CryptoBackend } from "./crypto.js";
 

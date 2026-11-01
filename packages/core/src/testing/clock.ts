@@ -7,6 +7,7 @@ import type { RetentionPolicy } from "../policy.js";
  */
 export const testPolicy: RetentionPolicy = {
   version: 1,
+  replacement: "both",
   deliveryWindowMs: 86_400_000n,
   appendRetryWindowMs: 604_800_000n,
   hygieneRotationMs: 2_592_000_000n,

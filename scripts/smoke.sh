@@ -25,7 +25,7 @@ must(typeof testing.FakeHost === "function", "testing entry");
 const backend = await sodium.loadSodiumBackend();
 must(backend.name === "sodium" && backend.randomBytes(8).length === 8, "sodium backend loads and runs");
 must(typeof expo.openKavach === "function" && typeof expo.SqliteStore === "function", "expo entry");
-core.validatePolicy({ version: 1, deliveryWindowMs: 1n, appendRetryWindowMs: 1n, hygieneRotationMs: 1n, maxOutboxRecords: 1, maxOutboxBytes: 1, kinds: [{ kind: 0, retentionMs: 1n, queue: "keepAll", history: true, newest: true }] });
+core.validatePolicy({ version: 1, replacement: "continuity", deliveryWindowMs: 1n, appendRetryWindowMs: 1n, hygieneRotationMs: 1n, maxOutboxRecords: 1, maxOutboxBytes: 1, kinds: [{ kind: 0, retentionMs: 1n, queue: "keepAll", history: true, newest: true }] });
 try { core.validatePolicy({}); must(false, "policy validation"); } catch (e) { must(e.code === "MALFORMED", "error code"); }
 const { existsSync } = await import("node:fs");
 must(existsSync(new URL("./node_modules/@plane31/blind-relay/src/index.ts", import.meta.url)), "sources ship with the maps");

@@ -21,8 +21,18 @@ export interface KindDeclaration {
   readonly headerClass: 0 | 1 | 2 | 3;
 }
 
+/**
+ * Which replacement models the product enables (protocol section 4, revision 9): `continuity`,
+ * the device holds the account key, recovered through the platform or a code, and the host can
+ * never rebind a key; `recovery`, the host's authority signs a succession to fresh keys after
+ * the product's fresh authentication; or `both`. A property of the app build, enforced by every
+ * verifying peer: a client without `recovery` rejects every succession document.
+ */
+export type ReplacementModel = "continuity" | "recovery" | "both";
+
 export interface RetentionPolicy {
   readonly version: number;
+  readonly replacement: ReplacementModel;
   readonly deliveryWindowMs: bigint;
   readonly appendRetryWindowMs: bigint;
   readonly hygieneRotationMs: bigint;
@@ -34,7 +44,7 @@ export interface RetentionPolicy {
 /** The largest kind the envelope carries. */
 export const MAX_WIRE_KIND = 255;
 
-const FIELDS: readonly (keyof RetentionPolicy)[] = ["version", "deliveryWindowMs", "appendRetryWindowMs", "hygieneRotationMs", "maxOutboxRecords", "maxOutboxBytes", "kinds"];
+const FIELDS: readonly (keyof RetentionPolicy)[] = ["version", "replacement", "deliveryWindowMs", "appendRetryWindowMs", "hygieneRotationMs", "maxOutboxRecords", "maxOutboxBytes", "kinds"];
 
 /** A missing or malformed policy is rejected; the SDK never substitutes defaults. */
 export function validatePolicy(policy: unknown): RetentionPolicy {
@@ -66,8 +76,10 @@ export function validatePolicy(policy: unknown): RetentionPolicy {
     if (headerClass !== 0 && headerClass !== 1 && headerClass !== 2 && headerClass !== 3) throw new KavachError("MALFORMED", stage, `kinds[${i}].headerClass must be 0 to 3`);
     return { kind, retentionMs: big(`kinds[${i}].retentionMs`, k.retentionMs), queue: k.queue, history: k.history, newest: k.newest, headerClass };
   });
+  if (p.replacement !== "continuity" && p.replacement !== "recovery" && p.replacement !== "both") throw new KavachError("MALFORMED", stage, "replacement must be continuity, recovery or both");
   return {
     version: int("version", p.version),
+    replacement: p.replacement,
     deliveryWindowMs: big("deliveryWindowMs", p.deliveryWindowMs),
     appendRetryWindowMs: big("appendRetryWindowMs", p.appendRetryWindowMs),
     hygieneRotationMs: big("hygieneRotationMs", p.hygieneRotationMs),
@@ -85,4 +97,14 @@ export function kindOf(policy: RetentionPolicy, kind: number): KindDeclaration |
 /** The kinds kept in history, in declaration order. */
 export function historyKinds(policy: RetentionPolicy): readonly number[] {
   return policy.kinds.filter((k) => k.history).map((k) => k.kind);
+}
+
+/** Whether a deployment accepts successions at all; a peer without it rejects every type 9 document. */
+export function acceptsSuccession(policy: RetentionPolicy): boolean {
+  return policy.replacement !== "continuity";
+}
+
+/** Whether a device may replace itself by holding the account key (restoreAccount). */
+export function allowsContinuity(policy: RetentionPolicy): boolean {
+  return policy.replacement !== "recovery";
 }

@@ -249,8 +249,12 @@ describe("T2 to T5, T8, T9", () => {
 
 describe("retention policy validation", () => {
   it("accepts a complete policy and rejects a missing or malformed one", () => {
-    const good = { version: 1, deliveryWindowMs: 86_400_000n, appendRetryWindowMs: 604_800_000n, hygieneRotationMs: 2_592_000_000n, maxOutboxRecords: 2000, maxOutboxBytes: 4 << 20, kinds: [{ kind: 0, retentionMs: 86_400_000n, queue: "keepAll" as const, history: true, newest: true }] };
+    const good = { version: 1, replacement: "both" as const, deliveryWindowMs: 86_400_000n, appendRetryWindowMs: 604_800_000n, hygieneRotationMs: 2_592_000_000n, maxOutboxRecords: 2000, maxOutboxBytes: 4 << 20, kinds: [{ kind: 0, retentionMs: 86_400_000n, queue: "keepAll" as const, history: true, newest: true }] };
     expect(() => validatePolicy({ ...good, kinds: [] })).toThrow(expect.objectContaining({ code: "MALFORMED" }));
+    expect(() => validatePolicy({ ...good, replacement: "either" })).toThrow(expect.objectContaining({ code: "MALFORMED" }));
+    const { replacement: _r, ...noModel } = good;
+    void _r;
+    expect(() => validatePolicy(noModel)).toThrow(expect.objectContaining({ code: "MALFORMED" }));
     expect(() => validatePolicy({ ...good, kinds: [{ ...good.kinds[0], kind: 256 }] })).toThrow(expect.objectContaining({ code: "MALFORMED" }));
     expect(() => validatePolicy({ ...good, kinds: [{ ...good.kinds[0], history: false, newest: false }] })).toThrow(expect.objectContaining({ code: "MALFORMED" }));
     expect(validatePolicy(good).maxOutboxRecords).toBe(2000);

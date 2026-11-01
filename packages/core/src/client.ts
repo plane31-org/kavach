@@ -1402,7 +1402,7 @@ class ClientImpl implements Client {
     const newPin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage));
     await t1Secrets(this.secrets, { accountSeed, deviceSeed, recoveryKey, instanceId });
     await this.store.transaction((tx) => {
-      for (const table of ["meta", "self", "pins", "certificates", "quarantine", "circles", "revision", "vault", "epochs", "stream", "outbox", "history", "historyIndex", "enqueueKeys", "newest", "readerEpochs", "subscriptions", "unresolved", "activation", "pendingReset"] as const) {
+      for (const table of ["meta", "self", "pins", "certificates", "quarantine", "circles", "revision", "vault", "epochs", "stream", "outbox", "history", "historyIndex", "enqueueKeys", "newest", "successions", "identities", "keyChanges", "replacement", "preferences", "chainProgress", "readerEpochs", "subscriptions", "unresolved", "activation", "pendingReset"] as const) {
         for (const [k] of tx.list(table)) tx.delete(table, k);
       }
       t1Header(tx, { account, device, certificate, instanceId, generation: 1n });

@@ -17,7 +17,7 @@ export interface SecretStore {
   delete(name: SecretName): Promise<void>;
 }
 
-export type SecretName = "accountSeed" | "deviceSeed" | "recoveryKey" | "storageKey" | "instanceId" | "pendingReset";
+export type SecretName = "accountSeed" | "deviceSeed" | "recoveryKey" | "storageKey" | "instanceId" | "pendingReset" | "pendingReplacement";
 
 // Logical tables. Rows are JSON-safe: bytes as hex strings, u64 as decimal strings.
 
@@ -29,6 +29,8 @@ export interface MetaRow {
   historyIndex?: 1;
   /** Set once the newest slots are built from history; a store from before the slot table is rebuilt on open. */
   newest?: 1;
+  /** The account id (revision 9): the identity at enrollment, constant across successions. Absent on a store from before revision 9, where it equals `identityId`. */
+  accountId?: string;
   instanceId: string;
   accountName: string;
   identityId: string;
@@ -47,7 +49,10 @@ export interface SelfRow {
 export interface PinRow {
   accountName: string;
   accountKey: string;
+  /** The account's current identity (revision 9); before it, the one identity an account ever had. */
   identityId: string;
+  /** The account id: the identity at enrollment. Absent on a row from before revision 9, where it is `identityId`. */
+  accountId?: string;
   generation: string;
   certificateHash: string;
   certificate: string;
@@ -265,6 +270,76 @@ export interface EnqueueKeyRow {
   sentAt: string;
 }
 
+/** One accepted succession transition, keyed `<accountId>:<previousGeneration padded to 20>`; the wire is the latest attestation seen. */
+export interface SuccessionRow {
+  accountId: string;
+  accountName: string;
+  successionId: string;
+  previousIdentityId: string;
+  newIdentityId: string;
+  previousGeneration: string;
+  newGeneration: string;
+  newCertificateHash: string;
+  authorityKeyId: string;
+  wire: string;
+  acceptedAt: string;
+}
+
+/** Every identity an account has had, keyed by identity id: which account it belongs to and whether it is retired. */
+export interface IdentityRow {
+  accountId: string;
+  accountName: string;
+  /** The generation at which this identity became current (1 for a root). */
+  sinceGeneration: string;
+  retired: boolean;
+}
+
+/** The durable key-change notice, written in the transaction that accepts a succession or a reset; keyed `<acceptedAt padded>:<accountId>`. */
+export interface KeyChangeRow {
+  accountId: string;
+  accountName: string;
+  previousIdentityId: string;
+  newIdentityId: string;
+  generation: string;
+  reason: "succession" | "reset";
+  successionId: string | undefined;
+  acceptedAt: string;
+}
+
+/** T11: a replacement proposal prepared on a fresh device, kept until it commits or is definitively conflicted. */
+export interface ReplacementRow {
+  successionId: string;
+  accountName: string;
+  accountId: string;
+  expectedCertificateHash: string;
+  expectedGeneration: string;
+  /** The exact certificate bytes under the new key, at expectedGeneration + 1. */
+  certificate: string;
+  deviceId: string;
+  /** Set by a definitive conflict: the proposal can never commit and the next prepare replaces it. */
+  stale: boolean;
+  conflictGeneration: string | undefined;
+}
+
+/** A circle's sharing preference as the host holds it, with the ordering that makes the latest user action win. */
+export interface PreferenceRow {
+  circleId: string;
+  enabled: boolean;
+  /** The host's revision the device last confirmed; 0 before any confirmation. */
+  revision: string;
+  /** A change the host has not confirmed, with the local sequence it carries; cleared only by the response to that sequence. */
+  pending: { enabled: boolean; sequence: string } | undefined;
+  /** The next local sequence to assign. */
+  nextSequence: string;
+}
+
+/** Paged chain retrieval in progress for an account: verified pages persist, the pin moves only when complete. */
+export interface ChainProgressRow {
+  accountId: string;
+  nextGeneration: string;
+  complete: boolean;
+}
+
 export interface Tables {
   meta: MetaRow;
   self: SelfRow;
@@ -290,6 +365,12 @@ export interface Tables {
   retiredIdentities: { identityId: string };
   clock: ClockRow;
   pendingReset: PendingResetRow;
+  successions: SuccessionRow;
+  identities: IdentityRow;
+  keyChanges: KeyChangeRow;
+  replacement: ReplacementRow;
+  preferences: PreferenceRow;
+  chainProgress: ChainProgressRow;
 }
 
 export type TableName = keyof Tables;
