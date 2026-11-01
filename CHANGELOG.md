@@ -2,7 +2,7 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
-## 0.3.0 (unreleased)
+## 0.3.0
 
 Protocol revision 9, no wire change. One release that moves generic plumbing out of products and into the SDK: a real `close()`, erasure of an account from a device, bounded multi-round sync, and account recovery as one call. The transport and host contracts are unchanged; the SDK still ships no HTTP package and no host library, and documents the transport's error contract instead.
 
