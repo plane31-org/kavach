@@ -2,6 +2,10 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
+## 0.1.3
+
+- No code change. The first release published through npm trusted publishing: the workflow proves its GitHub identity to npm instead of using a stored token, and npm attaches provenance itself.
+
 ## 0.1.2
 
 - The `/sodium` entry loads `libsodium-wrappers-sumo` through its CommonJS build. Its ESM build has shipped broken (0.7.16 imports a file the package does not contain), so a plain import of the 0.1.1 entry failed in a fresh Node install.
