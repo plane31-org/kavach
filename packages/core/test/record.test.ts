@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { toHex } from "../src/bytes.js";
-import { DocumentType, expectType, verifyDocument, type AccountDevice } from "../src/codec.js";
+import { DocumentType, expectType, recordWireBytes, verifyDocument, type AccountDevice } from "../src/codec.js";
 import { deviceSigningKeypair, ready } from "../src/crypto.js";
 import { MAX_COUNTER, type AuthorView } from "../src/epoch.js";
 import { KavachError } from "../src/errors.js";
@@ -66,6 +66,8 @@ describe("sealing", () => {
     expect(code(() => sealRecord({ ...base, nextCounter: MAX_COUNTER + 1 }))).toBe("COUNTER_EXHAUSTED");
     expect(code(() => sealRecord({ ...base, nextCounter: 0, payload: new Uint8Array(4097) }))).toBe("SIZE_LIMIT");
     expect(sealRecord({ ...base, nextCounter: 0, payload: new Uint8Array(0) }).wire.length).toBe(169); // 159 without the 10-byte envelope
+    // The one wire-size calculation the outbox cap uses matches a sealed wire at both ends of the payload range.
+    for (const n of [0, 1, 22, 4096]) expect(sealRecord({ ...base, nextCounter: 0, payload: new Uint8Array(n) }).wire.length).toBe(recordWireBytes(n));
   });
 });
 

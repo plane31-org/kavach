@@ -13,7 +13,7 @@ import { big, unbig } from "./rows.js";
 import type { HistoryRow, OutboxRow, Store, Tx } from "./store.js";
 import { META, REVISION, STREAM, currentRevision, t3ApplyChange } from "./transactions.js";
 import type { AppendOutcome, Relay } from "./transport.js";
-import type { RecordKind } from "./codec.js";
+import { recordWireBytes, type RecordKind } from "./codec.js";
 
 export interface OutboxEvents {
   queued?(recordId: Uint8Array, kind: RecordKind): void;
@@ -55,7 +55,8 @@ export interface EnqueueOptions {
   /**
    * The event time of what the record describes (a fix time, say), carried in the encrypted
    * envelope. A reader orders the kind's newest slot by it, clamped to the send time. Absent for a
-   * kind with no natural event time; the slot then orders by send time.
+   * kind with no natural event time; the slot then orders by send time. Zero means absent: the
+   * envelope has no other way to say "none", and the sender's own slot follows the same reading.
    */
   readonly eventTime?: bigint;
 }
@@ -86,6 +87,9 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
   if (!declared) throw new KavachError("MALFORMED", stage, `kind ${kind} is not declared in the retention policy`);
   const key = options.idempotencyKey;
   if (key !== undefined && (key.length === 0 || key.length > MAX_IDEMPOTENCY_KEY)) throw new KavachError("MALFORMED", stage, "idempotency key must be 1 to 128 characters");
+  // One reading of the event time for the envelope, the own slot and the history row: zero is none.
+  const eventTime = options.eventTime === undefined || options.eventTime === 0n ? undefined : options.eventTime;
+  if (eventTime !== undefined && eventTime < 0n) throw new KavachError("MALFORMED", stage, "event time before the epoch");
   const superseded: Uint8Array[] = [];
   const result = await deps.store.transaction((tx) => {
     requireReady(tx);
@@ -121,14 +125,14 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
         bytes += row.wire.length / 2;
       }
     }
-    if (count >= deps.policy.maxOutboxRecords || bytes + payload.length + 159 > deps.policy.maxOutboxBytes) throw new KavachError("QUEUE_FULL", stage);
+    if (count >= deps.policy.maxOutboxRecords || bytes + recordWireBytes(payload.length) > deps.policy.maxOutboxBytes) throw new KavachError("QUEUE_FULL", stage);
     const a = deps.author();
     const sealed = sealRecord({
       streamId: a.streamId,
       epoch: epoch.epoch,
       nextCounter: epoch.nextCounter,
       kind,
-      eventTime: options.eventTime,
+      eventTime,
       headerClass: declared.headerClass,
       payload,
       sentAt: now,
@@ -153,7 +157,7 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
     // keeps it, and the own newest slot when the kind has one, so `newest` answers for self.
     const self = toHex(a.identityId);
     const hash = toHex(bodyHash(sealed.wire.subarray(0, sealed.wire.length - 64)));
-    const own = declared.newest ? takeSlot(tx, self, kind, { generation: a.generation, eventTime: clampEventTime(options.eventTime, now), epoch: epoch.epoch, counter: sealed.counter, recordId: id, bodyHash: hash, sentAt: now, receivedAt: now, payload }, toHex) : false;
+    const own = declared.newest ? takeSlot(tx, self, kind, { generation: a.generation, eventTime: clampEventTime(eventTime, now), epoch: epoch.epoch, counter: sealed.counter, recordId: id, bodyHash: hash, sentAt: now, receivedAt: now, payload }, toHex) : false;
     if (declared.history) {
       const ownRow: HistoryRow = {
         recordId: id,
@@ -168,7 +172,7 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
         plaintext: toHex(payload),
         superseded: false,
         own: true,
-        ...(options.eventTime === undefined ? {} : { eventTime: big(options.eventTime) })
+        ...(eventTime === undefined ? {} : { eventTime: big(eventTime) })
       };
       tx.put("history", id, ownRow);
       indexHistory(tx, ownRow);

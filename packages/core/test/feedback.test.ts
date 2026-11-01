@@ -11,7 +11,7 @@ import { FaultyStore } from "../src/testing/faults.js";
 import { KavachError } from "../src/errors.js";
 import { MemoryStore, type Store, type Tx } from "../src/store.js";
 import type { Directory, Relay } from "../src/transport.js";
-import { META, VAULT } from "../src/transactions.js";
+import { META, VAULT, t3ApplyChange } from "../src/transactions.js";
 import { pair, resetTrust, thrown, world, type World } from "./clientWorld.js";
 import { enqueueCheckIn, enqueueLocation, enqueueStatus, latest, latestStatus, locationFromDegrees } from "./location.js";
 
@@ -619,6 +619,46 @@ describe("feedback findings", () => {
     // The relay saw classes 3 and 0 in the header and nothing of the kinds 7 and 42.
     const stream = [...w.host.streams.values()].find((s) => s.accountName === "alice");
     expect([...(stream?.records.values() ?? [])].map((x) => x.kind).sort()).toEqual([]); // delivered and deleted: the relay kept no copy
+  });
+
+  it("26: a retry of a saved key is answered offline, even with a rotation due; a new record still needs the network", async () => {
+    const w = world();
+    const { a } = await pair(w);
+    const first = await a.client.enqueue(0, Uint8Array.of(1), { idempotencyKey: "fix:9", eventTime: w.clock.now() });
+    // The active epoch is invalidated (as any membership or device change does) and the host cannot
+    // be reached to publish the next one, so anything that needs an epoch needs the network.
+    await a.store.transaction((tx) => t3ApplyChange(tx, { kind: "counterExhausted" }));
+    a.t.knobs.refuse.add("publishEpoch");
+    const publishes = a.t.calls.filter((c) => c === "publishEpoch").length;
+    const again = await a.client.enqueue(0, Uint8Array.of(1), { idempotencyKey: "fix:9", eventTime: w.clock.now() });
+    expect([again.duplicate, toHex(again.recordId)]).toEqual([true, toHex(first.recordId)]);
+    expect(a.t.calls.filter((c) => c === "publishEpoch").length).toBe(publishes);
+    expect(await thrown(() => a.client.enqueue(0, Uint8Array.of(2), { idempotencyKey: "fix:10" }))).toBe("NETWORK");
+  });
+
+  it("27: a zero event time is none on both sides: sender and reader agree on the newest record", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    const zero = await a.client.enqueue(0, Uint8Array.of(1), { eventTime: 0n });
+    await a.client.enqueue(0, Uint8Array.of(2), { eventTime: 1n }); // an ancient event time, sent later
+    await w.sync(a);
+    await w.sync(b);
+    expect([Array.from((await a.client.newest(aliceId, 0))?.payload ?? []), Array.from((await b.client.newest(aliceId, 0))?.payload ?? [])]).toEqual([[1], [1]]);
+    const mine = (await a.client.history({ authorIdentityId: aliceId, kind: 0 })).find((h) => toHex(h.recordId) === toHex(zero.recordId));
+    const theirs = (await b.client.history({ authorIdentityId: aliceId, kind: 0 })).find((h) => toHex(h.recordId) === toHex(zero.recordId));
+    expect([mine?.eventTime, theirs?.eventTime, (await a.client.newest(aliceId, 0))?.eventTime]).toEqual([undefined, undefined, mine?.sentAt]);
+    expect(await thrown(() => a.client.enqueue(0, Uint8Array.of(3), { eventTime: -1n }))).toBe("MALFORMED");
+  });
+
+  it("28: the outbox byte cap counts the envelope: a record one byte over the cap is refused", async () => {
+    const { recordWireBytes } = await import("../src/codec.js");
+    const cap = recordWireBytes(10);
+    for (const [maxOutboxBytes, expected] of [[cap, "OK"], [cap - 1, "QUEUE_FULL"]] as const) {
+      const w = world({ ...testPolicy, maxOutboxBytes });
+      const a = await w.device("alice");
+      await a.client.initializeAccount();
+      expect(await thrown(() => a.client.enqueue(0, new Uint8Array(10)))).toBe(expected);
+    }
   });
 });
 

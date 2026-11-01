@@ -47,6 +47,10 @@ export const MAX_RESET_KEY_LIST_LIFETIME_MS = 2_592_000_000n; // 30 days
 export const ENVELOPE_VERSION = 1;
 export const ENVELOPE_BYTES = 1 + 1 + 8;
 export const MIN_RECORD_CIPHERTEXT = ENVELOPE_BYTES + TAG_BYTES;
+/** The size of a sealed record on the wire for a payload of this length: header, nonce, length, envelope, payload, tag, signature. */
+export function recordWireBytes(payloadLength: number): number {
+  return RECORD_HEADER_BYTES + NONCE_BYTES + 4 + ENVELOPE_BYTES + payloadLength + TAG_BYTES + SIGNATURE_BYTES;
+}
 export const MAX_RECORD_CIPHERTEXT = ENVELOPE_BYTES + MAX_PAYLOAD_BYTES + TAG_BYTES;
 export const MIN_VAULT_CIPHERTEXT = 90;
 export const MAX_VAULT_CIPHERTEXT = 4_990;
@@ -409,6 +413,7 @@ export interface Envelope {
 export function encodeEnvelope(e: Envelope, payload: Uint8Array): Uint8Array {
   if (!Number.isInteger(e.kind) || e.kind < 0 || e.kind > MAX_KIND) throw malformed("encode", "kind out of range");
   if (payload.length > MAX_PAYLOAD_BYTES) throw new KavachError("SIZE_LIMIT", "encode", "payload over 4,096 bytes");
+  if (e.eventTime !== undefined && e.eventTime < 0n) throw malformed("encode", "event time before the epoch");
   return new Writer().u8(ENVELOPE_VERSION).u8(e.kind).u64(e.eventTime ?? 0n).bytes(payload).finish();
 }
 

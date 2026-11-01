@@ -616,6 +616,13 @@ class ClientImpl implements Client {
 
   async enqueue(kind: RecordKind, payload: Uint8Array, options: EnqueueOptions = {}): Promise<EnqueueResult> {
     const deps = this.outboxDeps();
+    // A key answered before anything that may need the network: the record it names is already
+    // durable, so a retry offline, or with a rotation due, returns it. The outbox checks the key
+    // again inside its transaction for calls that race.
+    if (options.idempotencyKey !== undefined) {
+      const seen = await this.store.read((tx) => tx.get("enqueueKeys", options.idempotencyKey ?? ""));
+      if (seen) return { recordId: fromHex(seen.recordId), duplicate: true };
+    }
     await this.ensureEpoch();
     try {
       return this.enqueued(kind, await enqueue(deps, kind, payload, options));
