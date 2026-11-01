@@ -1,6 +1,6 @@
 /**
  * The crash and lost-response sweeps of build step 16. One scenario (two accounts, a circle,
- * locations both ways, a check-in, concurrent contexts, a phone replacement) runs once with no
+ * records of a slot kind both ways, an event kind, concurrent contexts, a device replacement) runs once with no
  * fault to count the victim's transaction boundaries, then once per boundary and phase with the
  * victim's process crashing there, restarting, and finishing the scenario. After every run the
  * durable-state outcomes of protocol section 11 are checked against the host's view.
@@ -154,14 +154,14 @@ function scenario(rt: Runtime, stores: SweepStores, run: string): Scenario {
     { name: "alice.enqueue#2", run: () => d("alice").client.enqueue(0, ...loc(2)) },
     { name: "alice.sync#4", run: sync("alice") },
     { name: "bob.sync#2", run: sync("bob") },
-    { name: "bob.checkIn", run: () => d("bob").client.enqueue(1, ...loc(3)) },
+    { name: "bob.event", run: () => d("bob").client.enqueue(1, ...loc(3)) },
     { name: "bob.sync#3", run: sync("bob") },
     { name: "alice.sync#5", run: sync("alice") },
     {
       name: "alice.concurrent",
       run: async () => {
         if (!stores.fork) return;
-        // The background location task: a second client over another handle on the same store.
+        // A background context: a second client over another handle on the same store.
         const a = d("alice");
         const bg = await open({ accountName: "alice", retentionPolicy: testPolicy, recoveryProvider: a.provider, resetTrust, secretStore: a.secrets, store: a.store.fork(), transport: a.transport, now: rt.clock.now });
         await Promise.all([a.client.sync(), bg.enqueue(0, ...loc(4)), bg.enqueue(0, ...loc(5))]);
@@ -175,7 +175,7 @@ function scenario(rt: Runtime, stores: SweepStores, run: string): Scenario {
     { name: "alice.sync#7", run: sync("alice") },
     { name: "bob2.sync#2", run: sync("bob2") },
     { name: "bob.sync#4", run: sync("bob") },
-    { name: "bob2.checkIn", run: () => d("bob2").client.enqueue(1, ...loc(7)) },
+    { name: "bob2.event", run: () => d("bob2").client.enqueue(1, ...loc(7)) },
     { name: "bob2.sync#3", run: sync("bob2") },
     { name: "alice.sync#8", run: sync("alice") }
   ];
@@ -330,15 +330,15 @@ async function checkInvariants(rt: Runtime, label: string): Promise<void> {
       if (hostSub && hostSub.cursor < BigInt(sub.committedCursor)) fail(`${name}: committed cursor ${sub.committedCursor} above the host's ${hostSub.cursor}`);
     }
   }
-  // Delivery: bob2 holds alice's newest location; alice has bob's check-ins.
+  // Delivery: bob2 holds alice's newest record of kind 0; alice has bob's kind 1 records.
   const aliceId = fromHex(alice.identityId);
   const pin = await d("bob2").client.newest(aliceId, 0);
   const aliceStream = host.streams.get((await d("alice").store.inner.read((tx) => tx.get("self", "self")))?.streamId ?? "");
   const accepted = host.appendLog.filter((a) => a.streamId === (aliceStream ? [...host.streams.entries()].find(([, s]) => s === aliceStream)?.[0] : "") && (a.status === "ACCEPTED" || a.status === "ALREADY_ACCEPTED"));
-  const lastLocation = [...accepted].reverse().find((a) => a.epoch === aliceStream?.currentEpoch);
-  if (lastLocation && (!pin || toHex(pin.recordId) !== lastLocation.recordId)) fail(`bob2's pin is ${pin ? toHex(pin.recordId).slice(0, 8) : "missing"}, alice's last is ${lastLocation.recordId.slice(0, 8)}`);
-  const checkIns = await d("alice").client.history({ authorIdentityId: fromHex(bob.identityId), kind: 1 });
-  if (checkIns.length < 2) fail(`alice has ${checkIns.length} check-ins from bob`);
+  const last = [...accepted].reverse().find((a) => a.epoch === aliceStream?.currentEpoch);
+  if (last && (!pin || toHex(pin.recordId) !== last.recordId)) fail(`bob2's slot is ${pin ? toHex(pin.recordId).slice(0, 8) : "missing"}, alice's last is ${last.recordId.slice(0, 8)}`);
+  const events = await d("alice").client.history({ authorIdentityId: fromHex(bob.identityId), kind: 1 });
+  if (events.length < 2) fail(`alice has ${events.length} kind 1 records from bob`);
 }
 
 async function withRun<R>(stores: SweepStores, run: string, fn: () => Promise<R>): Promise<R> {

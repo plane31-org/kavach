@@ -1,8 +1,8 @@
 /**
  * The secret store over Expo SecureStore (profile section 3). Every value is device-only:
  * `WHEN_UNLOCKED_THIS_DEVICE_ONLY`, never synced, never in a backup. Values are hex strings
- * because SecureStore stores text. No biometric prompt: background location updates are
- * unattended, and a prompt per read would stop them.
+ * because SecureStore stores text. No biometric prompt: background work is unattended, and a
+ * prompt per read would stop it.
  */
 import { fromHex, toHex, type SecretName, type SecretStore } from "@kavach/core/adapters";
 

@@ -19,7 +19,6 @@ export interface OutboxEvents {
   queued?(recordId: Uint8Array, kind: RecordKind): void;
   accepted?(recordId: Uint8Array): void;
   cancelled?(recordId: Uint8Array, reason: string): void;
-  /** A location's acceptance is unknown or it was cancelled: the host should supply a fresh sample. */
   /** A record of a kind with a newest slot was cancelled or is in doubt: the app may resend its current state of that kind. */
   refresh?(reason: string): void;
   securityError?(code: string, detail: string): void;
@@ -67,7 +66,7 @@ export interface Enqueued {
   epoch: number;
   /** True when the idempotency key matched an earlier enqueue and this call made no record. */
   duplicate: boolean;
-  /** True when this record became the sender's own live pin (kind 0) or own status (kind 2). */
+  /** True when this record took the sender's own newest slot for its kind. */
   own: boolean;
 }
 
@@ -76,8 +75,8 @@ export const MAX_IDEMPOTENCY_KEY = 128;
 /**
  * T6: require a usable active epoch under the current desired revision, enforce the queue limits,
  * seal once, write the outbox row and the own history row, and advance the counter. The record
- * id is returned only after commit. A status (kind 2) is latest-wins: a status still queued when
- * a newer one is enqueued is cancelled, never sent, and a status writes no history row. An
+ * id is returned only after commit. A kind declared latestWins cancels a queued record of the same
+ * kind when a newer one is enqueued, never a sent one; a slot-only kind writes no history row. An
  * idempotency key is answered before any check: its record is already durable, whatever has
  * happened to the queue since.
  */

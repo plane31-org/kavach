@@ -5,7 +5,7 @@
  * Keys sort by time and are unique: the tuple is the zero-padded `sentAt`, epoch and counter
  * followed by the record id. `t:<kind>:<tuple>` is the timeline of one kind; `a:<author>:<kind>:
  * <tuple>` is one author's. A query without a kind merges the two kinds that reach history
- * (locations and check-ins); a status is never history. The tuple doubles as the page cursor:
+ * declared with history; a slot-only kind is never history. The tuple doubles as the page cursor:
  * it names a position that no later write moves.
  */
 import { unbig } from "./rows.js";

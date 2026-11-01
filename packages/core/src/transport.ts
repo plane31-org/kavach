@@ -1,6 +1,6 @@
 /**
  * The transport the host implements (protocol section 13): a directory and a relay. The SDK
- * passes opaque bytes through unchanged; no plaintext location ever enters this interface.
+ * passes opaque bytes through unchanged; no plaintext payload ever enters this interface.
  */
 
 export type MutationStatus = "COMMITTED" | "ALREADY_COMMITTED" | "CONFLICT" | "IGNORED_OLDER" | "RETRYABLE" | "UNAUTHORIZED" | "PERMANENT_FAILURE";

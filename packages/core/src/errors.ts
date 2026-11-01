@@ -56,7 +56,7 @@ const RETRYABLE: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
 
 /**
  * Every failure the SDK reports. `code` is one of the protocol's codes, `stage` is a safe
- * stage name for logs (never a secret, a location or an identifier), `retryable` says whether
+ * stage name for logs (never a secret, a payload or an identifier), `retryable` says whether
  * the same call may succeed later without any change of state.
  */
 export class KavachError extends Error {

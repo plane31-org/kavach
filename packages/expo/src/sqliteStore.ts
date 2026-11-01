@@ -2,8 +2,8 @@
  * The durable store over SQLite with SQLCipher (profile section 3).
  *
  * One table holds every logical table as JSON rows. Every write runs inside `BEGIN IMMEDIATE`,
- * so SQLite's file lock serialises writers across the foreground app, the background location
- * task and any headless context; a writer that cannot take the lock within the busy timeout
+ * so SQLite's file lock serialises writers across the foreground app, a background task and
+ * any headless context; a writer that cannot take the lock within the busy timeout
  * gets `LOCKED`. The transaction callback is synchronous, so begin, callback and commit run in
  * one turn of the event loop; it may initiate a transport send before commit through
  * `tx.handoff` (T6h). Reads outside a transaction therefore see committed state only.

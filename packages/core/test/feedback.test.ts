@@ -564,6 +564,62 @@ describe("feedback findings", () => {
     await w.sync(c);
     expect(w.host.notifications.slice(before).filter((n) => n.to === "bob").map((n) => n.kind).sort()).toEqual(["visible", "wake"]);
   });
+
+  it("25: a product with two kinds the SDK has never heard of gets every declared behaviour: retention, queue, history, newest, header class and news", async () => {
+    // Kind 7: a reading (history and a slot, keep all, class 3, kept two hours). Kind 42: a mood
+    // (slot only, latest wins, class 0, kept one hour). Nothing in the SDK knows either number.
+    const policy = {
+      ...testPolicy,
+      kinds: [
+        { kind: 7, retentionMs: 7_200_000n, queue: "keepAll" as const, history: true, newest: true, headerClass: 3 as const },
+        { kind: 42, retentionMs: 3_600_000n, queue: "latestWins" as const, history: false, newest: true, headerClass: 0 as const }
+      ]
+    };
+    const w = world(policy);
+    const a = await w.device("alice");
+    const b = await w.device("bob");
+    await a.client.initializeAccount();
+    await b.client.initializeAccount();
+    const { circleId } = await a.client.circles.create();
+    const aliceId = (await a.client.inspect()).identityId ?? new Uint8Array();
+    await b.client.circles.requestJoin(circleId, aliceId);
+    await w.sync(a);
+    await a.client.circles.approve(circleId, "bob");
+    await w.sync(a);
+    await w.sync(b);
+    await w.sync(a);
+    const t = w.clock.now();
+    // Queue: keepAll keeps both readings; latestWins cancels the older mood as superseded.
+    const r1 = await a.client.enqueue(7, Uint8Array.of(1), { eventTime: t - 10n });
+    const r2 = await a.client.enqueue(7, Uint8Array.of(2), { eventTime: t - 20n }); // sent later, measured earlier
+    const m1 = await a.client.enqueue(42, Uint8Array.of(9));
+    const m2 = await a.client.enqueue(42, Uint8Array.of(8));
+    expect(await a.store.read((tx) => [tx.get("outbox", toHex(r1.recordId))?.status, tx.get("outbox", toHex(r2.recordId))?.status, tx.get("outbox", toHex(m1.recordId))?.reason, tx.get("outbox", toHex(m2.recordId))?.status])).toEqual(["queued", "queued", "superseded", "queued"]);
+    // The sender's own slots, under the same rules: the reading with the later event time, the newest mood.
+    expect([Array.from((await a.client.newest(aliceId, 7))?.payload ?? []), Array.from((await a.client.newest(aliceId, 42))?.payload ?? [])]).toEqual([[1], [8]]);
+    const notes = w.host.notifications.length;
+    await w.sync(a);
+    // Header class: class 3 and class 0 both wake the reader; the host saw no kind.
+    expect(w.host.notifications.slice(notes).filter((n) => n.to === "bob").map((n) => n.kind)).toEqual(["wake", "wake", "wake"]);
+    const events = b.events.length;
+    const r = await w.sync(b);
+    expect([r.inbox.stored, r.inbox.invalid]).toEqual([3, 0]);
+    // History and newest on the reader; news is what took a slot.
+    expect((await b.client.history({ authorIdentityId: aliceId })).map((h) => [h.kind, Array.from(h.plaintext)]).sort()).toEqual([[7, [1]], [7, [2]]]);
+    expect([Array.from((await b.client.newest(aliceId, 7))?.payload ?? []), Array.from((await b.client.newest(aliceId, 42))?.payload ?? [])]).toEqual([[1], [8]]);
+    const stored = b.events.slice(events).filter((e): e is Extract<typeof e, { kind: "recordStored" }> => e.kind === "recordStored");
+    expect(stored.map((e) => [e.recordKind, e.tookSlot]).sort()).toEqual([[42, true], [7, false], [7, true]]);
+    // Retention per kind: the mood goes after an hour, the readings after two.
+    w.clock.advance(3_600_000n + 1n);
+    await w.sync(b);
+    expect([await b.client.newest(aliceId, 42), (await b.client.history({ authorIdentityId: aliceId })).length]).toEqual([undefined, 2]);
+    w.clock.advance(3_600_000n);
+    await w.sync(b);
+    expect([await b.client.newest(aliceId, 7), (await b.client.history({ authorIdentityId: aliceId })).length]).toEqual([undefined, 0]);
+    // The relay saw classes 3 and 0 in the header and nothing of the kinds 7 and 42.
+    const stream = [...w.host.streams.values()].find((s) => s.accountName === "alice");
+    expect([...(stream?.records.values() ?? [])].map((x) => x.kind).sort()).toEqual([]); // delivered and deleted: the relay kept no copy
+  });
 });
 
 /** Carol: a third author who shares with Bob through a circle of her own. */
