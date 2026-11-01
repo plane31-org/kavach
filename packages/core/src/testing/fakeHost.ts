@@ -114,6 +114,8 @@ export class FakeHost {
   /** Test switch: the n-th call to listCircles (1-based) fails with a transport error, once. */
   failCircleListAt: number | undefined;
   circleListCalls = 0;
+  /** Every getSuccessions call, for tests that check where a peer resumes a chain. */
+  readonly successionCalls: { accountId: string; afterGeneration: bigint; limit: number }[] = [];
   resetKeyList: Uint8Array | undefined;
   resetSigner: { key: SigningKeypair; keyId: Uint8Array } | undefined;
   /** Test switches. */
@@ -484,6 +486,7 @@ export class FakeHost {
         return { status: "COMMITTED" as const, succession: wire };
       },
       async getSuccessions(accountId, afterGeneration, limit) {
+        host.successionCalls.push({ accountId: toHex(accountId), afterGeneration, limit });
         const a = host.accountByAnyId(toHex(accountId));
         if (!a || a.accountId !== toHex(accountId)) return { successions: [] };
         return host.successionPage(a, afterGeneration, limit);

@@ -36,8 +36,8 @@ export interface MetaRow {
   identityId: string;
   certificateHash: string;
   state: StoreState;
-  /** Set by account recovery: discovery of this account's circles through the host, page by page, until complete. */
-  bootstrap?: { cursor?: string; complete: boolean };
+  /** Set by account recovery: discovery of this account's circles through the host, page by page, until complete; failed circles wait in `retry`. */
+  bootstrap?: { cursor?: string; complete: boolean; retry?: BootstrapRetryRow[]; pagesDone?: boolean };
 }
 
 export interface SelfRow {
@@ -346,8 +346,23 @@ export interface PreferenceRow {
 /** Paged chain retrieval in progress for an account: verified pages persist, the pin moves only when complete. */
 export interface ChainProgressRow {
   accountId: string;
+  /** The identity the verified prefix starts from (the pinned identity, or the account id at first contact). */
+  startIdentityId: string;
+  /** The links verified so far, in order; the pin has not moved for any of them. */
+  links: { wire: string; certificate: string }[];
+  /** The generation to continue from. */
   nextGeneration: string;
   complete: boolean;
+}
+
+/** One circle the host listed during bootstrap that this device could not adopt yet; retried by every sync until it lands. */
+export interface BootstrapRetryRow {
+  circleId: string;
+  ownerAccountId: string;
+  role: "owner" | "member" | "pending";
+  snapshot: string | undefined;
+  enabled: boolean | undefined;
+  preferenceRevision: string;
 }
 
 export interface Tables {

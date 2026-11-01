@@ -13,6 +13,7 @@ Protocol revision 9: account recovery (amendment A1, adopted). No existing wire 
 - The sharing preference is held at the host too, written at the join request, at circle creation and on every change, ordered by a host revision so a delayed enable never overrides a later disable.
 - Error codes `SUCCESSION_BINDING`, `SUPERSEDED_IDENTITY`, `AUTHORIZATION_REQUIRED`, `AUTHORIZATION_EXPIRED`, `REPLACEMENT_CONFLICT`, `SUCCESSION_PENDING`; state `replacementPrepared`. A device retired by a succession erases its account seed and reports `SUPERSEDED_DEVICE`.
 - Fixture: a type 9 vector, four negatives (26 in all) and ten verifier cases, verified by the Python checker.
+- After review of the first implementation: every succession goes through one path with the policy gate first, so a first contact with a chained account pins nothing on a continuity-only deployment (and quarantines) or when the chain does not verify; a retired owner key can only vouch for a circle held at revision 0; the Worker's replacement and activation writes are conditional on winning the compare-and-swap; a bootstrap circle that fails is retried by every sync and named in the error; a paged chain resumes from its verified prefix within the sync's `catchUp` budget. `recoveryProvider` is optional on a recovery-only profile.
 
 ## 0.1.3
 

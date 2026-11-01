@@ -8,7 +8,8 @@
 import { equalBytes, toHex } from "../bytes.js";
 import { KavachError } from "../errors.js";
 import { invokeSync, type Store, type Tx } from "../store.js";
-import type { AppendOutcome, Directory, EpochBundle, MutationOutcome, ReadRecordsResult, Relay, Transport } from "../transport.js";
+import type {
+  ResolvedAccount, AppendOutcome, Directory, EpochBundle, MutationOutcome, ReadRecordsResult, Relay, Transport } from "../transport.js";
 
 // Crashes ------------------------------------------------------------------------------------------
 
@@ -197,6 +198,13 @@ export class MaliciousTransport implements Transport {
     return result;
   }
 
+  /** A resolved account as served: a forked or tampered certificate, and a tampered chain, where the knobs say so. */
+  private servedAccount(r: ResolvedAccount): ResolvedAccount {
+    const certificate = this.knobs.fork.certificates.get(r.accountName) ?? this.serve("certificate", r.certificate) ?? r.certificate;
+    const successions = r.successions?.map((l) => ({ ...l, wire: this.serve("succession", l.wire) ?? l.wire }));
+    return { ...r, certificate, ...(successions ? { successions } : {}) };
+  }
+
   private wrapDirectory(): Directory {
     // The inner transport may rebind itself per call (a device's certificate changes at
     // activation), so it is read on every call, never captured.
@@ -207,13 +215,13 @@ export class MaliciousTransport implements Transport {
         this.calls.push("resolveAccounts");
         if (k.withhold.has("certificates")) return [];
         const rs = await d().resolveAccounts(names);
-        return rs.map((r) => ({ ...r, certificate: k.fork.certificates.get(r.accountName) ?? this.serve("certificate", r.certificate) ?? r.certificate }));
+        return rs.map((r) => this.servedAccount(r));
       },
       resolveIdentities: async (ids) => {
         this.calls.push("resolveIdentities");
         if (k.withhold.has("certificates")) return [];
         const rs = await d().resolveIdentities(ids);
-        return rs.map((r) => ({ ...r, certificate: k.fork.certificates.get(r.accountName) ?? this.serve("certificate", r.certificate) ?? r.certificate }));
+        return rs.map((r) => this.servedAccount(r));
       },
       getCertificate: async (hash) => {
         this.calls.push("getCertificate");

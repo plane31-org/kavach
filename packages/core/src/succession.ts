@@ -112,12 +112,12 @@ export interface VerifiedLink {
   readonly certificate: Uint8Array;
 }
 
-export function verifyChain(links: readonly { wire: Uint8Array; certificate: Uint8Array }[], input: { accountId: Uint8Array; finalIdentityId: Uint8Array; trust: ResetTrust; now: bigint }): VerifiedLink[] {
+export function verifyChain(links: readonly { wire: Uint8Array; certificate: Uint8Array }[], input: { accountId: Uint8Array; startIdentityId?: Uint8Array; finalIdentityId?: Uint8Array; trust: ResetTrust; now: bigint }): VerifiedLink[] {
   const stage = "chain";
   const list = input.trust.state.current;
   if (!list || !input.trust.fresh(input.now)) throw new KavachError("RESET_KEYS_REQUIRED", stage, "no fresh key list");
   const out: VerifiedLink[] = [];
-  let previous = input.accountId;
+  let previous = input.startIdentityId ?? input.accountId;
   for (const link of links) {
     const parsed = expectType<AccountSuccession>(parseDocument(link.wire), DocumentType.AccountSuccession, stage);
     const signer = list.list.keys.find((k) => equalBytes(k.keyId, parsed.authorityKeyId));
@@ -129,7 +129,7 @@ export function verifyChain(links: readonly { wire: Uint8Array; certificate: Uin
     out.push({ doc, wire: link.wire, certificate: link.certificate });
     previous = doc.newIdentityId;
   }
-  if (!equalBytes(previous, input.finalIdentityId)) throw new KavachError("SUCCESSION_BINDING", stage, "the chain does not end at this key");
+  if (input.finalIdentityId && !equalBytes(previous, input.finalIdentityId)) throw new KavachError("SUCCESSION_BINDING", stage, "the chain does not end at this key");
   return out;
 }
 

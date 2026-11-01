@@ -24,9 +24,9 @@ export interface EnqueueResult {
 import { acceptsSuccession, allowsContinuity, kindOf, validatePolicy, type ReplacementModel, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
-import type { CircleRow, PendingResetRow, ReplacementRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
+import type { BootstrapRetryRow, CircleRow, MetaRow, PendingResetRow, ReplacementRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
 import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t3Circle, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault } from "./transactions.js";
-import { applySuccession, recordChainIn, rootIdentityIn, verifyChain, type VerifiedLink } from "./succession.js";
+import { applySuccession, recordChainIn, rootIdentityIn, verifyChain, type SuccessionEffect, type VerifiedLink } from "./succession.js";
 import type { CircleListing, Directory, Relay, ResolvedAccount, SuccessionLink, Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
 
@@ -133,7 +133,8 @@ export type ClientEvent =
 export interface OpenOptions {
   readonly accountName: string;
   readonly retentionPolicy: unknown;
-  readonly recoveryProvider: RecoveryProvider;
+  /** The platform's synced secret store for the recovery key. Required when the profile enables identity continuity; a recovery-only profile may omit it, and then has no vault backup and no recovery code. */
+  readonly recoveryProvider?: RecoveryProvider;
   readonly resetTrust: ResetTrustConfig;
   readonly secretStore: SecretStore;
   readonly store: Store;
@@ -253,10 +254,12 @@ export interface SyncError {
    */
   readonly streamId?: Uint8Array;
   readonly authorIdentityId?: Uint8Array;
+  /** On a `bootstrap` entry: the circle that could not be adopted on this sync; it is retried by the next. */
+  readonly circleId?: Uint8Array;
 }
 
-function syncError(operation: string, e: unknown): SyncError {
-  return e instanceof KavachError ? { operation, code: e.code, stage: e.stage, retryable: e.retryable } : { operation, code: "UNEXPECTED", stage: operation, retryable: false };
+function syncError(operation: string, e: unknown, extra: Partial<Pick<SyncError, "circleId" | "streamId" | "authorIdentityId">> = {}): SyncError {
+  return e instanceof KavachError ? { operation, code: e.code, stage: e.stage, retryable: e.retryable, ...extra } : { operation, code: "UNEXPECTED", stage: operation, retryable: false, ...extra };
 }
 
 const RESET_LIST_RECHECK_MS = 86_400_000n;
@@ -264,6 +267,7 @@ const RESET_LIST_RECHECK_MS = 86_400_000n;
 export async function open(options: OpenOptions): Promise<Client> {
   await ready();
   const policy = validatePolicy(options.retentionPolicy);
+  if (!options.recoveryProvider && allowsContinuity(policy)) throw new KavachError("MALFORMED", "open", "recoveryProvider is required when the profile enables identity continuity");
   const impl = new ClientImpl(options, policy);
   await impl.load();
   return impl;
@@ -274,7 +278,7 @@ class ClientImpl implements Client {
   private readonly store: Store;
   private readonly secrets: SecretStore;
   private readonly transport: Transport;
-  private readonly provider: RecoveryProvider;
+  private readonly provider: RecoveryProvider | undefined;
   private readonly now: () => bigint;
   private readonly listeners = new Set<(e: ClientEvent) => void>();
   private account: OwnAccount | undefined;
@@ -284,6 +288,8 @@ class ClientImpl implements Client {
   private selfPin: AccountPin | undefined;
   private trust: ResetTrust;
   private syncing: Promise<SyncReport> | undefined;
+  /** The current sync's reading budget: records, and the links of a succession chain, count against it. */
+  private syncBudget: ReadBudget | undefined;
   private backupChecked = false;
   readonly circles: Client["circles"];
 
@@ -519,7 +525,7 @@ class ClientImpl implements Client {
     this.selfPin = pin;
     // The recovery key goes to the provider; enrollment never blocks on it or on the code.
     try {
-      await this.provider.save(this.accountName, pin.identityId, recoveryKey);
+      await this.provider?.save(this.accountName, pin.identityId, recoveryKey);
     } catch {
       /* status is reported by recoveryStatus() */
     }
@@ -528,6 +534,7 @@ class ClientImpl implements Client {
   }
 
   async recoveryStatus(): Promise<ProviderStatusResult> {
+    if (!this.provider) return { status: "unsupported", backupState: "unavailable", reason: "no recovery provider on a recovery-only profile" };
     return this.provider.status();
   }
 
@@ -557,14 +564,10 @@ class ClientImpl implements Client {
     if (!vaultWire) throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, "no vault");
     const accountId = resolvedAccountId(resolved);
     const identity = pinFromCertificate(current).identityId;
+    if (!this.provider) throw new KavachError("NOT_AUTHORIZED", stage, "identity continuity needs a recovery provider");
     // An account that succeeded: the served chain is verified link by link under the current list,
     // from the root to the key this device is about to hold, before anything is written.
-    const chain = await this.wholeChain(accountId, resolved);
-    let verified: VerifiedLink[] = [];
-    if (chain.length > 0) {
-      await this.ensureResetList();
-      verified = verifyChain(chain, { accountId, finalIdentityId: identity, trust: this.trust, now: this.now() });
-    }
+    const verified = resolved.successions?.length ? (await this.followChain({ accountId, accountName: this.accountName, finalIdentityId: identity, firstPage: resolved.successions, next: resolved.successionsNext })).verified : [];
     const recovered = await recoverAccount({
       accountName: this.accountName,
       identityId: identity,
@@ -637,7 +640,7 @@ class ClientImpl implements Client {
     this.device = device;
     this.selfPin = pin;
     try {
-      await this.provider.save(this.accountName, pin.identityId, input.recoveryKey);
+      await this.provider?.save(this.accountName, pin.identityId, input.recoveryKey);
     } catch {
       /* reported by recoveryStatus() */
     }
@@ -692,7 +695,7 @@ class ClientImpl implements Client {
    * asks the provider and saves again when it has nothing for this identity.
    */
   private async ensureBackup(): Promise<void> {
-    if (this.backupChecked || !this.selfPin) return;
+    if (this.backupChecked || !this.selfPin || !this.provider) return;
     this.backupChecked = true;
     try {
       const key = await this.secrets.get("recoveryKey");
@@ -844,6 +847,10 @@ class ClientImpl implements Client {
       purged: 0,
       errors: []
     };
+    this.syncBudget = {
+      remainingRecords: Math.max(1, Math.floor(options.catchUp?.maxRecords ?? DEFAULT_CATCH_UP.maxRecords)),
+      deadline: this.now() + BigInt(Math.max(0, Math.floor(options.catchUp?.maxMs ?? DEFAULT_CATCH_UP.maxMs)))
+    };
     if (!this.selfPin) {
       // A prepared replacement whose commit this device never saw: the chain says whether it landed.
       const row = await this.store.read((tx) => tx.get("replacement", "pending"));
@@ -884,7 +891,7 @@ class ClientImpl implements Client {
     await this.ensureBackup();
     if (meta.bootstrap && !meta.bootstrap.complete) {
       try {
-        report.bootstrap = await this.bootstrap(report, meta.bootstrap.cursor);
+        report.bootstrap = await this.bootstrap(report, meta.bootstrap);
       } catch (e) {
         report.errors.push(syncError("bootstrap", e));
       }
@@ -920,10 +927,8 @@ class ClientImpl implements Client {
     // Each stream on its own: a failed download or a refused record names its stream in the report
     // and leaves the other streams to be read; a stream that failed is not counted as synced.
     // One budget spans the streams; a stream it stops early reports hasMore.
-    const budget: ReadBudget = {
-      remainingRecords: Math.max(1, Math.floor(options.catchUp?.maxRecords ?? DEFAULT_CATCH_UP.maxRecords)),
-      deadline: this.now() + BigInt(Math.max(0, Math.floor(options.catchUp?.maxMs ?? DEFAULT_CATCH_UP.maxMs)))
-    };
+    const budget: ReadBudget = this.syncBudget;
+    if (budget.remainingRecords < 1) budget.remainingRecords = 1; // every stream reads at least one page
     for (const s of subs) {
       try {
         const known = await this.store.read((tx) => tx.list("certificates").some(([, c]) => c.streamId === toHex(s.streamId)));
@@ -1082,27 +1087,10 @@ class ClientImpl implements Client {
    * attestations leave the device as it is.
    */
   private async supersededBySuccession(pin: AccountPin, me: ResolvedAccount): Promise<boolean> {
-    const fromUs = (l: SuccessionLink): boolean => {
-      try {
-        return toHex(expectType<AccountSuccession>(parseDocument(l.wire), DocumentType.AccountSuccession, "sync").previousIdentityId) === toHex(pin.identityId);
-      } catch {
-        return false;
-      }
-    };
-    let link = (me.successions ?? []).find(fromUs);
-    let cursor = me.successionsNext;
-    for (let pages = 0; !link && cursor !== undefined && pages < 64; pages++) {
-      const page = await this.transport.directory.getSuccessions(pin.accountId, cursor, 32);
-      link = page.successions.find(fromUs);
-      cursor = page.successions.length ? page.nextGeneration : undefined;
-    }
-    if (!link) return false;
+    if (!me.successions?.length) return false;
     try {
-      return await this.store.transaction((tx) => {
-        const effect = applySuccession(tx, { wire: link.wire, newCertificate: link.certificate, policy: this.policy, trust: this.trust, now: this.now() });
-        this.persistTrustIn(tx);
-        return effect.outcome === "ACCEPTED" || effect.outcome === "DUPLICATE";
-      });
+      const r = await this.followChain({ accountId: pin.accountId, accountName: pin.accountName, current: pin, firstPage: me.successions, next: me.successionsNext, budget: this.syncBudget });
+      return r.pin !== undefined && !equalBytes(r.pin.identityId, pin.identityId);
     } catch {
       return false;
     }
@@ -1115,12 +1103,17 @@ class ClientImpl implements Client {
    */
   private async acceptSnapshotFrom(c: CircleState, wire: Uint8Array, ownerPin: AccountPin, now: bigint, report?: SyncReport, resolved = false): Promise<ReturnType<typeof acceptSnapshot>> {
     const { pin } = this.requireAccount("sync");
+    // The very bytes this device already verified (a bootstrap snapshot under a key since retired)
+    // are a duplicate whatever key signed them; only new bytes are verified.
+    if (c.snapshot && equalBytes(c.snapshot, wire)) return { outcome: "DUPLICATE", state: c };
     try {
       return acceptSnapshot(c, wire, ownerPin.accountKey, pin.accountId, now);
     } catch (e) {
       if (!isKavachError(e, "BAD_SIGNATURE")) throw e;
+      // A retired key may only vouch for a circle this device holds at revision 0 (bootstrap, first
+      // contact): an established circle advances under the current owner key alone.
       const ownerHex = toHex(ownerPin.accountId);
-      const retiredKeys = await this.store.read((tx) => tx.list("identities").flatMap(([, r]) => (r.accountId === ownerHex && r.retired && r.accountKey ? [fromHex(r.accountKey)] : [])));
+      const retiredKeys = c.revision === 0n ? await this.store.read((tx) => tx.list("identities").flatMap(([, r]) => (r.accountId === ownerHex && r.retired && r.accountKey ? [fromHex(r.accountKey)] : []))) : [];
       for (const key of retiredKeys) {
         try {
           return acceptSnapshot(c, wire, key, pin.accountId, now);
@@ -1148,65 +1141,103 @@ class ClientImpl implements Client {
   }
 
   /**
-   * Apply the host's succession chain for a pinned account: each link in order, accepted ones as
-   * duplicates. Returns the pin as it stands afterwards, or undefined when a link was deferred or
-   * refused, in which case the certificate under the new key must not be accepted either.
+   * The one path every succession takes (section 4, "Chains"): the policy gate first, then the
+   * key list, then each link verified in order from the start identity (the pinned identity for
+   * an established contact, the account id at first contact or for a restoring device), page by
+   * page within the sync's budget, with the verified prefix persisted so that the next sync
+   * resumes instead of starting over. Only when the chain is complete does anything move: for a
+   * pinned contact every link is applied in one transaction, so no epoch is ever sealed to an
+   * intermediate successor; for a first contact or a restore the verified links are returned and
+   * the caller records them with the pin or the header. Any failure leaves the pin where it was.
    */
-  private async applyChain(current: AccountPin, firstPage: readonly SuccessionLink[], next: bigint | undefined, report: SyncReport): Promise<AccountPin | undefined> {
-    const accountHex = toHex(current.accountId);
-    // The whole chain first (section 7: paged and bounded); the pin moves only when it is complete,
-    // so no epoch is ever sealed to an intermediate successor.
-    const links = [...firstPage];
-    let cursor = next;
-    for (let pages = 0; cursor !== undefined && pages < 64; pages++) {
+  private async followChain(input: { accountId: Uint8Array; accountName: string; current?: AccountPin; finalIdentityId?: Uint8Array; firstPage: readonly SuccessionLink[]; next: bigint | undefined; budget?: ReadBudget | undefined }): Promise<{ pin: AccountPin | undefined; verified: VerifiedLink[]; accepted: SuccessionEffect[] }> {
+    const stage = "chain";
+    if (!acceptsSuccession(this.policy)) throw new KavachError("UNSUPPORTED_TYPE", stage, "this deployment does not accept successions");
+    const accountHex = toHex(input.accountId);
+    const startIdentity = input.current?.identityId ?? input.accountId;
+    await this.ensureResetList();
+    const progress = await this.store.read((tx) => tx.get("chainProgress", accountHex));
+    const verified: VerifiedLink[] = [];
+    let cursor: bigint | undefined;
+    let pending: readonly SuccessionLink[];
+    if (progress && progress.startIdentityId === toHex(startIdentity) && progress.links.length > 0) {
+      // Resume: the prefix was verified by an earlier sync from this same start.
+      for (const l of progress.links) verified.push({ doc: expectType<AccountSuccession>(parseDocument(fromHex(l.wire)), DocumentType.AccountSuccession, stage), wire: fromHex(l.wire), certificate: fromHex(l.certificate) });
+      cursor = unbig(progress.nextGeneration);
+      pending = [];
+    } else {
+      pending = input.firstPage;
+      cursor = input.next;
+    }
+    const verifyMore = (links: readonly SuccessionLink[]): void => {
+      const from = verified.at(-1)?.doc.newIdentityId ?? startIdentity;
+      verified.push(...verifyChain(links, { accountId: input.accountId, startIdentityId: from, trust: this.trust, now: this.now() }));
+    };
+    const persist = (): Promise<void> =>
+      this.store.transaction((tx) => {
+        if (cursor === undefined) tx.delete("chainProgress", accountHex);
+        else tx.put("chainProgress", accountHex, { accountId: accountHex, startIdentityId: toHex(startIdentity), links: verified.map((v) => ({ wire: toHex(v.wire), certificate: toHex(v.certificate) })), nextGeneration: big(cursor), complete: false });
+      });
+    verifyMore(pending);
+    if (input.budget) input.budget.remainingRecords -= pending.length;
+    while (cursor !== undefined) {
+      if (input.budget && (input.budget.remainingRecords <= 0 || this.now() >= input.budget.deadline)) {
+        await persist();
+        throw new KavachError("METADATA_REQUIRED", stage, "the chain continues past this sync's budget");
+      }
       let page;
       try {
-        page = await this.transport.directory.getSuccessions(current.accountId, cursor, 32);
+        page = await this.transport.directory.getSuccessions(input.accountId, cursor, 32);
       } catch (e) {
-        report.errors.push(syncError("succession", e));
-        break;
+        await persist();
+        throw e;
       }
-      if (page.successions.length === 0) break;
-      links.push(...page.successions);
+      if (page.successions.length === 0) {
+        await persist();
+        throw new KavachError("METADATA_REQUIRED", stage, "the host did not finish serving the chain");
+      }
+      verifyMore(page.successions);
+      if (input.budget) input.budget.remainingRecords -= page.successions.length;
       cursor = page.nextGeneration;
+      if (cursor !== undefined) await persist();
     }
-    if (cursor !== undefined) {
-      const remaining = cursor;
-      await this.store.transaction((tx) => tx.put("chainProgress", accountHex, { accountId: accountHex, nextGeneration: big(remaining), complete: false }));
-      report.errors.push({ operation: "succession", code: "METADATA_REQUIRED", stage: "chain", retryable: true });
-      return undefined;
+    const last = verified.at(-1)?.doc.newIdentityId ?? startIdentity;
+    if (input.finalIdentityId && !equalBytes(last, input.finalIdentityId)) throw new KavachError("SUCCESSION_BINDING", stage, "the chain does not end at the served key");
+    if (!input.current) {
+      if (progress) await this.store.transaction((tx) => tx.delete("chainProgress", accountHex));
+      return { pin: undefined, verified, accepted: [] };
     }
-    try {
-      const applied = await this.store.transaction((tx) => {
-        const effects: ReturnType<typeof applySuccession>[] = [];
-        let pin = current;
-        for (const link of links) {
-          const doc = expectType<AccountSuccession>(parseDocument(link.wire), DocumentType.AccountSuccession, "sync");
-          // A link behind the pinned key that is already on record: the pin moved past it earlier.
-          if (doc.previousGeneration < pin.generation && tx.list("successions").some(([, s]) => s.accountId === accountHex && unbig(s.previousGeneration) === doc.previousGeneration)) continue;
-          const e = applySuccession(tx, { wire: link.wire, newCertificate: link.certificate, policy: this.policy, trust: this.trust, now: this.now() });
-          effects.push(e);
-          pin = e.pin;
-        }
-        this.persistTrustIn(tx);
-        tx.delete("chainProgress", accountHex);
-        return { effects, pin };
-      });
-      for (const effect of applied.effects) {
-        if (effect.outcome !== "ACCEPTED") continue;
-        report.metadata.successions++;
-        report.metadata.rotations++;
-        this.emit({ kind: "accountKeyChanged", accountName: effect.accountName, quarantined: false });
-        this.emit({ kind: "deviceChanged", identityId: effect.pin.accountId, generation: effect.pin.generation });
+    const current = input.current;
+    const applied = await this.store.transaction((tx) => {
+      const effects: SuccessionEffect[] = [];
+      let pin = current;
+      for (const link of verified) {
+        // A link behind the pinned key that is already on record: the pin moved past it earlier.
+        if (link.doc.previousGeneration < pin.generation && tx.list("successions").some(([, s]) => s.accountId === accountHex && unbig(s.previousGeneration) === link.doc.previousGeneration)) continue;
+        const e = applySuccession(tx, { wire: link.wire, newCertificate: link.certificate, policy: this.policy, trust: this.trust, now: this.now() });
+        effects.push(e);
+        pin = e.pin;
       }
-      return applied.pin;
-    } catch (e) {
-      report.errors.push(syncError("succession", e));
-      if (e instanceof KavachError && (e.code === "EQUIVOCATION" || e.code === "ROLLBACK" || e.code === "SUCCESSION_BINDING" || e.code === "DEVICE_ID_REUSED")) {
-        this.emit({ kind: "securityError", code: e.code, detail: current.accountName });
-      }
-      return undefined;
+      this.persistTrustIn(tx);
+      tx.delete("chainProgress", accountHex);
+      return { effects, pin };
+    });
+    return { pin: applied.pin, verified, accepted: applied.effects };
+  }
+
+  /** The report side of an applied chain: counters and events for every accepted link. */
+  private reportAccepted(accepted: readonly SuccessionEffect[], report: SyncReport): void {
+    for (const effect of accepted) {
+      if (effect.outcome !== "ACCEPTED") continue;
+      report.metadata.successions++;
+      report.metadata.rotations++;
+      this.emit({ kind: "accountKeyChanged", accountName: effect.accountName, quarantined: false });
+      this.emit({ kind: "deviceChanged", identityId: effect.pin.accountId, generation: effect.pin.generation });
     }
+  }
+
+  private securityCodeOf(e: unknown): ErrorCode | undefined {
+    return e instanceof KavachError && (e.code === "EQUIVOCATION" || e.code === "ROLLBACK" || e.code === "SUCCESSION_BINDING" || e.code === "DEVICE_ID_REUSED" || e.code === "SUPERSEDED_IDENTITY") ? e.code : undefined;
   }
 
   /** Accept a member's certificate; a changed account key is quarantined unless a succession chain or a reset receipt explains it. */
@@ -1216,14 +1247,44 @@ class ClientImpl implements Client {
     const doc = expectType<AccountDevice>(verifyDocument(wire), DocumentType.AccountDevice, "sync");
     const existing = await this.store.read((tx) => tx.list("pins").find(([, p]) => p.accountName === doc.accountName)?.[1]);
     let current = existing ? rowToPin(existing) : undefined;
-    if (current && resolved.successions?.length && !equalBytes(current.accountKey, doc.accountKey)) {
-      if (!acceptsSuccession(this.policy)) {
-        // This deployment replaces keys by identity continuity only: the chain is refused whoever
-        // signed it, and the key change below is quarantined as a bare directory key change.
-        report.errors.push(syncError("succession", new KavachError("UNSUPPORTED_TYPE", "succession", "this deployment does not accept successions")));
-      } else {
-        current = await this.applyChain(current, resolved.successions, resolved.successionsNext, report);
-        if (!current) return;
+    const accountId = current?.accountId ?? resolvedAccountId(resolved);
+    const chain = resolved.successions ?? [];
+    if (current && chain.length > 0 && !equalBytes(current.accountKey, doc.accountKey)) {
+      try {
+        const r = await this.followChain({ accountId, accountName: doc.accountName, current, firstPage: chain, next: resolved.successionsNext, budget: this.syncBudget });
+        this.reportAccepted(r.accepted, report);
+        current = r.pin;
+      } catch (e) {
+        report.errors.push(syncError("succession", e));
+        // A deployment that refuses successions quarantines the key change below, as a bare
+        // directory key change. Anything else leaves the pin where it was until the next sync.
+        if (!isKavachError(e, "UNSUPPORTED_TYPE")) {
+          const code = this.securityCodeOf(e);
+          if (code) this.emit({ kind: "securityError", code, detail: doc.accountName });
+          return;
+        }
+      }
+      if (!current) return;
+    }
+    let verified: VerifiedLink[] = [];
+    if (!current && chain.length > 0) {
+      // A first contact with an account that went through successions: the chain is verified from
+      // the root to the served key before any pin is written, under the same policy gate as for an
+      // established contact. A deployment that refuses successions pins nothing and quarantines.
+      try {
+        verified = (await this.followChain({ accountId, accountName: doc.accountName, finalIdentityId: pinFromCertificate(doc).identityId, firstPage: chain, next: resolved.successionsNext, budget: this.syncBudget })).verified;
+      } catch (e) {
+        report.errors.push(syncError("succession", e));
+        if (isKavachError(e, "UNSUPPORTED_TYPE")) {
+          const already = await this.store.read((tx) => tx.get("quarantine", doc.accountName));
+          await this.store.transaction((tx) => tx.put("quarantine", doc.accountName, { accountName: doc.accountName, certificate: toHex(wire), reason: "succession refused", at: big(this.now()) }));
+          report.metadata.quarantined++;
+          if (!already) this.emit({ kind: "accountKeyChanged", accountName: doc.accountName, quarantined: true });
+        } else {
+          const code = this.securityCodeOf(e);
+          if (code) this.emit({ kind: "securityError", code, detail: doc.accountName });
+        }
+        return;
       }
     }
     let outcome;
@@ -1242,21 +1303,7 @@ class ClientImpl implements Client {
       throw e;
     }
     if (outcome.outcome === "DUPLICATE") return;
-    // A first contact with an account that went through successions is pinned under its root id,
-    // as the chain the host serves names it. The current key is taken from the directory exactly
-    // as a first certificate is today; the chain is verified so that what the retired keys signed
-    // (an owner's snapshot from before the succession) can still be checked.
-    const p = current ? outcome.pin : { ...outcome.pin, accountId: resolvedAccountId(resolved) };
-    let verified: VerifiedLink[] = [];
-    if (!current && resolved.successions?.length && acceptsSuccession(this.policy)) {
-      try {
-        const links = await this.wholeChain(p.accountId, resolved);
-        await this.ensureResetList();
-        verified = verifyChain(links, { accountId: p.accountId, finalIdentityId: p.identityId, trust: this.trust, now: this.now() });
-      } catch (e) {
-        report.errors.push(syncError("succession", e));
-      }
-    }
+    const p = current ? outcome.pin : { ...outcome.pin, accountId };
     await this.store.transaction((tx) => {
       tx.put("pins", toHex(p.accountId), pinToRow(p));
       if (verified.length) {
@@ -1828,19 +1875,6 @@ class ClientImpl implements Client {
     return this.activateReplacement(row, roots, outcome.succession);
   }
 
-  /** Every link of a resolved account's chain: the attached first page and whatever pages follow. */
-  private async wholeChain(accountId: Uint8Array, resolved: ResolvedAccount): Promise<SuccessionLink[]> {
-    const links = [...(resolved.successions ?? [])];
-    let cursor = resolved.successionsNext;
-    for (let pages = 0; cursor !== undefined && pages < 64; pages++) {
-      const page = await this.transport.directory.getSuccessions(accountId, cursor, 32);
-      if (page.successions.length === 0) throw new KavachError("METADATA_REQUIRED", "chain", "the host did not finish serving the chain");
-      links.push(...page.successions);
-      cursor = page.nextGeneration;
-    }
-    return links;
-  }
-
   /** Our own link on the host's chain, if the proposal committed: the one naming our succession id and certificate. */
   private async findOwnLink(row: ReplacementRow): Promise<SuccessionLink | undefined> {
     const page = await this.transport.directory.getSuccessions(fromHex(row.accountId), unbig(row.expectedGeneration), 8);
@@ -1913,7 +1947,7 @@ class ClientImpl implements Client {
     this.selfPin = pin;
     this.retired = false;
     try {
-      await this.provider.save(this.accountName, pin.identityId, recoveryKey);
+      await this.provider?.save(this.accountName, pin.identityId, recoveryKey);
     } catch {
       /* reported by recoveryStatus() */
     }
@@ -1928,36 +1962,57 @@ class ClientImpl implements Client {
    * the circle is enabled only if the served preference says so. Never writes membership; an
    * owner's successor republishes the served snapshot at the next revision.
    */
-  private async bootstrap(report: SyncReport, start: string | undefined): Promise<{ circles: number; pending: number; failed: number }> {
+  private async bootstrap(report: SyncReport, state: NonNullable<MetaRow["bootstrap"]>): Promise<{ circles: number; pending: number; failed: number }> {
     const out = { circles: 0, pending: 0, failed: 0 };
-    let cursor = start;
-    for (let pages = 0; pages < 64; pages++) {
+    // A circle that could not be adopted is kept with what the host served and retried by every
+    // sync; a failure never advances past it silently, and never undoes another circle.
+    let retry: BootstrapRetryRow[] = state.retry ?? [];
+    let cursor = state.cursor;
+    let pagesDone = state.pagesDone === true;
+    const adopt = async (c: CircleListing): Promise<boolean> => {
+      try {
+        const r = await this.adoptListing(c, report);
+        if (r === "member") out.circles++;
+        else if (r === "pending") out.pending++;
+        return true;
+      } catch (e) {
+        out.failed++;
+        report.errors.push(syncError("bootstrap", e, { circleId: c.circleId }));
+        return false;
+      }
+    };
+    const save = (done: boolean): Promise<void> =>
+      this.store.transaction((tx) => {
+        const meta = tx.get("meta", META);
+        if (!meta) return;
+        const bootstrap = done && retry.length === 0 ? { complete: true } : { ...(cursor === undefined ? {} : { cursor }), complete: false, retry, pagesDone: done };
+        tx.put("meta", META, { ...meta, bootstrap });
+        t9MarkVault(tx);
+      });
+    const stillFailing: BootstrapRetryRow[] = [];
+    for (const r of retry) {
+      const listing: CircleListing = { circleId: fromHex(r.circleId), ownerAccountId: fromHex(r.ownerAccountId), role: r.role, snapshot: r.snapshot === undefined ? undefined : fromHex(r.snapshot), enabled: r.enabled, preferenceRevision: unbig(r.preferenceRevision) };
+      if (!(await adopt(listing))) stillFailing.push(r);
+    }
+    retry = stillFailing;
+    for (let pages = 0; !pagesDone && pages < 64; pages++) {
       let page;
       try {
         page = await this.transport.directory.listCircles(cursor);
       } catch (e) {
         // What landed stays; the cursor says where to resume on the next sync.
         report.errors.push(syncError("bootstrap", e));
+        await save(false);
         return out;
       }
       for (const c of page.circles) {
-        try {
-          const r = await this.adoptListing(c, report);
-          if (r === "member") out.circles++;
-          else if (r === "pending") out.pending++;
-        } catch (e) {
-          out.failed++;
-          report.errors.push(syncError("bootstrap", e));
-        }
+        if (!(await adopt(c))) retry.push({ circleId: toHex(c.circleId), ownerAccountId: toHex(c.ownerAccountId), role: c.role, snapshot: c.snapshot === undefined ? undefined : toHex(c.snapshot), enabled: c.enabled, preferenceRevision: big(c.preferenceRevision) });
       }
-      await this.store.transaction((tx) => {
-        const meta = tx.get("meta", META);
-        if (meta) tx.put("meta", META, { ...meta, bootstrap: page.cursor === undefined ? { complete: true } : { cursor: page.cursor, complete: false } });
-        t9MarkVault(tx);
-      });
-      if (page.cursor === undefined) break;
       cursor = page.cursor;
+      if (cursor === undefined) pagesDone = true;
+      await save(pagesDone);
     }
+    await save(pagesDone);
     return out;
   }
 
@@ -2068,7 +2123,7 @@ class ClientImpl implements Client {
     this.device = device;
     this.selfPin = newPin;
     try {
-      await this.provider.save(this.accountName, newPin.identityId, recoveryKey);
+      await this.provider?.save(this.accountName, newPin.identityId, recoveryKey);
     } catch {
       /* reported by recoveryStatus() */
     }

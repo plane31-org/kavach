@@ -201,25 +201,29 @@ export class Directory {
       )
     );
     const vault = input.newVault ? parseVaultHeader(unhex(input.newVault, "newVault")) : undefined;
+    // The compare-and-swap goes first, and every other statement is conditional on it having
+    // moved the account to the new certificate: a batch that loses the race writes nothing, so a
+    // losing proposal can never answer ALREADY_COMMITTED later.
+    const won = "EXISTS (SELECT 1 FROM accounts WHERE account_name = ?1 AND certificate_hash = ?2)";
     const statements = [
-      this.db.prepare("UPDATE authorizations SET used = 1 WHERE token = ?").bind(input.authorization),
-      this.db
-        .prepare("INSERT INTO successions (succession_id, account_name, account_id, previous_generation, new_generation, wire, certificate, certificate_hash, previous_certificate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(input.successionId, a.account_name, accountId, a.generation, doc.generation.toString(), wire, input.newCertificate, certHash, a.certificate),
       vault && input.newVault
         ? this.db
-            .prepare("UPDATE accounts SET account_key = ?, identity_id = ?, certificate = ?, certificate_hash = ?, generation = ?, vault = ?, vault_revision = ?, vault_hash = ? WHERE account_name = ? AND certificate_hash = ?")
-            .bind(hex(doc.accountKey), hex(newIid), input.newCertificate, certHash, doc.generation.toString(), input.newVault, vault.vaultRevision.toString(), hex(vault.hash), a.account_name, input.expectedCertificateHash)
+            .prepare("UPDATE accounts SET account_key = ?3, identity_id = ?4, certificate = ?5, certificate_hash = ?2, generation = ?6, vault = ?7, vault_revision = ?8, vault_hash = ?9 WHERE account_name = ?1 AND certificate_hash = ?10")
+            .bind(a.account_name, certHash, hex(doc.accountKey), hex(newIid), input.newCertificate, doc.generation.toString(), input.newVault, vault.vaultRevision.toString(), hex(vault.hash), input.expectedCertificateHash)
         : this.db
-            .prepare("UPDATE accounts SET account_key = ?, identity_id = ?, certificate = ?, certificate_hash = ?, generation = ? WHERE account_name = ? AND certificate_hash = ?")
-            .bind(hex(doc.accountKey), hex(newIid), input.newCertificate, certHash, doc.generation.toString(), a.account_name, input.expectedCertificateHash),
-      this.db.prepare("INSERT OR IGNORE INTO identities (identity_id, account_name) VALUES (?, ?)").bind(hex(newIid), a.account_name),
-      this.db.prepare("UPDATE certificates SET current = 0 WHERE account_name = ?").bind(a.account_name),
-      this.db.prepare("INSERT INTO certificates (certificate_hash, account_name, wire, current) VALUES (?, ?, ?, 1)").bind(certHash, a.account_name, input.newCertificate),
-      this.db.prepare("INSERT OR IGNORE INTO device_ids (account_name, device_id) VALUES (?, ?)").bind(a.account_name, hex(doc.deviceId))
+            .prepare("UPDATE accounts SET account_key = ?3, identity_id = ?4, certificate = ?5, certificate_hash = ?2, generation = ?6 WHERE account_name = ?1 AND certificate_hash = ?7")
+            .bind(a.account_name, certHash, hex(doc.accountKey), hex(newIid), input.newCertificate, doc.generation.toString(), input.expectedCertificateHash),
+      this.db.prepare(`UPDATE authorizations SET used = 1 WHERE token = ?3 AND ${won}`).bind(a.account_name, certHash, input.authorization),
+      this.db
+        .prepare(`INSERT INTO successions (succession_id, account_name, account_id, previous_generation, new_generation, wire, certificate, certificate_hash, previous_certificate) SELECT ?3, ?1, ?4, ?5, ?6, ?7, ?8, ?2, ?9 WHERE ${won}`)
+        .bind(a.account_name, certHash, input.successionId, accountId, a.generation, doc.generation.toString(), wire, input.newCertificate, a.certificate),
+      this.db.prepare(`INSERT OR IGNORE INTO identities (identity_id, account_name) SELECT ?3, ?1 WHERE ${won}`).bind(a.account_name, certHash, hex(newIid)),
+      this.db.prepare(`UPDATE certificates SET current = 0 WHERE account_name = ?1 AND ${won}`).bind(a.account_name, certHash),
+      this.db.prepare(`INSERT INTO certificates (certificate_hash, account_name, wire, current) SELECT ?2, ?1, ?3, 1 WHERE ${won}`).bind(a.account_name, certHash, input.newCertificate),
+      this.db.prepare(`INSERT OR IGNORE INTO device_ids (account_name, device_id) SELECT ?1, ?3 WHERE ${won}`).bind(a.account_name, certHash, hex(doc.deviceId))
     ];
     const result = await this.db.batch(statements);
-    if ((result[2]?.meta.changes ?? 0) !== 1) return { status: "CONFLICT", current: (await this.account(a.account_name))?.certificate ?? a.certificate };
+    if ((result[0]?.meta.changes ?? 0) !== 1) return { status: "CONFLICT", current: (await this.account(a.account_name))?.certificate ?? a.certificate };
     await this.openStream(hex(newIid), doc.deviceId, a.account_name, accountId);
     return { status: "COMMITTED", succession: wire };
   }
@@ -309,14 +313,16 @@ export class Directory {
     const used = await this.db.prepare("SELECT 1 FROM device_ids WHERE account_name = ? AND device_id = ?").bind(a.account_name, hex(doc.deviceId)).first();
     if (used) return { status: "UNAUTHORIZED" };
     const vh = parseVaultHeader(unhex(input.newVault, "newVault"));
-    // Compare-and-swap in one statement: the update is conditional on the expected hash.
+    // Compare-and-swap first; the certificate and device rows are conditional on it having moved
+    // the account, so a batch that loses the race writes nothing.
+    const won = "EXISTS (SELECT 1 FROM accounts WHERE account_name = ?1 AND certificate_hash = ?2)";
     const result = await this.db.batch([
       this.db
-        .prepare("UPDATE accounts SET certificate = ?, certificate_hash = ?, generation = ?, vault = ?, vault_revision = ?, vault_hash = ? WHERE account_name = ? AND certificate_hash = ? AND vault_revision = ?")
-        .bind(input.newCertificate, newHash, doc.generation.toString(), input.newVault, vh.vaultRevision.toString(), hex(vh.hash), a.account_name, input.expectedCertificateHash, input.expectedVaultRevision),
-      this.db.prepare("UPDATE certificates SET current = 0 WHERE account_name = ?").bind(a.account_name),
-      this.db.prepare("INSERT INTO certificates (certificate_hash, account_name, wire, current) VALUES (?, ?, ?, 1)").bind(newHash, a.account_name, input.newCertificate),
-      this.db.prepare("INSERT INTO device_ids (account_name, device_id) VALUES (?, ?)").bind(a.account_name, hex(doc.deviceId))
+        .prepare("UPDATE accounts SET certificate = ?3, certificate_hash = ?2, generation = ?4, vault = ?5, vault_revision = ?6, vault_hash = ?7 WHERE account_name = ?1 AND certificate_hash = ?8 AND vault_revision = ?9")
+        .bind(a.account_name, newHash, input.newCertificate, doc.generation.toString(), input.newVault, vh.vaultRevision.toString(), hex(vh.hash), input.expectedCertificateHash, input.expectedVaultRevision),
+      this.db.prepare(`UPDATE certificates SET current = 0 WHERE account_name = ?1 AND ${won}`).bind(a.account_name, newHash),
+      this.db.prepare(`INSERT OR IGNORE INTO certificates (certificate_hash, account_name, wire, current) SELECT ?2, ?1, ?3, 1 WHERE ${won}`).bind(a.account_name, newHash, input.newCertificate),
+      this.db.prepare(`INSERT OR IGNORE INTO device_ids (account_name, device_id) SELECT ?1, ?3 WHERE ${won}`).bind(a.account_name, newHash, hex(doc.deviceId))
     ]);
     if ((result[0]?.meta.changes ?? 0) !== 1) return { status: "CONFLICT" };
     await this.openStream(a.identity_id, doc.deviceId, a.account_name, accountIdOf(a));
