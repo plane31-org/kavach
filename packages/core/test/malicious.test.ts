@@ -243,12 +243,11 @@ describe("lost device with the complete old-device state", () => {
     await attacker.sync();
     expect((await attacker.getState()).status).toBe("retired");
     expect((await attacker.history({ authorIdentityId: aliceId })).length).toBe(openedBefore);
-    expect(await thrown(() => enqueueLocation(attacker, w.loc(8)))).toBe("ACCOUNT_RECOVERY_REQUIRED");
-    // Bypassing the SDK: the relay answers the old certificate with nothing, and the new epoch's
-    // wrap for Bob's identity is sealed to the new phone's key.
+    expect(await thrown(() => enqueueLocation(attacker, w.loc(8)))).toBe("SUPERSEDED_DEVICE");
+    // Bypassing the SDK: the relay refuses the old certificate outright (the fence, revision 9),
+    // and the new epoch's wrap for Bob's identity is sealed to the new phone's key.
     const aliceStream = [...w.host.streams.entries()].find(([, s]) => s.accountName === "alice");
-    const page = await session.relay.readRecords(fromHex(aliceStream?.[0] ?? ""), 0n, 10);
-    expect(page.records.length).toBe(0);
+    await expect(session.relay.readRecords(fromHex(aliceStream?.[0] ?? ""), 0n, 10)).rejects.toThrow("SUPERSEDED_DEVICE");
     const bundle = await session.relay.getEpoch(fromHex(aliceStream?.[0] ?? ""), aliceStream?.[1].currentEpoch ?? 0);
     const self = await image.store.read((tx) => tx.get("self", "self"));
     const oldBox = deviceFromSeed((await image.secrets.get("deviceSeed")) ?? new Uint8Array(32), fromHex(self?.deviceId ?? "")).box;

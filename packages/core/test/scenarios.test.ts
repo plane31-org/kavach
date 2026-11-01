@@ -231,12 +231,11 @@ describe("scenarios 3 to 7: device replacement", () => {
     await attacker.client.sync(); // retired: nothing is read
     expect((await attacker.client.getState()).status).toBe("retired");
     expect((await attacker.client.history({ authorIdentityId: aliceId })).length).toBe(before);
-    // Even reading the relay directly with the old certificate yields nothing addressed to it.
+    // Reading the relay directly with the old certificate is refused: the superseded device is fenced.
     const oldCert = [...w.host.accounts.get("bob")?.retiredCertificates ?? []][0] ?? "";
     const rogue = w.host.asDevice("bob", Uint8Array.from(Buffer.from(oldCert, "hex")));
     const aliceStream = [...w.host.streams.entries()].find(([, s]) => s.accountName === "alice");
-    const page = await rogue.relay.readRecords(Uint8Array.from(Buffer.from(aliceStream?.[0] ?? "", "hex")), 0n, 10);
-    expect(page.records.length).toBe(0);
+    await expect(rogue.relay.readRecords(Uint8Array.from(Buffer.from(aliceStream?.[0] ?? "", "hex")), 0n, 10)).rejects.toThrow("SUPERSEDED_DEVICE");
   });
 
   it("6: two candidate devices activate concurrently: exactly one commits", async () => {

@@ -8,19 +8,22 @@ import { equalBytes, fromHex, toHex } from "../bytes.js";
 import {
   DocumentType,
   buildResetReceipt,
+  buildSuccession,
   expectType,
   parseDocument,
   parseVaultHeader,
   verifyDocument,
   type AccountDevice,
+  type AccountSuccession,
   type CircleSnapshot,
   type EncryptedRecord,
   type EpochManifest,
   type RecordKind
 } from "../codec.js";
-import { bodyHash, identityId, streamId as deriveStreamId, type SigningKeypair } from "../crypto.js";
+import { bodyHash, identityId, randomBytes, streamId as deriveStreamId, type SigningKeypair } from "../crypto.js";
 import type {
   AppendOutcome,
+  CircleListing,
   Directory,
   EpochBundle,
   JoinRequest,
@@ -28,13 +31,19 @@ import type {
   ReadRecordsResult,
   Relay,
   ResolvedAccount,
+  SuccessionLink,
   Transport
 } from "../transport.js";
 
 interface Account {
   accountName: string;
   accountKey: Uint8Array;
+  /** The identity of the current key. */
   identityId: string;
+  /** The account id: the root of the succession chain; what circles, manifests and streams name. */
+  accountId: string;
+  /** The chain from the root, oldest first; empty until a succession. */
+  successions: SuccessionLink[];
   certificate: Uint8Array;
   certificateHash: string;
   generation: bigint;
@@ -89,6 +98,15 @@ export class FakeHost {
   readonly streams = new Map<string, StreamState>();
   readonly notifications: Notification[] = [];
   readonly receipts = new Map<string, Uint8Array>();
+  /** Successions by succession id: the committed document and the certificate hash it bound, for idempotent commits. */
+  readonly successionLog = new Map<string, { accountName: string; certificateHash: string; wire: Uint8Array }>();
+  /** Replacement authorizations the product's fresh authentication issued (`authorizeReplacement`), single use. */
+  readonly authorizations = new Map<string, { accountName: string; successionId: string; expectedCertificateHash: string; certificateHash: string; expiresAt: bigint; used: boolean }>();
+  /** Sharing preferences per (account id, circle id), with the revision that orders them. */
+  readonly preferences = new Map<string, { enabled: boolean; revision: bigint }>();
+  authorizationTtlMs = 300_000n;
+  successionPageSize = 8;
+  circlePageSize = 50;
   resetKeyList: Uint8Array | undefined;
   resetSigner: { key: SigningKeypair; keyId: Uint8Array } | undefined;
   /** Test switches. */
@@ -104,6 +122,46 @@ export class FakeHost {
 
   accountByIdentity(iid: string): Account | undefined {
     return [...this.accounts.values()].find((a) => a.identityId === iid);
+  }
+
+  /** The account an id names today: its account id, its current identity, or an identity it retired. */
+  accountByAnyId(id: string): Account | undefined {
+    return [...this.accounts.values()].find((a) => a.accountId === id || a.identityId === id || a.previousIdentities.has(id));
+  }
+
+  /**
+   * The product's fresh authentication, as a test hook: an authorization bound to the proposal
+   * (account, succession id, expected certificate, the certificate's hash), single use, expiring.
+   */
+  authorizeReplacement(input: { accountName: string; successionId: Uint8Array; expectedCertificateHash: Uint8Array; certificate: Uint8Array }): Uint8Array {
+    const doc = expectType<AccountDevice>(verifyDocument(input.certificate), DocumentType.AccountDevice);
+    const token = randomBytes(32);
+    this.authorizations.set(toHex(token), { accountName: input.accountName, successionId: toHex(input.successionId), expectedCertificateHash: toHex(input.expectedCertificateHash), certificateHash: toHex(doc.bodyHash), expiresAt: this.now() + this.authorizationTtlMs, used: false });
+    return token;
+  }
+
+  private resolvedOf(a: Account): ResolvedAccount {
+    const r: ResolvedAccount = { accountName: a.accountName, accountKey: a.accountKey, certificate: a.certificate };
+    const page = this.successionPage(a, 0n, this.successionPageSize);
+    return {
+      ...r,
+      ...(a.resetReceipt ? { resetReceipt: a.resetReceipt } : {}),
+      ...(page.successions.length ? { successions: page.successions } : {}),
+      ...(page.nextGeneration !== undefined ? { successionsNext: page.nextGeneration } : {})
+    };
+  }
+
+  private successionPage(a: Account, afterGeneration: bigint, limit: number): { successions: SuccessionLink[]; nextGeneration?: bigint } {
+    const gen = (l: SuccessionLink): bigint => expectType<AccountDevice>(parseDocument(l.certificate), DocumentType.AccountDevice).generation;
+    const rest = a.successions.filter((l) => gen(l) > afterGeneration);
+    const page = rest.slice(0, Math.max(1, limit));
+    const last = page.at(-1);
+    return rest.length > page.length && last ? { successions: page, nextGeneration: gen(last) } : { successions: page };
+  }
+
+  /** The circle fence: is this certificate the account's current device? A retired device is refused reads too. */
+  private isCurrentDevice(accountName: string, certificateHash: string): boolean {
+    return this.accounts.get(accountName)?.certificateHash === certificateHash;
   }
 
   private stream(streamHex: string, authorIdentityId: string, accountName: string): StreamState {
@@ -181,17 +239,13 @@ export class FakeHost {
       async resolveAccounts(names): Promise<ResolvedAccount[]> {
         return names.flatMap((n) => {
           const a = host.accounts.get(n);
-          if (!a) return [];
-          const r: ResolvedAccount = { accountName: n, accountKey: a.accountKey, certificate: a.certificate };
-          return [a.resetReceipt ? { ...r, resetReceipt: a.resetReceipt } : r];
+          return a ? [host.resolvedOf(a)] : [];
         });
       },
       async resolveIdentities(identityIds): Promise<ResolvedAccount[]> {
         return identityIds.flatMap((iid) => {
-          const a = host.accountByIdentity(toHex(iid)) ?? [...host.accounts.values()].find((x) => x.previousIdentities.has(toHex(iid)));
-          if (!a) return [];
-          const r: ResolvedAccount = { accountName: a.accountName, accountKey: a.accountKey, certificate: a.certificate };
-          return [a.resetReceipt ? { ...r, resetReceipt: a.resetReceipt } : r];
+          const a = host.accountByAnyId(toHex(iid));
+          return a ? [host.resolvedOf(a)] : [];
         });
       },
       async getCertificate(hash) {
@@ -207,6 +261,8 @@ export class FakeHost {
           accountName: doc.accountName,
           accountKey: doc.accountKey,
           identityId: iid,
+          accountId: iid,
+          successions: [],
           certificate,
           certificateHash: toHex(doc.bodyHash),
           generation: doc.generation,
@@ -237,7 +293,7 @@ export class FakeHost {
         a.deviceIds.add(toHex(doc.deviceId));
         a.vault = { wire: input.newVault, revision: vh.vaultRevision, hash: toHex(vh.hash) };
         host.certificates.set(a.certificateHash, input.newCertificate);
-        host.stream(toHex(deriveStreamId(fromHex(a.identityId), doc.deviceId)), a.identityId, a.accountName);
+        host.stream(toHex(deriveStreamId(fromHex(a.identityId), doc.deviceId)), a.accountId, a.accountName);
         return { status: "COMMITTED" };
       },
       async getVault(name) {
@@ -264,7 +320,7 @@ export class FakeHost {
         const a = caller();
         if (!current()) return { status: "UNAUTHORIZED" };
         const doc = expectType<CircleSnapshot>(verifyDocument(newSnapshot, a.accountKey), DocumentType.CircleSnapshot);
-        if (toHex(doc.ownerIdentityId) !== a.identityId || !equalBytes(doc.circleId, circleId)) return { status: "UNAUTHORIZED" };
+        if (toHex(doc.ownerIdentityId) !== a.accountId || !equalBytes(doc.circleId, circleId)) return { status: "UNAUTHORIZED" };
         const key = toHex(circleId);
         const existing = host.circles.get(key);
         if (existing) {
@@ -273,10 +329,10 @@ export class FakeHost {
             return { status: "CONFLICT", current: existing.snapshot, currentRevision: existing.revision };
           }
         } else if (expectedRevision !== 0n || doc.revision !== 1n) return { status: "CONFLICT" };
-        host.circles.set(key, { snapshot: newSnapshot, revision: doc.revision, hash: toHex(doc.bodyHash), ownerIdentityId: a.identityId, closed: false });
+        host.circles.set(key, { snapshot: newSnapshot, revision: doc.revision, hash: toHex(doc.bodyHash), ownerIdentityId: a.accountId, closed: false });
         // Requests for accounts now admitted are cleared.
         const members = new Set(doc.members.map(toHex));
-        host.requests.set(key, (host.requests.get(key) ?? []).filter((r) => !members.has(host.accounts.get(r.accountName)?.identityId ?? "")));
+        host.requests.set(key, (host.requests.get(key) ?? []).filter((r) => !members.has(host.accounts.get(r.accountName)?.accountId ?? "")));
         return { status: "COMMITTED" };
       },
       async requestJoin(circleId): Promise<MutationOutcome> {
@@ -289,7 +345,7 @@ export class FakeHost {
         list.push({ circleId, accountName: a.accountName, action: "join", requestedAt: host.now() });
         host.requests.set(toHex(circleId), list);
         if (!hadLive) {
-          const owner = host.accountByIdentity(c.ownerIdentityId);
+          const owner = host.accountByAnyId(c.ownerIdentityId);
           if (owner) host.notifications.push({ kind: "joinRequest", to: owner.accountName, from: a.accountName, circleId: toHex(circleId) });
         }
         return { status: "COMMITTED" };
@@ -301,14 +357,14 @@ export class FakeHost {
         const list = host.requests.get(toHex(circleId)) ?? [];
         list.push({ circleId, accountName: a.accountName, action: "leave", requestedAt: host.now() });
         host.requests.set(toHex(circleId), list);
-        const owner = host.accountByIdentity(c.ownerIdentityId);
+        const owner = host.accountByAnyId(c.ownerIdentityId);
         if (owner) host.notifications.push({ kind: "leaveRequest", to: owner.accountName, from: a.accountName, circleId: toHex(circleId) });
         return { status: "COMMITTED" };
       },
       async readRequests(circleId) {
         const a = caller();
         const c = host.circles.get(toHex(circleId));
-        if (!c || c.ownerIdentityId !== a.identityId) return [];
+        if (!c || c.ownerIdentityId !== a.accountId) return [];
         const cutoff = host.now() - 7n * 86_400_000n;
         return (host.requests.get(toHex(circleId)) ?? []).filter((r) => r.requestedAt > cutoff);
       },
@@ -332,9 +388,13 @@ export class FakeHost {
           host.resetSigner.key.secretKey
         );
         host.receipts.set(toHex(input.resetId), receipt);
-        for (const c of host.circles.values()) if (c.ownerIdentityId === a.identityId) c.closed = true;
+        for (const c of host.circles.values()) if (c.ownerIdentityId === a.accountId) c.closed = true;
         const vh = parseVaultHeader(input.newVault);
+        // The whole chain is retired; the reset starts a new account root with an empty chain.
         a.previousIdentities.add(a.identityId);
+        a.previousIdentities.add(a.accountId);
+        for (const l of a.successions) a.previousIdentities.add(toHex(expectType<AccountSuccession>(parseDocument(l.wire), DocumentType.AccountSuccession).previousIdentityId));
+        a.successions = [];
         a.resetReceipt = receipt;
         a.retiredCertificates.add(a.certificateHash);
         a.accountKey = doc.accountKey;
@@ -343,10 +403,95 @@ export class FakeHost {
         a.certificateHash = toHex(doc.bodyHash);
         a.generation = doc.generation;
         a.deviceIds.add(toHex(doc.deviceId));
+        a.accountId = toHex(newIid);
         a.vault = { wire: input.newVault, revision: vh.vaultRevision, hash: toHex(vh.hash) };
         host.certificates.set(a.certificateHash, input.newCertificate);
-        host.stream(toHex(deriveStreamId(newIid, doc.deviceId)), a.identityId, a.accountName);
+        host.stream(toHex(deriveStreamId(newIid, doc.deviceId)), a.accountId, a.accountName);
         return { status: "COMMITTED" as const, receipt };
+      },
+      async succeedAccount(input) {
+        // The succession id answers first: a device retrying after a lost response finds its
+        // proposal committed and its token spent, and must get the document, not UNAUTHORIZED.
+        const doc = expectType<AccountDevice>(verifyDocument(input.newCertificate), DocumentType.AccountDevice);
+        const certHash = toHex(doc.bodyHash);
+        const known = host.successionLog.get(toHex(input.successionId));
+        if (known) return known.certificateHash === certHash && known.accountName === input.accountName ? { status: "ALREADY_COMMITTED" as const, succession: known.wire } : { status: "UNAUTHORIZED" as const };
+        const a = host.accounts.get(input.accountName);
+        if (!a || doc.accountName !== a.accountName) return { status: "UNAUTHORIZED" as const };
+        // The authorization: issued for this proposal, unspent, unexpired.
+        const auth = host.authorizations.get(toHex(input.authorization));
+        if (!auth || auth.used || auth.expiresAt < host.now() || auth.accountName !== a.accountName || auth.successionId !== toHex(input.successionId) || auth.expectedCertificateHash !== toHex(input.expectedCertificateHash) || auth.certificateHash !== certHash) {
+          return { status: "UNAUTHORIZED" as const };
+        }
+        if (a.certificateHash !== toHex(input.expectedCertificateHash)) return { status: "CONFLICT" as const, current: a.certificate };
+        if (equalBytes(doc.accountKey, a.accountKey) || doc.generation !== a.generation + 1n || a.deviceIds.has(toHex(doc.deviceId))) return { status: "UNAUTHORIZED" as const };
+        if (!host.resetSigner) return { status: "PERMANENT_FAILURE" as const };
+        const newIid = identityId(doc.accountName, doc.accountKey);
+        const wire = buildSuccession(
+          {
+            accountName: a.accountName,
+            accountId: fromHex(a.accountId),
+            previousIdentityId: fromHex(a.identityId),
+            newIdentityId: newIid,
+            previousGeneration: a.generation,
+            newGeneration: doc.generation,
+            newCertificateHash: doc.bodyHash,
+            successionId: input.successionId,
+            issuedAt: host.now(),
+            authorityKeyId: host.resetSigner.keyId
+          },
+          host.resetSigner.key.secretKey
+        );
+        auth.used = true;
+        host.successionLog.set(toHex(input.successionId), { accountName: a.accountName, certificateHash: certHash, wire });
+        a.successions.push({ wire, certificate: input.newCertificate });
+        a.previousIdentities.add(a.identityId);
+        a.retiredCertificates.add(a.certificateHash);
+        a.accountKey = doc.accountKey;
+        a.identityId = toHex(newIid);
+        a.certificate = input.newCertificate;
+        a.certificateHash = certHash;
+        a.generation = doc.generation;
+        a.deviceIds.add(toHex(doc.deviceId));
+        if (input.newVault) {
+          const vh = parseVaultHeader(input.newVault);
+          a.vault = { wire: input.newVault, revision: vh.vaultRevision, hash: toHex(vh.hash) };
+        }
+        host.certificates.set(certHash, input.newCertificate);
+        host.stream(toHex(deriveStreamId(newIid, doc.deviceId)), a.accountId, a.accountName);
+        return { status: "COMMITTED" as const, succession: wire };
+      },
+      async getSuccessions(accountId, afterGeneration, limit) {
+        const a = host.accountByAnyId(toHex(accountId));
+        if (!a || a.accountId !== toHex(accountId)) return { successions: [] };
+        return host.successionPage(a, afterGeneration, limit);
+      },
+      async listCircles(cursor) {
+        const a = caller();
+        if (!current()) return { circles: [] };
+        const mine: CircleListing[] = [];
+        for (const [key, c] of [...host.circles].sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0))) {
+          if (cursor !== undefined && key <= cursor) continue;
+          const snap = expectType<CircleSnapshot>(parseDocument(c.snapshot), DocumentType.CircleSnapshot);
+          const pending = (host.requests.get(key) ?? []).some((r) => r.accountName === a.accountName && r.action === "join");
+          const role = c.ownerIdentityId === a.accountId ? "owner" : snap.members.some((m) => toHex(m) === a.accountId) ? "member" : pending ? "pending" : undefined;
+          if (!role) continue;
+          const pref = host.preferences.get(`${a.accountId}:${key}`);
+          mine.push({ circleId: fromHex(key), ownerAccountId: fromHex(c.ownerIdentityId), role, snapshot: c.closed ? undefined : c.snapshot, enabled: pref?.enabled, preferenceRevision: pref?.revision ?? 0n });
+        }
+        const page = mine.slice(0, Math.max(1, host.circlePageSize));
+        const last = page.at(-1);
+        return mine.length > page.length && last ? { circles: page, cursor: toHex(last.circleId) } : { circles: page };
+      },
+      async setSharingPreference(circleId, enabled, expectedRevision) {
+        const a = caller();
+        if (!current()) return { status: "UNAUTHORIZED" as const, revision: 0n };
+        const key = `${a.accountId}:${toHex(circleId)}`;
+        const cur = host.preferences.get(key) ?? { enabled: false, revision: 0n };
+        if (cur.revision !== expectedRevision) return { status: "CONFLICT" as const, revision: cur.revision, enabled: cur.enabled };
+        const next = { enabled, revision: cur.revision + 1n };
+        host.preferences.set(key, next);
+        return { status: "COMMITTED" as const, revision: next.revision };
       }
     };
 
@@ -361,12 +506,12 @@ export class FakeHost {
         const s = host.streams.get(toHex(streamId));
         const e = s?.epochs.get(epoch);
         if (!e) return undefined;
-        return { manifest: e.manifest, wrap: e.wraps.get(caller().identityId) };
+        return { manifest: e.manifest, wrap: e.wraps.get(caller().accountId) };
       },
       async publishEpoch({ streamId, expectedEpoch, manifest, wraps }) {
         const a = caller();
         const s = host.streams.get(toHex(streamId));
-        if (!s || s.authorIdentityId !== a.identityId) return { status: "UNAUTHORIZED" as const };
+        if (!s || s.authorIdentityId !== a.accountId) return { status: "UNAUTHORIZED" as const };
         if (!current()) return { status: "UNAUTHORIZED" as const };
         const doc = expectType<EpochManifest>(parseDocument(manifest), DocumentType.EpochManifest);
         const cur = s.epochs.get(s.currentEpoch);
@@ -379,7 +524,7 @@ export class FakeHost {
         s.currentEpoch = doc.epoch;
         s.currentManifestHash = toHex(doc.bodyHash);
         for (const r of rows) {
-          if (r.identityId === a.identityId) continue;
+          if (r.identityId === a.accountId) continue;
           if (!s.subscriptions.has(r.certificateHash)) s.subscriptions.set(r.certificateHash, { identityId: r.identityId, cursor: s.tail, startSeq: s.tail });
         }
         host.purgeEpochs(s);
@@ -392,7 +537,7 @@ export class FakeHost {
           const a = caller();
           const rec = expectType<EncryptedRecord>(parseDocument(wire), DocumentType.EncryptedRecord);
           const s = host.streams.get(toHex(rec.streamId));
-          if (!s || s.authorIdentityId !== a.identityId) return { status: "UNAUTHORIZED" };
+          if (!s || s.authorIdentityId !== a.accountId) return { status: "UNAUTHORIZED" };
           if (!current()) return { status: "SUPERSEDED_DEVICE" };
           const id = toHex(recordId);
           const hash = toHex(bodyHash(wire)); // exact bytes, signature included
@@ -410,14 +555,14 @@ export class FakeHost {
           const seq = ++s.tail;
           const acceptedAt = host.now() > s.lastAcceptedAt ? host.now() : s.lastAcceptedAt;
           s.lastAcceptedAt = acceptedAt;
-          const required = new Set(epoch.rows.filter((r) => r.identityId !== a.identityId).map((r) => r.certificateHash));
+          const required = new Set(epoch.rows.filter((r) => r.identityId !== a.accountId).map((r) => r.certificateHash));
           s.records.set(seq, { recordId: id, wire, acceptedAt, epoch: rec.epoch, counter: rec.counter, kind: rec.headerClass, required });
           s.highWater = { epoch: rec.epoch, counter: rec.counter };
           const outcome: AppendOutcome = { status: "ACCEPTED", deliverySeq: seq };
           s.lastAppend = { recordId: id, hash, seq, at: acceptedAt, outcome };
           for (const r of epoch.rows) {
-            if (r.identityId === a.identityId) continue;
-            const to = host.accountByIdentity(r.identityId)?.accountName ?? r.identityId;
+            if (r.identityId === a.accountId) continue;
+            const to = host.accountByAnyId(r.identityId)?.accountName ?? r.identityId;
             // By header class, as the test profile declares them: 1 is a visible notification, 2 is
             // silent and needs no wake-up, anything else is a wake-up. The host never sees the kind.
             if (rec.headerClass !== 2) host.notifications.push({ kind: rec.headerClass === 1 ? "visible" : "wake", to, from: a.accountName });
@@ -437,6 +582,8 @@ export class FakeHost {
       },
       async readRecords(streamId, afterSeq, limit): Promise<ReadRecordsResult> {
         const s = host.streams.get(toHex(streamId));
+        // The fence: a retired device reads nothing more (amendment A1, host rules).
+        if (!host.isCurrentDevice(accountName, callerCert)) throw new Error("SUPERSEDED_DEVICE");
         if (!s) return { records: [], nextSeq: afterSeq, tail: 0n, expiredThrough: 0n, committedCursor: 0n };
         if (afterSeq > s.tail) throw new Error("CURSOR_OUT_OF_RANGE");
         const sub = s.subscriptions.get(callerCert);

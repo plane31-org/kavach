@@ -99,9 +99,9 @@ export class FaultyStore implements Store {
 
 // The malicious transport ----------------------------------------------------------------------------
 
-export type MutationName = "registerAccount" | "activateDevice" | "publishVault" | "publishOwnedCircle" | "requestJoin" | "requestLeave" | "resetAccount" | "publishEpoch" | "appendRecord" | "ackThrough";
+export type MutationName = "registerAccount" | "activateDevice" | "publishVault" | "publishOwnedCircle" | "requestJoin" | "requestLeave" | "resetAccount" | "succeedAccount" | "setSharingPreference" | "publishEpoch" | "appendRecord" | "ackThrough";
 
-export type ServedKind = "certificate" | "snapshot" | "vault" | "manifest" | "wrap" | "record" | "keyList" | "receipt";
+export type ServedKind = "certificate" | "snapshot" | "vault" | "manifest" | "wrap" | "record" | "keyList" | "receipt" | "succession";
 
 export interface MaliciousKnobs {
   /** Mutations whose next response is lost after the host committed it (each name is consumed once). */
@@ -111,7 +111,7 @@ export interface MaliciousKnobs {
   /** Mutations whose next response waits for the given promise after the host committed (consumed once). */
   readonly hold: Map<MutationName, Promise<void>>;
   /** Reads that answer "nothing" while present. */
-  readonly withhold: Set<"snapshots" | "epochs" | "records" | "requests" | "currentEpoch" | "keyList" | "certificates">;
+  readonly withhold: Set<"snapshots" | "epochs" | "records" | "requests" | "currentEpoch" | "keyList" | "certificates" | "successions" | "circleList">;
   /** Older documents served instead of the current ones. */
   readonly replay: {
     vault?: Uint8Array;
@@ -248,7 +248,19 @@ export class MaliciousTransport implements Transport {
         this.calls.push("getResetReceipt");
         return this.serve("receipt", await d().getResetReceipt(id));
       },
-      resetAccount: (input) => this.mutate("resetAccount", () => d().resetAccount(input))
+      resetAccount: (input) => this.mutate("resetAccount", () => d().resetAccount(input)),
+      succeedAccount: (input) => this.mutate("succeedAccount", () => d().succeedAccount(input)),
+      getSuccessions: async (accountId, after, limit) => {
+        this.calls.push("getSuccessions");
+        if (k.withhold.has("successions")) return { successions: [] };
+        const page = await d().getSuccessions(accountId, after, limit);
+        return { ...page, successions: page.successions.map((l) => ({ ...l, wire: this.serve("succession", l.wire) ?? l.wire })) };
+      },
+      listCircles: async (cursor) => {
+        this.calls.push("listCircles");
+        return k.withhold.has("circleList") ? { circles: [] } : d().listCircles(cursor);
+      },
+      setSharingPreference: (circleId, enabled, expected) => this.mutate("setSharingPreference", () => d().setSharingPreference(circleId, enabled, expected))
     };
   }
 

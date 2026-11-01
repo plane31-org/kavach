@@ -25,7 +25,9 @@ export const VAULT = "vault";
 export type OpenedState =
   | { readonly kind: "fresh" }
   | { readonly kind: "initializing"; readonly account: OwnAccount }
-  | { readonly kind: StoreState; readonly meta: MetaRow; readonly account: OwnAccount };
+  | { readonly kind: StoreState; readonly meta: MetaRow; readonly account: OwnAccount }
+  /** A device retired by a succession erased its account seed (amendment A1, section 4): the header stays, the key is gone. */
+  | { readonly kind: "RETIRED"; readonly meta: MetaRow; readonly account: undefined };
 
 /**
  * Bind the secret store to the local store. A mismatch between the two is `RECOVERY_REQUIRED`
@@ -36,6 +38,7 @@ export async function openStore(store: Store, secrets: SecretStore, accountName:
   const [accountSeed, instanceId] = await Promise.all([secrets.get("accountSeed"), secrets.get("instanceId")]);
   const meta = await store.read((tx) => tx.get("meta", META));
   if (!accountSeed || !instanceId) {
+    if (meta?.state === "RETIRED") return { kind: "RETIRED", meta, account: undefined };
     if (meta) throw new KavachError("RECOVERY_REQUIRED", stage, "store present but secrets missing");
     return { kind: "fresh" };
   }

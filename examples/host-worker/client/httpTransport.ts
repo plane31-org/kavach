@@ -49,12 +49,15 @@ export function httpTransport(o: HttpTransportOptions): Transport {
     ...(typeof r["current"] === "string" ? { current: fromHex(r["current"]) } : {}),
     ...(typeof r["currentRevision"] === "string" ? { currentRevision: BigInt(r["currentRevision"]) } : {})
   });
+  const links = (rows: unknown): { wire: Uint8Array; certificate: Uint8Array }[] => (Array.isArray(rows) ? (rows as { wire: string; certificate: string }[]).map((l) => ({ wire: fromHex(l.wire), certificate: fromHex(l.certificate) })) : []);
   const resolved = (rows: Json[]): ResolvedAccount[] =>
     rows.map((r) => ({
       accountName: String(r["accountName"]),
       accountKey: fromHex(String(r["accountKey"])),
       certificate: fromHex(String(r["certificate"])),
-      ...(typeof r["resetReceipt"] === "string" ? { resetReceipt: fromHex(r["resetReceipt"]) } : {})
+      ...(typeof r["resetReceipt"] === "string" ? { resetReceipt: fromHex(r["resetReceipt"]) } : {}),
+      ...(Array.isArray(r["successions"]) ? { successions: links(r["successions"]) } : {}),
+      ...(typeof r["successionsNext"] === "string" ? { successionsNext: BigInt(r["successionsNext"]) } : {})
     }));
 
   const directory: Directory = {
@@ -100,6 +103,39 @@ export function httpTransport(o: HttpTransportOptions): Transport {
     resetAccount: async (i) => {
       const r = await call<Json>("POST", `/v1/accounts/${i.accountName}/reset`, { expectedOldIdentityId: toHex(i.expectedOldIdentityId), newCertificate: toHex(i.newCertificate), newVault: toHex(i.newVault), resetId: toHex(i.resetId) });
       return { ...outcome(r), ...(typeof r["receipt"] === "string" ? { receipt: fromHex(r["receipt"]) } : {}) };
+    },
+    succeedAccount: async (i) => {
+      const r = await call<Json>("POST", `/v1/accounts/${i.accountName}/succeed`, {
+        expectedCertificateHash: toHex(i.expectedCertificateHash),
+        newCertificate: toHex(i.newCertificate),
+        ...(i.newVault ? { newVault: toHex(i.newVault) } : {}),
+        successionId: toHex(i.successionId),
+        authorization: toHex(i.authorization)
+      });
+      return { ...outcome(r), ...(typeof r["succession"] === "string" ? { succession: fromHex(r["succession"]) } : {}) };
+    },
+    getSuccessions: async (accountId, after, limit) => {
+      const r = await call<Json | null>("GET", `/v1/successions/${toHex(accountId)}?after=${after}&limit=${limit}`);
+      return { successions: links(r?.["successions"]), ...(typeof r?.["nextGeneration"] === "string" ? { nextGeneration: BigInt(r["nextGeneration"]) } : {}) };
+    },
+    listCircles: async (cursor) => {
+      const r = await call<Json | null>("GET", `/v1/circles${cursor ? `?cursor=${cursor}` : ""}`);
+      const rows = Array.isArray(r?.["circles"]) ? (r["circles"] as Json[]) : [];
+      return {
+        circles: rows.map((c) => ({
+          circleId: fromHex(String(c["circleId"])),
+          ownerAccountId: fromHex(String(c["ownerAccountId"])),
+          role: c["role"] as "owner" | "member" | "pending",
+          snapshot: typeof c["snapshot"] === "string" ? fromHex(c["snapshot"]) : undefined,
+          enabled: typeof c["enabled"] === "boolean" ? c["enabled"] : undefined,
+          preferenceRevision: BigInt(String(c["preferenceRevision"] ?? "0"))
+        })),
+        ...(typeof r?.["cursor"] === "string" ? { cursor: r["cursor"] } : {})
+      };
+    },
+    setSharingPreference: async (circleId, enabled, expectedRevision) => {
+      const r = await call<Json>("PUT", `/v1/circles/${toHex(circleId)}/preference`, { enabled, expectedRevision });
+      return { status: r["status"] as "COMMITTED" | "ALREADY_COMMITTED" | "CONFLICT" | "UNAUTHORIZED" | "RETRYABLE", revision: BigInt(String(r["revision"] ?? "0")), ...(typeof r["enabled"] === "boolean" ? { enabled: r["enabled"] } : {}) };
     }
   };
 

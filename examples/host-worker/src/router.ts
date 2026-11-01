@@ -1,6 +1,6 @@
 /** The HTTP surface of the reference host: protocol section 13's directory and relay, as JSON. */
 import { DocumentType, expectType, parseDocument, type EncryptedRecord } from "@plane31/blind-relay/adapters";
-import { Directory } from "./directory.js";
+import { Directory, accountIdOf } from "./directory.js";
 import type { Env } from "./env.js";
 import { HttpError, big, body, error, hex, hostNow, json, requireCaller, unhex } from "./wire.js";
 
@@ -53,6 +53,12 @@ async function route(request: Request, env: Env): Promise<Response> {
     const b = await body<{ expectedRevision: string; expectedHash?: string; newVault: string }>(request);
     return json(await dir.publishVault(requireCaller(request), b));
   }
+  if (seg[0] === "circles" && seg.length === 1 && m === "GET") return json(await dir.listCircles(requireCaller(request), url.searchParams.get("cursor") ?? undefined));
+  if (seg[0] === "circles" && seg[1] && seg[2] === "preference" && m === "PUT") {
+    const b = await body<{ enabled: boolean; expectedRevision: string }>(request);
+    if (typeof b.enabled !== "boolean") throw new HttpError(400, "MALFORMED", "enabled");
+    return json(await dir.setPreference(requireCaller(request), seg[1], b.enabled, big(b.expectedRevision, "expectedRevision").toString()));
+  }
   if (seg[0] === "circles" && seg[1] && seg.length === 2 && m === "GET") {
     const s = await dir.circle(seg[1]);
     return s ? json({ wire: s }) : error(404, "NOT_FOUND");
@@ -79,6 +85,16 @@ async function route(request: Request, env: Env): Promise<Response> {
     const b = await body<{ expectedOldIdentityId: string; newCertificate: string; newVault: string; resetId: string }>(request);
     return json(await dir.reset({ accountName: seg[1], ...b }));
   }
+  if (seg[0] === "accounts" && seg[1] && seg[2] === "succeed" && m === "POST") {
+    const b = await body<{ expectedCertificateHash: string; newCertificate: string; newVault?: string; successionId: string; authorization: string }>(request);
+    return json(await dir.succeed({ accountName: seg[1], ...b }));
+  }
+  if (seg[0] === "successions" && seg[1] && m === "GET") return json(await dir.successions(seg[1], big(url.searchParams.get("after") ?? "0", "after").toString(), Number(url.searchParams.get("limit") ?? "8")));
+  // The product's fresh authentication stands in: tests only. A production host issues the token from its own login path.
+  if (seg[0] === "accounts" && seg[1] && seg[2] === "replacement-authorizations" && m === "POST" && env.ALLOW_TEST_CLOCK === "true") {
+    const b = await body<{ successionId: string; expectedCertificateHash: string; certificate: string }>(request);
+    return json(await dir.authorizeReplacement(seg[1], b));
+  }
   if (seg[0] === "subscriptions" && m === "GET") return json(await dir.subscriptions(requireCaller(request)));
 
   // Relay ------------------------------------------------------------------------------------------
@@ -95,14 +111,14 @@ async function route(request: Request, env: Env): Promise<Response> {
       const c = requireCaller(request);
       const a = await dir.account(c.accountName);
       if (!a) throw new HttpError(401, "UNAUTHORIZED");
-      return json(await call("/epoch", { epoch: Number(seg[3]), callerIdentityId: a.identity_id }));
+      return json(await call("/epoch", { epoch: Number(seg[3]), callerIdentityId: accountIdOf(a) }));
     }
     if (seg[2] === "epochs" && seg.length === 3 && m === "PUT") {
       const a = await dir.currentDevice(requireCaller(request));
       const b = await body<{ expectedEpoch: number; manifest: string; wraps: Record<string, string> }>(request);
-      const r = await call<{ status: string; newSubscriptions?: { certificateHash: string; identityId: string }[] }>("/publishEpoch", { callerIdentityId: a.identity_id, ...b });
+      const r = await call<{ status: string; newSubscriptions?: { certificateHash: string; identityId: string }[] }>("/publishEpoch", { callerIdentityId: accountIdOf(a), ...b });
       for (const s of r.newSubscriptions ?? []) {
-        await env.DIRECTORY.prepare("INSERT OR IGNORE INTO subscriptions (stream_id, reader_certificate, author_identity) VALUES (?, ?, ?)").bind(streamId, s.certificateHash, a.identity_id).run();
+        await env.DIRECTORY.prepare("INSERT OR IGNORE INTO subscriptions (stream_id, reader_certificate, author_identity) VALUES (?, ?, ?)").bind(streamId, s.certificateHash, accountIdOf(a)).run();
       }
       return json(r);
     }
@@ -111,7 +127,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       const b = await body<{ recordId: string; wire: string }>(request);
       const rec = expectType<EncryptedRecord>(parseDocument(unhex(b.wire, "wire")), DocumentType.EncryptedRecord);
       if (hex(rec.streamId) !== streamId) throw new HttpError(400, "MALFORMED", "record is for another stream");
-      const r = await call<{ status: string; notify?: { identityId: string; kind: string }[] }>("/append", { callerIdentityId: a.identity_id, recordId: b.recordId, wire: b.wire, now: now.toString() });
+      const r = await call<{ status: string; notify?: { identityId: string; kind: string }[] }>("/append", { callerIdentityId: accountIdOf(a), recordId: b.recordId, wire: b.wire, now: now.toString() });
       for (const n of r.notify ?? []) {
         const to = await dir.accountByIdentity(n.identityId);
         if (to) await dir.notify(n.kind, to.account_name, a.account_name);
@@ -120,6 +136,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     }
     if (seg[2] === "records" && m === "GET") {
       const c = requireCaller(request);
+      await dir.currentDevice(c); // the fence: a retired device reads nothing more
       const r = await call<{ error?: string }>("/read", { callerCertificate: c.certificateHash, afterSeq: big(url.searchParams.get("after") ?? "0", "after").toString(), limit: Number(url.searchParams.get("limit") ?? "100") });
       if (r.error) throw new HttpError(400, r.error);
       return json(r);

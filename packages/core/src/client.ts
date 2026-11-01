@@ -21,7 +21,7 @@ export interface EnqueueResult {
   readonly recordId: Uint8Array;
   readonly duplicate: boolean;
 }
-import { allowsContinuity, kindOf, validatePolicy, type RetentionPolicy } from "./policy.js";
+import { acceptsSuccession, allowsContinuity, kindOf, validatePolicy, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
 import type { CircleRow, PendingResetRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
@@ -229,6 +229,8 @@ class ClientImpl implements Client {
   private readonly now: () => bigint;
   private readonly listeners = new Set<(e: ClientEvent) => void>();
   private account: OwnAccount | undefined;
+  /** Retired by a succession or a later device: nothing is written from here again. */
+  private retired = false;
   private device: DeviceKeys | undefined;
   private selfPin: AccountPin | undefined;
   private trust: ResetTrust;
@@ -265,14 +267,16 @@ class ClientImpl implements Client {
     await this.finishInterruptedReset();
     const opened = await openStore(this.store, this.secrets, this.accountName);
     if (opened.kind === "fresh") return;
+    this.retired = opened.kind === "RETIRED";
     await ensureHistoryIndex(this.store);
     await ensureSlots(this.store, this.policy);
     this.account = opened.account;
     const deviceSeed = await this.secrets.get("deviceSeed");
     const self = await this.store.read((tx) => tx.get("self", "self"));
-    if (deviceSeed && self) {
+    if (deviceSeed && self && opened.account) {
+      const accountId = opened.account.accountId;
       this.device = deviceFromSeed(deviceSeed, fromHex(self.deviceId));
-      const pinRow = await this.store.read((tx) => tx.get("pins", toHex(opened.account.accountId)));
+      const pinRow = await this.store.read((tx) => tx.get("pins", toHex(accountId)));
       if (pinRow) this.selfPin = rowToPin(pinRow);
     }
     const rows = await this.store.read((tx) => ({
@@ -312,6 +316,7 @@ class ClientImpl implements Client {
   }
 
   private requireAccount(stage: string): { account: OwnAccount; device: DeviceKeys; pin: AccountPin } {
+    if (this.retired) throw new KavachError("SUPERSEDED_DEVICE", stage, "this device is retired");
     if (!this.account || !this.device || !this.selfPin) throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, "no account on this device");
     return { account: this.account, device: this.device, pin: this.selfPin };
   }
@@ -361,7 +366,7 @@ class ClientImpl implements Client {
   async getState(): Promise<ClientState> {
     const meta = await this.store.read((tx) => tx.get("meta", META));
     const base = { identityId: this.selfPin?.accountId, keyIdentityId: this.selfPin?.identityId, certificateHash: this.selfPin?.certificateHash, generation: this.selfPin?.generation, outbox: 0, waitingFor: [] as Uint8Array[], circles: [] as CircleSummary[] };
-    if (!meta || !this.account) return { status: "fresh", paused: undefined, ...base };
+    if (!meta || (!this.account && meta.state !== "RETIRED")) return { status: "fresh", paused: undefined, ...base };
     const circles = await this.listCircles();
     const outbox = await outboxCount(this.store);
     const waitingFor = await this.waitingFor();
@@ -857,6 +862,9 @@ class ClientImpl implements Client {
         // reset we did not make is ignored here, as before.
         if (await this.supersededBySuccession(pin, me)) {
           await this.retire();
+          // The key itself is retired, not only the device: nothing of it stays here.
+          await this.secrets.delete("accountSeed");
+          this.account = undefined;
           return;
         }
       } else if (!equalBytes(theirs.bodyHash, pin.certificateHash) && theirs.generation > pin.generation) {
@@ -1081,8 +1089,14 @@ class ClientImpl implements Client {
     const existing = await this.store.read((tx) => tx.list("pins").find(([, p]) => p.accountName === doc.accountName)?.[1]);
     let current = existing ? rowToPin(existing) : undefined;
     if (current && resolved.successions?.length && !equalBytes(current.accountKey, doc.accountKey)) {
-      current = await this.applyChain(current, resolved.successions, report);
-      if (!current) return;
+      if (!acceptsSuccession(this.policy)) {
+        // This deployment replaces keys by identity continuity only: the chain is refused whoever
+        // signed it, and the key change below is quarantined as a bare directory key change.
+        report.errors.push(syncError("succession", new KavachError("UNSUPPORTED_TYPE", "succession", "this deployment does not accept successions")));
+      } else {
+        current = await this.applyChain(current, resolved.successions, report);
+        if (!current) return;
+      }
     }
     let outcome;
     try {
@@ -1198,6 +1212,7 @@ class ClientImpl implements Client {
   }
 
   private async retire(): Promise<void> {
+    this.retired = true;
     await this.store.transaction((tx) => {
       const meta = tx.get("meta", META);
       if (meta) tx.put("meta", META, { ...meta, state: "RETIRED" });
