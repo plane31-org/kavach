@@ -6,8 +6,8 @@ import { rotationReason, MAX_COUNTER } from "./epoch.js";
 import { bodyHash } from "./crypto.js";
 import { KavachError } from "./errors.js";
 import { indexHistory } from "./historyIndex.js";
-import { advancePin, measuredAt } from "./pins.js";
-import type { RetentionPolicy } from "./policy.js";
+import { kindOf, type RetentionPolicy } from "./policy.js";
+import { eventTimeOf, takeSlot } from "./slots.js";
 import { sealRecord } from "./record.js";
 import { big, unbig } from "./rows.js";
 import type { HistoryRow, OutboxRow, Store, Tx } from "./store.js";
@@ -76,6 +76,8 @@ export const MAX_IDEMPOTENCY_KEY = 128;
  */
 export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8Array, options: EnqueueOptions = {}): Promise<Enqueued> {
   const stage = "enqueue";
+  const declared = kindOf(deps.policy, kind);
+  if (!declared) throw new KavachError("MALFORMED", stage, `kind ${kind} is not declared in the retention policy`);
   const key = options.idempotencyKey;
   if (key !== undefined && (key.length === 0 || key.length > MAX_IDEMPOTENCY_KEY)) throw new KavachError("MALFORMED", stage, "idempotency key must be 1 to 128 characters");
   const superseded: Uint8Array[] = [];
@@ -103,7 +105,7 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
     let count = 0;
     let bytes = 0;
     for (const [key, row] of tx.list("outbox")) {
-      if (kind === 2 && row.kind === 2 && row.status === "queued") {
+      if (declared.queue === "latestWins" && row.kind === kind && row.status === "queued") {
         tx.put("outbox", key, terminal(row, "cancelled", "superseded"));
         superseded.push(fromHex(row.recordId));
         continue;
@@ -139,18 +141,12 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
       reason: undefined
     });
     if (key !== undefined) tx.put("enqueueKeys", key, { recordId: id, epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now) });
-    // The sender's own row, under the rules a reader applies (section 10): the own pin advances by
-    // measurement time, the own status slot takes every newer status; so `latest` and
-    // `latestStatus` answer for self as for anyone else.
-    let own = false;
-    let ownPin = false;
+    // The sender's own row, under the rules a reader applies (section 10): history when the kind
+    // keeps it, and the own newest slot when the kind has one, so `newest` answers for self.
     const self = toHex(a.identityId);
-    if (kind === 2) {
-      const hash = toHex(bodyHash(sealed.wire.subarray(0, sealed.wire.length - 64)));
-      tx.put("statuses", self, { recordId: id, bodyHash: hash, generation: big(a.generation), epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), receivedAt: big(now), payload: toHex(payload) });
-      own = true;
-    }
-    if (kind !== 2) {
+    const hash = toHex(bodyHash(sealed.wire.subarray(0, sealed.wire.length - 64)));
+    const own = declared.newest ? takeSlot(tx, self, kind, { generation: a.generation, eventTime: eventTimeOf(payload, now), epoch: epoch.epoch, counter: sealed.counter, recordId: id, bodyHash: hash, sentAt: now, receivedAt: now, payload }, toHex) : false;
+    if (declared.history) {
       const ownRow: HistoryRow = {
         recordId: id,
         authorIdentityId: toHex(a.identityId),
@@ -167,14 +163,13 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
       };
       tx.put("history", id, ownRow);
       indexHistory(tx, ownRow);
-      if (kind === 0) ownPin = advancePin(tx, self, { generation: a.generation, capturedAt: measuredAt(payload, now), epoch: epoch.epoch, counter: sealed.counter, recordId: id, sentAt: now });
     }
     const nextCounter = epoch.nextCounter + 1;
     tx.put("epochs", String(epoch.epoch), { ...epoch, nextCounter, lastSentAt: big(now) });
     if (nextCounter > MAX_COUNTER) {
       // The final counter was just used: the next enqueue rotates.
     }
-    return { recordId: sealed.recordId, counter: sealed.counter, epoch: epoch.epoch, duplicate: false, own: own || ownPin } as const;
+    return { recordId: sealed.recordId, counter: sealed.counter, epoch: epoch.epoch, duplicate: false, own } as const;
   });
   if ("rotate" in result) {
     throw new KavachError(result.rotate === "counterExhausted" ? "COUNTER_EXHAUSTED" : "ROTATION_REQUIRED", stage, result.rotate);

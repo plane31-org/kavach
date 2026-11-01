@@ -12,7 +12,7 @@ import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { ensureHistoryIndex } from "./historyIndex.js";
-import { forgetAuthor, forgetAuthorIn, history, historyPage, latest, latestStatus, newest, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Latest, type LatestStatus, type ReadBudget, type ReceiveResult } from "./inbox.js";
+import { ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
 import { drain, enqueue, outboxCount, outboxCounts, purgeOutbox, type EnqueueOptions, type OutboxCounts } from "./outbox.js";
 export type { EnqueueOptions } from "./outbox.js";
 
@@ -30,7 +30,11 @@ import type { Relay, Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
 
 /** The types of the client's queries and of `receive`, defined with the inbox. */
-export type { HistoryEntry, HistoryPage, HistoryQuery, Latest, LatestStatus, ReceiveResult } from "./inbox.js";
+export type { HistoryEntry, HistoryPage, HistoryQuery, Newest, ReceiveResult } from "./inbox.js";
+/** @deprecated until the generic API of revision 8: `latest` returns `Newest` for kind 0. */
+export type Latest = Newest;
+/** @deprecated until the generic API of revision 8: `latestStatus` returns `Newest` for kind 2. */
+export type LatestStatus = Newest;
 
 /** accountSeed, deviceSeed, recoveryKey, instanceId and deviceId of a pending reset, in the secret store. */
 const RESET_ROOTS_BYTES = 32 * 3 + 16 + 16;
@@ -141,8 +145,12 @@ export interface Client {
   historyPage(query?: HistoryQuery): Promise<HistoryPage>;
   /** The newest history entry for an author or kind, own records and superseded ones included. */
   newest(query?: Pick<HistoryQuery, "authorIdentityId" | "kind">): Promise<HistoryEntry | undefined>;
-  latest(identityId: Uint8Array): Promise<Latest | undefined>;
-  latestStatus(identityId: Uint8Array): Promise<LatestStatus | undefined>;
+  /** The newest record of a kind from an author's current device, self included; `undefined` when none or expired. */
+  newestOf(identityId: Uint8Array, kind: number): Promise<Newest | undefined>;
+  /** `newestOf(identityId, 0)`. */
+  latest(identityId: Uint8Array): Promise<Newest | undefined>;
+  /** `newestOf(identityId, 2)`. */
+  latestStatus(identityId: Uint8Array): Promise<Newest | undefined>;
   inspect(): Promise<Inspection>;
   readonly circles: {
     create(): Promise<{ circleId: Uint8Array }>;
@@ -248,6 +256,7 @@ class ClientImpl implements Client {
     const opened = await openStore(this.store, this.secrets, this.accountName);
     if (opened.kind === "fresh") return;
     await ensureHistoryIndex(this.store);
+    await ensureSlots(this.store, this.policy);
     this.account = opened.account;
     const deviceSeed = await this.secrets.get("deviceSeed");
     const self = await this.store.read((tx) => tx.get("self", "self"));
@@ -1083,23 +1092,27 @@ class ClientImpl implements Client {
   }
 
   history(query?: HistoryQuery): Promise<HistoryEntry[]> {
-    return history(this.store, query);
+    return history(this.store, this.policy, query);
   }
 
   historyPage(query?: HistoryQuery): Promise<HistoryPage> {
-    return historyPage(this.store, query);
+    return historyPage(this.store, this.policy, query);
   }
 
   newest(query?: Pick<HistoryQuery, "authorIdentityId" | "kind">): Promise<HistoryEntry | undefined> {
-    return newest(this.store, query);
+    return newest(this.store, this.policy, query);
   }
 
-  latest(identityId: Uint8Array): Promise<Latest | undefined> {
-    return latest(this.store, identityId, this.now());
+  newestOf(identityId: Uint8Array, kind: number): Promise<Newest | undefined> {
+    return newestSlot(this.store, identityId, kind, this.now());
   }
 
-  latestStatus(identityId: Uint8Array): Promise<LatestStatus | undefined> {
-    return latestStatus(this.store, identityId, this.now());
+  latest(identityId: Uint8Array): Promise<Newest | undefined> {
+    return this.newestOf(identityId, 0);
+  }
+
+  latestStatus(identityId: Uint8Array): Promise<Newest | undefined> {
+    return this.newestOf(identityId, 2);
   }
 
   // Circles ---------------------------------------------------------------------------------------
@@ -1408,7 +1421,7 @@ class ClientImpl implements Client {
     const newPin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage));
     await t1Secrets(this.secrets, { accountSeed, deviceSeed, recoveryKey, instanceId });
     await this.store.transaction((tx) => {
-      for (const table of ["meta", "self", "pins", "certificates", "quarantine", "circles", "revision", "vault", "epochs", "stream", "outbox", "history", "historyIndex", "enqueueKeys", "livePins", "statuses", "readerEpochs", "subscriptions", "unresolved", "activation", "pendingReset"] as const) {
+      for (const table of ["meta", "self", "pins", "certificates", "quarantine", "circles", "revision", "vault", "epochs", "stream", "outbox", "history", "historyIndex", "enqueueKeys", "newest", "readerEpochs", "subscriptions", "unresolved", "activation", "pendingReset"] as const) {
         for (const [k] of tx.list(table)) tx.delete(table, k);
       }
       t1Header(tx, { account, device, certificate, instanceId, generation: 1n });

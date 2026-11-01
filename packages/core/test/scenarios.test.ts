@@ -448,7 +448,7 @@ describe("scenarios 24 and 26 through the client", () => {
     expect(b.events.filter((e) => e.kind === "checkIn").length).toBe(1);
     expect(w.host.notifications.slice(start).filter((n) => n.to === "bob").map((n) => n.kind)).toEqual(["checkIn", "wake", "wake"]);
     const pin = await b.client.latest(aliceId);
-    expect(pin && toHex(pin.plaintext)).toBe(toHex((await import("../src/codec.js")).encodeLocation(loc(w.clock, 12))));
+    expect(pin && toHex(pin.payload)).toBe(toHex((await import("../src/codec.js")).encodeLocation(loc(w.clock, 12))));
   });
 
   it("26: hygiene rotation at the configured interval produces a new epoch and needsLocation", async () => {

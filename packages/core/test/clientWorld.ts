@@ -7,6 +7,7 @@ import { C, H, signingKeypairFromSeed } from "../src/crypto.js";
 import { KavachError } from "../src/errors.js";
 import { locationFromDegrees } from "../src/record.js";
 import { MemorySecretStore, MemoryStore } from "../src/store.js";
+import type { RetentionPolicy } from "../src/policy.js";
 import { TestClock, testPolicy } from "../src/testing/clock.js";
 import { FakeHost } from "../src/testing/fakeHost.js";
 import { MaliciousTransport } from "../src/testing/faults.js";
@@ -31,21 +32,21 @@ export interface Dev {
 export interface World {
   host: FakeHost;
   clock: TestClock;
-  device(name: string, provider?: MemoryPlatformProvider, store?: MemoryStore, secrets?: MemorySecretStore): Promise<Dev>;
+  device(name: string, provider?: MemoryPlatformProvider, store?: MemoryStore, secrets?: MemorySecretStore, policy?: RetentionPolicy): Promise<Dev>;
   loc(lat: number): Location;
   sync(d: Dev): Promise<SyncReport>;
 }
 
-export function world(): World {
+export function world(defaultPolicy: RetentionPolicy = testPolicy): World {
   const host = new FakeHost();
   const clock = new TestClock();
   host.now = clock.now;
   host.resetSigner = { key: operational, keyId: operationalId };
   host.resetKeyList = buildResetKeyList({ version: 1n, issuedAt: clock.now(), expiresAt: clock.now() + 30n * DAY, keys: [{ keyId: operationalId, publicKey: operational.publicKey }] }, management.secretKey);
-  const device = async (name: string, provider = new MemoryPlatformProvider(name + "@platform"), store = new MemoryStore(), secrets = new MemorySecretStore()): Promise<Dev> => {
+  const device = async (name: string, provider = new MemoryPlatformProvider(name + "@platform"), store = new MemoryStore(), secrets = new MemorySecretStore(), policy = defaultPolicy): Promise<Dev> => {
     const t = new MaliciousTransport(hostTransport(host, name));
     const events: ClientEvent[] = [];
-    const client = await open({ accountName: name, retentionPolicy: testPolicy, recoveryProvider: provider, resetTrust, secretStore: secrets, store, transport: t, now: clock.now });
+    const client = await open({ accountName: name, retentionPolicy: policy, recoveryProvider: provider, resetTrust, secretStore: secrets, store, transport: t, now: clock.now });
     client.subscribe((e) => events.push(e));
     return { client, store, secrets, events, t, provider };
   };

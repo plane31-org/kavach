@@ -3,7 +3,7 @@ import { toHex } from "../src/bytes.js";
 import { createCircleSnapshot, newCircleId, successorSnapshot } from "../src/circle.js";
 import { buildEncryptedRecord, encodeLocation } from "../src/codec.js";
 import { randomBytes, ready } from "../src/crypto.js";
-import { history, latest, purgeHistory, receive, syncStream } from "../src/inbox.js";
+import { history, newestSlot, purgeHistory, receive, syncStream } from "../src/inbox.js";
 import { drain, enqueue } from "../src/outbox.js";
 import { locationFromDegrees } from "../src/record.js";
 import { FakeHost } from "../src/testing/fakeHost.js";
@@ -50,15 +50,15 @@ describe("receiving through sync", () => {
     const b = await syncStream(bob.inbox, aliceStream(alice), alice.pin.identityId);
     expect(b).toMatchObject({ read: 2, stored: 2, keyPending: 0, acked: 2n });
     expect(host.retainedCount(alice.pin.streamId)).toBe(2); // Carol has not read yet
-    const pin = await latest(bob.store, alice.pin.identityId, clock.now());
-    expect(pin && toHex(pin.plaintext)).toBe(toHex(sample(clock, 38)));
+    const pin = await newestSlot(bob.store, alice.pin.identityId, 0, clock.now());
+    expect(pin && toHex(pin.payload)).toBe(toHex(sample(clock, 38)));
     const c = await syncStream(carol.inbox, aliceStream(alice), alice.pin.identityId);
     expect(c.acked).toBe(2n);
     expect(host.retainedCount(alice.pin.streamId)).toBe(0);
     // Nothing more to read, no second acknowledgement.
     const again = await syncStream(bob.inbox, aliceStream(alice), alice.pin.identityId);
     expect(again).toMatchObject({ read: 0, acked: undefined });
-    expect((await history(bob.store)).length).toBe(2);
+    expect((await history(bob.store, bob.inbox.policy)).length).toBe(2);
   });
 
   it("S11 to S13 and S16: updated, duplicate, equivocation, and counter 6 after 7 keeps the pin at 7", async () => {
@@ -76,9 +76,9 @@ describe("receiving through sync", () => {
     const conflicting = wireFor(7, 41);
     expect(await receive(bob.inbox, conflicting)).toEqual({ result: "invalid", reason: "EQUIVOCATION" });
     expect((await receive(bob.inbox, wireFor(6, 39))).result).toBe("history");
-    const pin = await latest(bob.store, alice.pin.identityId, clock.now());
-    expect(pin && toHex(pin.plaintext)).toBe(toHex(sample(clock, 40)));
-    expect((await history(bob.store, { authorIdentityId: alice.pin.identityId })).length).toBe(3);
+    const pin = await newestSlot(bob.store, alice.pin.identityId, 0, clock.now());
+    expect(pin && toHex(pin.payload)).toBe(toHex(sample(clock, 40)));
+    expect((await history(bob.store, bob.inbox.policy, { authorIdentityId: alice.pin.identityId })).length).toBe(3);
   });
 
   it("a record that cannot be opened offline holds the prefix while later records flow, and opens after the next sync", async () => {
@@ -107,7 +107,7 @@ describe("receiving through sync", () => {
     if (epoch1) s2?.epochs.set(1, epoch1);
     s = await syncStream(bob.inbox, aliceStream(alice), alice.pin.identityId);
     expect(s).toMatchObject({ read: 3, stored: 1, duplicate: 2, acked: 3n });
-    expect((await history(bob.store)).map((h) => toHex(h.plaintext).slice(0, 4))).toHaveLength(3);
+    expect((await history(bob.store, bob.inbox.policy)).map((h) => toHex(h.plaintext).slice(0, 4))).toHaveLength(3);
   });
 
   it("a check-in survives later locations, is never the pin, and a superseded device's record is history only", async () => {
@@ -117,11 +117,11 @@ describe("receiving through sync", () => {
     await enqueue(alice.outbox, 0, sample(clock, 12));
     await drain(alice.outbox);
     await syncStream(bob.inbox, aliceStream(alice), alice.pin.identityId);
-    const all = await history(bob.store, { authorIdentityId: alice.pin.identityId });
+    const all = await history(bob.store, bob.inbox.policy, { authorIdentityId: alice.pin.identityId });
     expect(all.map((h) => h.kind)).toEqual([1, 0, 0]);
-    const pin = await latest(bob.store, alice.pin.identityId, clock.now());
-    expect(pin && toHex(pin.plaintext)).toBe(toHex(sample(clock, 12)));
-    expect((await history(bob.store, { kind: 1 })).length).toBe(1);
+    const pin = await newestSlot(bob.store, alice.pin.identityId, 0, clock.now());
+    expect(pin && toHex(pin.payload)).toBe(toHex(sample(clock, 12)));
+    expect((await history(bob.store, bob.inbox.policy, { kind: 1 })).length).toBe(1);
     // Alice replaces her phone: Bob accepts the new certificate; a late record from the old device is history only.
     const { certify, newDevice } = await import("../src/identity.js");
     const newPhone = newDevice();
@@ -131,9 +131,9 @@ describe("receiving through sync", () => {
     const late = buildEncryptedRecord({ streamId: alice.pin.streamId, epoch: 1, counter: 9, sentAt: clock.now(), kind: 0 }, sample(clock, 13), Uint8Array.from(Buffer.from(key, "hex")), randomBytes(24), alice.device.signing.secretKey);
     const r = await receive(bob.inbox, late);
     expect(r.result).toBe("history");
-    const after = await latest(bob.store, alice.pin.identityId, clock.now());
-    expect(after && toHex(after.plaintext)).toBe(toHex(sample(clock, 12)));
-    expect((await history(bob.store, { authorIdentityId: alice.pin.identityId })).find((h) => toHex(h.plaintext) === toHex(sample(clock, 13)))?.superseded).toBe(true);
+    const after = await newestSlot(bob.store, alice.pin.identityId, 0, clock.now());
+    expect(after && toHex(after.payload)).toBe(toHex(sample(clock, 12)));
+    expect((await history(bob.store, bob.inbox.policy, { authorIdentityId: alice.pin.identityId })).find((h) => toHex(h.plaintext) === toHex(sample(clock, 13)))?.superseded).toBe(true);
     void host;
   });
 
@@ -173,18 +173,18 @@ describe("receiving through sync", () => {
     expect(s).toMatchObject({ read: 0, stored: 0 });
     const sub = await bob.store.read((tx) => tx.get("subscriptions", toHex(alice.pin.streamId)));
     expect(sub?.ackPrefix).toBe("1");
-    expect((await history(bob.store)).length).toBe(0);
+    expect((await history(bob.store, bob.inbox.policy)).length).toBe(0);
     // Alice's own history is the only copy; her retention window then removes it too.
-    expect((await history(alice.store)).length).toBe(1);
+    expect((await history(alice.store, alice.outbox.policy)).length).toBe(1);
     expect(await purgeHistory(alice.store, alice.outbox.policy, clock.now())).toBe(1);
     // A fresh record and a purge of the reader side removes the pin with the record.
     await alice.rotate();
     await enqueue(alice.outbox, 0, sample(clock, 2));
     await drain(alice.outbox);
     await syncStream(bob.inbox, aliceStream(alice), alice.pin.identityId);
-    expect(await latest(bob.store, alice.pin.identityId, clock.now())).toBeDefined();
+    expect(await newestSlot(bob.store, alice.pin.identityId, 0, clock.now())).toBeDefined();
     clock.advance(86_400_001n);
     expect(await purgeHistory(bob.store, bob.inbox.policy, clock.now())).toBe(1);
-    expect(await latest(bob.store, alice.pin.identityId, clock.now())).toBeUndefined();
+    expect(await newestSlot(bob.store, alice.pin.identityId, 0, clock.now())).toBeUndefined();
   });
 });

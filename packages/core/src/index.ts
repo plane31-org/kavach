@@ -25,6 +25,7 @@ export {
   type Inspection,
   type Latest,
   type LatestStatus,
+  type Newest,
   type OpenOptions,
   type PauseReason,
   type ReceiveResult,
@@ -42,7 +43,7 @@ export { locationFromDegrees, locationToDegrees } from "./record.js";
 export { decodeLocation, encodeLocation, type Location, type LocationStatus, type RecordKind } from "./codec.js";
 
 // Configuration ------------------------------------------------------------------------------------
-export { validatePolicy, type RetentionPolicy } from "./policy.js";
+export { validatePolicy, type KindDeclaration, type RetentionPolicy } from "./policy.js";
 export type { ResetTrustConfig } from "./reset.js";
 export { setCryptoBackend, type CryptoBackend } from "./crypto.js";
 

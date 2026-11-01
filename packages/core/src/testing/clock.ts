@@ -1,15 +1,22 @@
 import type { RetentionPolicy } from "../policy.js";
 
-/** A retention policy for tests: the Moyo profile's values. */
+/**
+ * A retention policy for tests. Three kinds: 0 is kept a day in history with a newest slot
+ * (a position); 1 is kept thirty days in history with no slot, every one news (an event); 2 is a
+ * one-day slot only, latest wins while queued (a state).
+ */
 export const testPolicy: RetentionPolicy = {
   version: 1,
   deliveryWindowMs: 86_400_000n,
   appendRetryWindowMs: 604_800_000n,
-  locationHistoryMs: 86_400_000n,
-  checkInHistoryMs: 2_592_000_000n,
   hygieneRotationMs: 2_592_000_000n,
   maxOutboxRecords: 2000,
-  maxOutboxBytes: 4 << 20
+  maxOutboxBytes: 4 << 20,
+  kinds: [
+    { kind: 0, retentionMs: 86_400_000n, queue: "keepAll", history: true, newest: true },
+    { kind: 1, retentionMs: 2_592_000_000n, queue: "keepAll", history: true, newest: false },
+    { kind: 2, retentionMs: 86_400_000n, queue: "latestWins", history: false, newest: true }
+  ]
 };
 
 /** A controllable clock. */

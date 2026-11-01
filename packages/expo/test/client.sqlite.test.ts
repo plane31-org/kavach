@@ -71,7 +71,7 @@ describe("client on SqliteStore", () => {
     expect(report.inbox.stored).toBe(1);
     const pin = await bob.latest(aliceId);
     expect(pin).toBeDefined();
-    expect(toHex(pin?.plaintext ?? new Uint8Array()).length).toBe(44);
+    expect(toHex(pin?.payload ?? new Uint8Array()).length).toBe(44);
     expect(host.retainedCount([...host.streams.keys()].map((k) => Uint8Array.from(Buffer.from(k, "hex")))[0] ?? new Uint8Array())).toBeGreaterThanOrEqual(0);
     // A restart with the same secret store reopens the account from the file; the file without its
     // secrets is RECOVERY_REQUIRED, never a fresh account.

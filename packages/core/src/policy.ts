@@ -1,27 +1,38 @@
-/** The versioned retention policy a profile passes to `open()` (protocol section 13). No defaults. */
+/**
+ * The versioned retention policy a profile passes to `open()` (protocol section 13): the global
+ * windows, and one declaration per record kind the product uses. The SDK treats a kind as an
+ * opaque small integer whose behaviour is what the declaration says. No defaults.
+ */
 import { KavachError } from "./errors.js";
+
+/** How the SDK treats one record kind; what the kind means is the product's. */
+export interface KindDeclaration {
+  /** The kind number carried by the record. Until revision 8 the wire carries 0, 1 or 2. */
+  readonly kind: number;
+  /** How long a reader keeps records and the newest slot's payload, from `sentAt`. */
+  readonly retentionMs: bigint;
+  /** `keepAll`: every queued record is sent. `latestWins`: a newer queued record of this kind cancels the older one (`superseded`). */
+  readonly queue: "keepAll" | "latestWins";
+  /** Whether records are kept in indexed, pageable history. */
+  readonly history: boolean;
+  /** Whether one newest-per-author slot is kept, from the author's current device, ordered by event time. */
+  readonly newest: boolean;
+}
 
 export interface RetentionPolicy {
   readonly version: number;
   readonly deliveryWindowMs: bigint;
   readonly appendRetryWindowMs: bigint;
-  readonly locationHistoryMs: bigint;
-  readonly checkInHistoryMs: bigint;
   readonly hygieneRotationMs: bigint;
   readonly maxOutboxRecords: number;
   readonly maxOutboxBytes: number;
+  readonly kinds: readonly KindDeclaration[];
 }
 
-const FIELDS: readonly (keyof RetentionPolicy)[] = [
-  "version",
-  "deliveryWindowMs",
-  "appendRetryWindowMs",
-  "locationHistoryMs",
-  "checkInHistoryMs",
-  "hygieneRotationMs",
-  "maxOutboxRecords",
-  "maxOutboxBytes"
-];
+/** The largest kind the current wire can carry: two header bits, both set being malformed. */
+export const MAX_WIRE_KIND = 2;
+
+const FIELDS: readonly (keyof RetentionPolicy)[] = ["version", "deliveryWindowMs", "appendRetryWindowMs", "hygieneRotationMs", "maxOutboxRecords", "maxOutboxBytes", "kinds"];
 
 /** A missing or malformed policy is rejected; the SDK never substitutes defaults. */
 export function validatePolicy(policy: unknown): RetentionPolicy {
@@ -29,24 +40,45 @@ export function validatePolicy(policy: unknown): RetentionPolicy {
   if (typeof policy !== "object" || policy === null) throw new KavachError("MALFORMED", stage, "retention policy missing");
   const p = policy as Record<string, unknown>;
   for (const f of FIELDS) if (!(f in p)) throw new KavachError("MALFORMED", stage, `retention policy lacks ${f}`);
-  const big = (f: keyof RetentionPolicy): bigint => {
-    const v = p[f];
+  const big = (f: string, v: unknown): bigint => {
     if (typeof v !== "bigint" || v <= 0n) throw new KavachError("MALFORMED", stage, `${f} must be a positive bigint`);
     return v;
   };
-  const int = (f: keyof RetentionPolicy): number => {
-    const v = p[f];
+  const int = (f: string, v: unknown): number => {
     if (typeof v !== "number" || !Number.isInteger(v) || v <= 0) throw new KavachError("MALFORMED", stage, `${f} must be a positive integer`);
     return v;
   };
+  if (!Array.isArray(p.kinds) || p.kinds.length === 0) throw new KavachError("MALFORMED", stage, "kinds must declare at least one kind");
+  const seen = new Set<number>();
+  const kinds: KindDeclaration[] = p.kinds.map((raw: unknown, i: number) => {
+    if (typeof raw !== "object" || raw === null) throw new KavachError("MALFORMED", stage, `kinds[${i}] must be an object`);
+    const k = raw as Record<string, unknown>;
+    const kind = k.kind;
+    if (typeof kind !== "number" || !Number.isInteger(kind) || kind < 0 || kind > MAX_WIRE_KIND) throw new KavachError("MALFORMED", stage, `kinds[${i}].kind must be an integer from 0 to ${MAX_WIRE_KIND}`);
+    if (seen.has(kind)) throw new KavachError("MALFORMED", stage, `kind ${kind} declared twice`);
+    seen.add(kind);
+    if (k.queue !== "keepAll" && k.queue !== "latestWins") throw new KavachError("MALFORMED", stage, `kinds[${i}].queue must be keepAll or latestWins`);
+    if (typeof k.history !== "boolean" || typeof k.newest !== "boolean") throw new KavachError("MALFORMED", stage, `kinds[${i}].history and .newest must be booleans`);
+    if (!k.history && !k.newest) throw new KavachError("MALFORMED", stage, `kinds[${i}] keeps nothing: declare history or newest`);
+    return { kind, retentionMs: big(`kinds[${i}].retentionMs`, k.retentionMs), queue: k.queue, history: k.history, newest: k.newest };
+  });
   return {
-    version: int("version"),
-    deliveryWindowMs: big("deliveryWindowMs"),
-    appendRetryWindowMs: big("appendRetryWindowMs"),
-    locationHistoryMs: big("locationHistoryMs"),
-    checkInHistoryMs: big("checkInHistoryMs"),
-    hygieneRotationMs: big("hygieneRotationMs"),
-    maxOutboxRecords: int("maxOutboxRecords"),
-    maxOutboxBytes: int("maxOutboxBytes")
+    version: int("version", p.version),
+    deliveryWindowMs: big("deliveryWindowMs", p.deliveryWindowMs),
+    appendRetryWindowMs: big("appendRetryWindowMs", p.appendRetryWindowMs),
+    hygieneRotationMs: big("hygieneRotationMs", p.hygieneRotationMs),
+    maxOutboxRecords: int("maxOutboxRecords", p.maxOutboxRecords),
+    maxOutboxBytes: int("maxOutboxBytes", p.maxOutboxBytes),
+    kinds
   };
+}
+
+/** The declaration of a kind, or `undefined` for one the product did not declare. */
+export function kindOf(policy: RetentionPolicy, kind: number): KindDeclaration | undefined {
+  return policy.kinds.find((k) => k.kind === kind);
+}
+
+/** The kinds kept in history, in declaration order. */
+export function historyKinds(policy: RetentionPolicy): readonly number[] {
+  return policy.kinds.filter((k) => k.history).map((k) => k.kind);
 }

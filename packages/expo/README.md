@@ -25,7 +25,7 @@ const { client, databaseFileName } = await openKavach({
   accountName,
   transport,          // the app's authenticated fetch and sockets, a `Transport` from "@kavach/core/adapters"
   recoveryProvider,   // BlockStoreRecoveryProvider on Android, AppleKeychainRecoveryProvider on iOS
-  retentionPolicy,
+  retentionPolicy,    // the global windows plus `kinds`: one { kind, retentionMs, queue, history, newest } per record kind the app uses
   resetTrust,
   secrets: { secureStore: SecureStore, thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, keychainService: "app.getmoyo" },
   database: SQLite,

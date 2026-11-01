@@ -66,6 +66,7 @@ export function t1Header(tx: Tx, input: { account: OwnAccount; device: DeviceKey
   tx.put("meta", META, {
     schema: 1,
     historyIndex: 1,
+    newest: 1,
     instanceId: toHex(input.instanceId),
     accountName: input.account.accountName,
     identityId: toHex(input.account.identityId),

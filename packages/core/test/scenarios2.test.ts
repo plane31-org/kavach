@@ -183,7 +183,7 @@ describe("step 13: remaining appendix scenarios through the client", () => {
     const h = await b.client.history({ authorIdentityId: aliceId });
     expect(h.length).toBe(8);
     const pin = await b.client.latest(aliceId);
-    expect(pin && toHex(pin.plaintext)).toBe(toHex((await import("../src/codec.js")).encodeLocation(loc(w.clock, 7))));
+    expect(pin && toHex(pin.payload)).toBe(toHex((await import("../src/codec.js")).encodeLocation(loc(w.clock, 7))));
   });
 
   it("25: two execution contexts enqueue concurrently: counters are unique and the order is preserved", async () => {
@@ -230,7 +230,7 @@ describe("step 13: remaining appendix scenarios through the client", () => {
     expect(report.outbox.accepted).toBe(0);
     await b.client.sync();
     const pin = await b.client.latest(aliceId);
-    expect(pin && toHex(pin.plaintext)).toBe(toHex((await import("../src/codec.js")).encodeLocation(loc(w.clock, 1))));
+    expect(pin && toHex(pin.payload)).toBe(toHex((await import("../src/codec.js")).encodeLocation(loc(w.clock, 1))));
   });
 
   it("every state transition is emitted only after its durable commit", async () => {

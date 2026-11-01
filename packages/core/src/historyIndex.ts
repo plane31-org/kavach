@@ -8,11 +8,9 @@
  * (locations and check-ins); a status is never history. The tuple doubles as the page cursor:
  * it names a position that no later write moves.
  */
-import type { RecordKind } from "./codec.js";
 import { unbig } from "./rows.js";
 import type { HistoryRow, Store, Tx } from "./store.js";
 
-export const HISTORY_KINDS: readonly RecordKind[] = [0, 1];
 const META = "meta";
 
 /** A u64 as twenty decimal digits, so that string order is numeric order. */
@@ -24,11 +22,11 @@ export function historyTuple(r: Pick<HistoryRow, "sentAt" | "epoch" | "counter" 
   return `${padTime(unbig(r.sentAt))}:${r.epoch.toString().padStart(10, "0")}:${r.counter.toString().padStart(10, "0")}:${r.recordId}`;
 }
 
-export function timelinePrefix(kind: RecordKind): string {
+export function timelinePrefix(kind: number): string {
   return `t:${kind}:`;
 }
 
-export function authorPrefix(authorIdentityId: string, kind: RecordKind): string {
+export function authorPrefix(authorIdentityId: string, kind: number): string {
   return `a:${authorIdentityId}:${kind}:`;
 }
 

@@ -27,6 +27,8 @@ export interface MetaRow {
   schema: 1;
   /** Set once the history index holds every history row; a store from before the index is backfilled on open. */
   historyIndex?: 1;
+  /** Set once the newest slots are built from history; a store from before the slot table is rebuilt on open. */
+  newest?: 1;
   instanceId: string;
   accountName: string;
   identityId: string;
@@ -159,18 +161,12 @@ export interface HistoryRow {
   bodyHash?: string;
 }
 
-export interface LivePinRow {
-  recordId: string;
-  generation: string;
-  epoch: number;
-  counter: number;
-  sentAt: string;
-  /** Measurement time (the decoded `capturedAt`, clamped to `sentAt`); absent on rows from before revision 7, derived from the record then. */
-  capturedAt?: string;
-}
-
-/** The newest status (kind 2) per author: one row, never history. Keyed by author identity id. */
-export interface StatusRow {
+/**
+ * The newest record per author and kind (for kinds declared `newest`), keyed `<author>:<kind>`.
+ * The order fields decide replacement; the payload is dropped at expiry while the row keeps its
+ * order, so an older record replayed later cannot become current.
+ */
+export interface NewestRow {
   recordId: string;
   bodyHash: string;
   generation: string;
@@ -178,7 +174,9 @@ export interface StatusRow {
   counter: number;
   sentAt: string;
   receivedAt: string;
-  /** Hex, possibly empty; `null` once expired, the slot staying so an older status cannot become current. */
+  /** The event time the slot was ordered by, never later than `sentAt`. */
+  eventTime: string;
+  /** Hex, possibly empty; `null` once expired. */
   payload: string | null;
 }
 
@@ -280,8 +278,7 @@ export interface Tables {
   history: HistoryRow;
   historyIndex: HistoryIndexRow;
   enqueueKeys: EnqueueKeyRow;
-  livePins: LivePinRow;
-  statuses: StatusRow;
+  newest: NewestRow;
   readerEpochs: ReaderEpochRow;
   subscriptions: SubscriptionRow;
   unresolved: UnresolvedRow;

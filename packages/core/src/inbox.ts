@@ -7,12 +7,12 @@ import { DocumentType, expectType, parseDocument, type EncryptedRecord, type Rec
 import { bodyHash } from "./crypto.js";
 import { openEpoch, type AuthorView, type SelfView } from "./epoch.js";
 import { KavachError, isKavachError } from "./errors.js";
-import type { RetentionPolicy } from "./policy.js";
-import { HISTORY_KINDS, authorPrefix, indexHistory, padTime, timelinePrefix, unindexHistory } from "./historyIndex.js";
-import { advancePin, measuredAt } from "./pins.js";
-import { compareSlots, openRecordWire } from "./record.js";
+import { authorPrefix, indexHistory, padTime, timelinePrefix, unindexHistory } from "./historyIndex.js";
+import { historyKinds, kindOf, type RetentionPolicy } from "./policy.js";
+import { openRecordWire } from "./record.js";
 import { big, unbig } from "./rows.js";
-import type { HistoryRow, KeyRange, Store, SubscriptionRow, Tx, StatusRow } from "./store.js";
+import { eventTimeOf, slotKey, takeSlot } from "./slots.js";
+import type { HistoryRow, KeyRange, Store, SubscriptionRow, Tx } from "./store.js";
 import type { ReadRecordsResult, Relay } from "./transport.js";
 
 export const MAX_FUTURE_SKEW_MS = 300_000n;
@@ -120,20 +120,21 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   const cert = [...author.view.certificates.values()].find((c) => equalBytes(c.streamId, parsed.streamId));
   const generation = unbig(tx.list("certificates").find(([, c]) => c.streamId === toHex(parsed.streamId))?.[1].generation ?? "0");
   const base = { recordId: opened.recordId, authorIdentityId: author.identityId, kind: parsed.kind };
-  if (parsed.kind === 2) {
-    // A status is the author's current state, not an event: one row per author, newest slot wins,
-    // never a pin, never a check-in, never history. An older or superseded one changes nothing.
-    const key = toHex(author.identityId);
-    const current = tx.get("statuses", key);
+  const declared = kindOf(deps.policy, parsed.kind);
+  if (!declared) return { result: "invalid", reason: "BAD_PAYLOAD" }; // a kind this product did not declare
+  const authorHex = toHex(author.identityId);
+  const fromCurrentDevice = !opened.superseded && !!cert?.current;
+  const candidate = { generation, eventTime: eventTimeOf(opened.plaintext, parsed.sentAt), epoch: parsed.epoch, counter: parsed.counter, recordId: id, bodyHash: hash, sentAt: parsed.sentAt, receivedAt: now, payload: opened.plaintext };
+  if (!declared.history) {
+    // A slot-only kind is the author's current state, not an event: one row per author, the newest
+    // from the current device wins. An older or superseded one changes nothing.
+    const current = tx.get("newest", slotKey(authorHex, parsed.kind));
     if (current?.recordId === id) {
       if (current.bodyHash === hash) return { result: "duplicate", recordId: opened.recordId };
       return { result: "invalid", reason: "EQUIVOCATION" };
     }
-    if (opened.superseded || !cert?.current) return { result: "history", ...base };
-    const slot = { generation, epoch: parsed.epoch, counter: parsed.counter };
-    if (current && compareSlots(slot, { generation: unbig(current.generation), epoch: current.epoch, counter: current.counter }) <= 0) return { result: "history", ...base };
-    tx.put("statuses", key, { recordId: id, bodyHash: hash, generation: big(generation), epoch: parsed.epoch, counter: parsed.counter, sentAt: big(parsed.sentAt), receivedAt: big(now), payload: toHex(opened.plaintext) });
-    return { result: "updated", ...base };
+    if (!fromCurrentDevice) return { result: "history", ...base };
+    return takeSlot(tx, authorHex, parsed.kind, candidate, toHex) ? { result: "updated", ...base } : { result: "history", ...base };
   }
   const existing = tx.get("history", id);
   if (existing) {
@@ -157,11 +158,9 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   };
   tx.put("history", id, row);
   indexHistory(tx, row);
-  let moved = false;
-  if (parsed.kind === 0 && !row.superseded) {
-    moved = advancePin(tx, toHex(author.identityId), { generation, capturedAt: measuredAt(opened.plaintext, parsed.sentAt), epoch: parsed.epoch, counter: parsed.counter, recordId: id, sentAt: parsed.sentAt });
-  }
-  return moved || parsed.kind === 1 ? { result: "updated", ...base } : { result: "history", ...base };
+  // A kind with a slot is news when it takes the slot; a kind without one is news every time.
+  const took = declared.newest && fromCurrentDevice ? takeSlot(tx, authorHex, parsed.kind, candidate, toHex) : false;
+  return took || !declared.newest ? { result: "updated", ...base } : { result: "history", ...base };
 }
 
 /** A record pushed by the host outside `sync`: stored, but it never advances a relay cursor. */
@@ -386,10 +385,11 @@ function toEntry(r: HistoryRow): HistoryEntry {
 }
 
 /** One page of history in time order, read through the index: one bounded scan per kind, merged. */
-export async function historyPage(store: Store, q: HistoryQuery = {}): Promise<HistoryPage> {
+export async function historyPage(store: Store, policy: RetentionPolicy, q: HistoryQuery = {}): Promise<HistoryPage> {
   const limit = Math.max(0, Math.floor(q.limit ?? HISTORY_PAGE));
   const reverse = q.order === "desc";
-  const kinds = q.kind === undefined ? HISTORY_KINDS : HISTORY_KINDS.includes(q.kind) ? [q.kind] : [];
+  const all = historyKinds(policy);
+  const kinds = q.kind === undefined ? all : all.includes(q.kind) ? [q.kind] : [];
   if (limit === 0 || kinds.length === 0) return { entries: [], cursor: undefined };
   return store.read((tx) => {
     const scans = kinds.map((kind) => {
@@ -418,13 +418,13 @@ export async function historyPage(store: Store, q: HistoryQuery = {}): Promise<H
 }
 
 /** The first page only, for callers that want a plain list. */
-export async function history(store: Store, q: HistoryQuery = {}): Promise<HistoryEntry[]> {
-  return (await historyPage(store, q)).entries;
+export async function history(store: Store, policy: RetentionPolicy, q: HistoryQuery = {}): Promise<HistoryEntry[]> {
+  return (await historyPage(store, policy, q)).entries;
 }
 
 /** The newest history entry matching the filters, read as a one-entry descending page. */
-export async function newest(store: Store, q: Pick<HistoryQuery, "authorIdentityId" | "kind"> = {}): Promise<HistoryEntry | undefined> {
-  return (await historyPage(store, { ...q, order: "desc", limit: 1 })).entries[0];
+export async function newest(store: Store, policy: RetentionPolicy, q: Pick<HistoryQuery, "authorIdentityId" | "kind"> = {}): Promise<HistoryEntry | undefined> {
+  return (await historyPage(store, policy, { ...q, order: "desc", limit: 1 })).entries[0];
 }
 
 interface IndexHit {
@@ -450,62 +450,71 @@ function mergeByTuple(scans: IndexHit[][], reverse: boolean, limit: number): Ind
   return out;
 }
 
-export interface Latest {
+/** An author's newest record of a kind: the slot's holder, with the event time it was chosen by and its age. */
+export interface Newest {
   readonly recordId: Uint8Array;
-  readonly plaintext: Uint8Array;
-  readonly sentAt: bigint;
-  /** The measurement time the pin was chosen by: the decoded capture time, never later than `sentAt`. */
-  readonly capturedAt: bigint;
-  readonly ageMs: bigint;
-}
-
-/** The live pin: the newest verified location from the author's current device, with its age. */
-export async function latest(store: Store, authorIdentityId: Uint8Array, now: bigint): Promise<Latest | undefined> {
-  return store.read((tx) => {
-    const pin = tx.get("livePins", toHex(authorIdentityId));
-    if (!pin) return undefined;
-    const row = tx.get("history", pin.recordId);
-    if (!row) return undefined;
-    const plaintext = fromHex(row.plaintext);
-    return { recordId: fromHex(row.recordId), plaintext, sentAt: unbig(row.sentAt), capturedAt: measuredAt(plaintext, unbig(row.sentAt)), ageMs: now - unbig(row.sentAt) };
-  });
-}
-
-export interface LatestStatus {
-  readonly recordId: Uint8Array;
+  readonly kind: number;
   readonly payload: Uint8Array;
   readonly sentAt: bigint;
+  /** The event time the slot was ordered by, never later than `sentAt`. */
+  readonly eventTime: bigint;
   readonly ageMs: bigint;
 }
 
-/** The author's newest status (kind 2), with its age. */
-export async function latestStatus(store: Store, authorIdentityId: Uint8Array, now: bigint): Promise<LatestStatus | undefined> {
+/** The newest slot of an author and kind, or `undefined` when there is none or its payload expired (the slot stays, the payload is gone). */
+export async function newestSlot(store: Store, authorIdentityId: Uint8Array, kind: number, now: bigint): Promise<Newest | undefined> {
   return store.read((tx) => {
-    const row = tx.get("statuses", toHex(authorIdentityId));
-    if (!row || row.payload === null) return undefined; // none, or expired: the slot stays, the payload is gone
-    return { recordId: fromHex(row.recordId), payload: fromHex(row.payload), sentAt: unbig(row.sentAt), ageMs: now - unbig(row.sentAt) };
+    const row = tx.get("newest", slotKey(toHex(authorIdentityId), kind));
+    if (!row || row.payload === null) return undefined;
+    return { recordId: fromHex(row.recordId), kind, payload: fromHex(row.payload), sentAt: unbig(row.sentAt), eventTime: unbig(row.eventTime), ageMs: now - unbig(row.sentAt) };
   });
 }
 
 /**
- * Retention: drop history outside the windows; a pin whose record is gone disappears with it. A
- * status expires with the location window: its payload is dropped while the row keeps its slot,
- * so an older status replayed later cannot become current.
+ * Build the slots once for a store written before the slot table: every non-superseded history
+ * row of a kind declared `newest` is offered to its slot in time order. A fresh store is marked
+ * at T1 and never runs this. Idempotent.
+ */
+export async function ensureSlots(store: Store, policy: RetentionPolicy): Promise<boolean> {
+  const built = await store.read((tx) => tx.get("meta", "meta")?.newest === 1);
+  if (built) return false;
+  return store.transaction((tx) => {
+    const meta = tx.get("meta", "meta");
+    if (!meta || meta.newest === 1) return false;
+    for (const [, r] of tx.list("history")) {
+      if (r.superseded || !kindOf(policy, r.kind)?.newest) continue;
+      const payload = fromHex(r.plaintext);
+      takeSlot(tx, r.authorIdentityId, r.kind, { generation: unbig(r.generation), eventTime: eventTimeOf(payload, unbig(r.sentAt)), epoch: r.epoch, counter: r.counter, recordId: r.recordId, bodyHash: r.bodyHash ?? "", sentAt: unbig(r.sentAt), receivedAt: unbig(r.receivedAt), payload }, toHex);
+    }
+    tx.put("meta", "meta", { ...meta, newest: 1 });
+    return true;
+  });
+}
+
+/**
+ * Retention, per declared kind: drop history past the kind's window, and drop the payload of a
+ * newest slot past it while the row keeps its order, so an older record replayed later cannot
+ * become current.
  */
 export async function purgeHistory(store: Store, policy: RetentionPolicy, now: bigint): Promise<number> {
-  const window = (kind: RecordKind): bigint => (kind === 1 ? policy.checkInHistoryMs : policy.locationHistoryMs);
-  const staleStatus = (r: StatusRow): boolean => r.payload !== null && unbig(r.sentAt) + window(2) <= now;
+  const window = (kind: number): bigint | undefined => kindOf(policy, kind)?.retentionMs;
+  const kindOfSlot = (key: string): number => Number(key.slice(key.lastIndexOf(":") + 1));
+  const staleSlot = (key: string, r: { payload: string | null; sentAt: string }): boolean => {
+    const w = window(kindOfSlot(key));
+    return r.payload !== null && w !== undefined && unbig(r.sentAt) + w <= now;
+  };
   // The expired prefix of each kind's timeline: `sentAt + window <= now`, as a key bound.
-  const expiredRange = (kind: RecordKind, limit?: number): KeyRange | undefined => {
-    const cutoff = now - window(kind) + 1n;
+  const expiredRange = (kind: number, limit?: number): KeyRange | undefined => {
+    const w = window(kind);
+    const cutoff = w === undefined ? 0n : now - w + 1n;
     return cutoff <= 0n ? undefined : { prefix: timelinePrefix(kind), lt: timelinePrefix(kind) + padTime(cutoff), ...(limit === undefined ? {} : { limit }) };
   };
-  const expired = (tx: Pick<Tx, "range">, limit?: number) => HISTORY_KINDS.flatMap((kind) => {
+  const expired = (tx: Pick<Tx, "range">, limit?: number) => historyKinds(policy).flatMap((kind) => {
     const r = expiredRange(kind, limit);
     return r ? tx.range("historyIndex", r) : [];
   });
   // Read first: most syncs purge nothing and must not take the writer lock for it.
-  const any = await store.read((tx) => expired(tx, 1).length > 0 || tx.list("statuses").some(([, r]) => staleStatus(r)));
+  const any = await store.read((tx) => expired(tx, 1).length > 0 || tx.list("newest").some(([k, r]) => staleSlot(k, r)));
   if (!any) return 0;
   return store.transaction((tx) => {
     let removed = 0;
@@ -518,28 +527,25 @@ export async function purgeHistory(store: Store, policy: RetentionPolicy, now: b
       unindexHistory(tx, row);
       tx.delete("history", hit.recordId);
       removed++;
-      const pin = tx.get("livePins", row.authorIdentityId);
-      if (pin?.recordId === hit.recordId) tx.delete("livePins", row.authorIdentityId);
     }
-    for (const [key, r] of tx.list("statuses")) {
-      if (staleStatus(r)) {
-        tx.put("statuses", key, { ...r, payload: null });
-        removed++;
+    for (const [key, r] of tx.list("newest")) {
+      if (staleSlot(key, r)) {
+        tx.put("newest", key, { ...r, payload: null });
+        if (!kindOf(policy, kindOfSlot(key))?.history) removed++; // a history kind's record was counted with its row
       }
     }
     return removed;
   });
 }
 
-/** Clear a removed author's live pin and keys; history already received stays. */
+/** Clear a removed author's newest slots and keys; history already received stays. */
 export async function forgetAuthor(store: Store, authorIdentityId: Uint8Array): Promise<void> {
   await store.transaction((tx) => forgetAuthorIn(tx, authorIdentityId));
 }
 
 /** The same, inside a caller's transaction. */
 export function forgetAuthorIn(tx: Tx, authorIdentityId: Uint8Array): void {
-  tx.delete("livePins", toHex(authorIdentityId));
-  tx.delete("statuses", toHex(authorIdentityId));
+  for (const [k] of tx.list("newest", toHex(authorIdentityId) + ":")) tx.delete("newest", k);
   for (const [, c] of tx.list("certificates")) {
     if (c.identityId !== toHex(authorIdentityId)) continue;
     for (const [k] of tx.list("readerEpochs", c.streamId + ":")) tx.delete("readerEpochs", k);
