@@ -4,7 +4,6 @@
  * captured at import time would be missing for the life of the process.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { randomBytes, ready, sealBox } from "../src/crypto.js";
 import { nobleBackend } from "../src/crypto/noble.js";
 
 // Node defines `globalThis.crypto` with a getter only; it is replaced through its descriptor.
@@ -19,9 +18,9 @@ afterEach(() => {
 
 describe("the random source", () => {
   it("is read at call time: a source installed after import is used, and its absence is a clear error", async () => {
-    await ready();
+    // The portable backend itself: the libsodium backend draws from libsodium, and this test runs under both.
     setCrypto(undefined);
-    expect(() => randomBytes(16)).toThrow(/install a secure random source/);
+    expect(() => nobleBackend.randomBytes(16)).toThrow(/install a secure random source/);
     let calls = 0;
     setCrypto({
       getRandomValues: (a: Uint8Array) => {
@@ -30,10 +29,10 @@ describe("the random source", () => {
         return a;
       }
     });
-    const bytes = randomBytes(8);
+    const bytes = nobleBackend.randomBytes(8);
     expect([calls, [...bytes]]).toEqual([1, [3, 10, 17, 24, 31, 38, 45, 52]]);
-    // The sealed-box ephemeral key, drawn inside the backend, goes through the same path.
-    const sealed = sealBox(new Uint8Array(32), nobleBackend.boxKeypairFromSeed(new Uint8Array(32).fill(5)).publicKey);
-    expect([sealed.length, calls]).toEqual([80, 2]);
+    // An ephemeral box keypair, drawn inside the backend, goes through the same path.
+    const ephemeral = nobleBackend.boxKeypair();
+    expect([ephemeral.publicKey.length, calls]).toEqual([32, 2]);
   });
 });
