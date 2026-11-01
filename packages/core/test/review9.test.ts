@@ -354,6 +354,37 @@ describe("fourth review: the replacement device holds its account's whole chain"
   });
 });
 
+describe("fifth review: a paged history at activation", () => {
+  it("with one-link pages, a third replacement activates on the retried commit and on a sync resume alike", async () => {
+    const w = world();
+    const { a, bobId } = await pair(w);
+    await recover(w, "bob");
+    await recover(w, "bob");
+    w.host.successionPageSize = 1;
+    // Through the commit's own answer.
+    const d = await w.device("bob", new MemoryPlatformProvider("bob-4@platform"), new MemoryStore(), new MemorySecretStore());
+    const p = await d.client.prepareReplacement();
+    const token = w.host.authorizeReplacement({ accountName: "bob", successionId: p.successionId, expectedCertificateHash: p.expectedCertificateHash, certificate: p.certificate });
+    expect((await d.client.completeReplacement({ successionId: p.successionId, authorization: token })).generation).toBe(4n);
+    expect(await d.store.read((tx) => tx.list("successions").map(([, s]) => s.newGeneration))).toEqual(["2", "3", "4"]);
+    const r = await w.sync(d);
+    expect([r.errors, r.bootstrap?.circles]).toEqual([[], 1]);
+    // Through the chain, after a lost response.
+    const e = await w.device("bob", new MemoryPlatformProvider("bob-5@platform"), new MemoryStore(), new MemorySecretStore());
+    const q = await e.client.prepareReplacement();
+    const token2 = w.host.authorizeReplacement({ accountName: "bob", successionId: q.successionId, expectedCertificateHash: q.expectedCertificateHash, certificate: q.certificate });
+    e.t.knobs.loseResponseOf.add("succeedAccount");
+    e.t.knobs.withhold.add("successions");
+    expect(await thrown(() => e.client.completeReplacement({ successionId: q.successionId, authorization: token2 }))).toBe("SUCCESSION_PENDING");
+    e.t.knobs.withhold.delete("successions");
+    const resumed = await w.sync(e);
+    expect([resumed.errors, (await e.client.getState()).generation]).toEqual([[], 5n]);
+    expect(await e.store.read((tx) => tx.list("successions").map(([, s]) => s.newGeneration))).toEqual(["2", "3", "4", "5"]);
+    const ar = await w.sync(a);
+    expect([ar.errors, (await a.store.read((tx) => tx.get("pins", toHex(bobId))))?.generation]).toEqual([[], "5"]);
+  });
+});
+
 describe("a recovery-only client without a provider has no vault", () => {
   it("registers without one, publishes none, and the host holds none", async () => {
     const recovery = { ...testPolicy, replacement: "recovery" as const };

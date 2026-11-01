@@ -97,6 +97,19 @@ function world(): { host: FakeHost; clock: TestClock; resetTrust: { managementKe
 }
 
 describe("openKavach", () => {
+  it("takes no recovery provider on a recovery-only profile, and requires one where identity continuity is enabled", async () => {
+    const w = world();
+    const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));
+    const keys = new Map<string, string>();
+    const recoveryOnly = { ...testPolicy, replacement: "recovery" as const };
+    const alice = await openKavach({ accountName: "alice", transport: w.transport("alice"), retentionPolicy: recoveryOnly, resetTrust: w.resetTrust, secrets: new MemorySecretStore(), database: cipherLike(dir, keys), context: "foreground", now: w.clock.now });
+    await alice.client.initializeAccount();
+    expect((await alice.client.recoveryStatus()).status).toBe("unsupported");
+    expect(w.host.accounts.get("alice")?.vault).toBeUndefined();
+    await alice.client.close();
+    await expect(openKavach({ accountName: "bob", transport: w.transport("bob"), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets: new MemorySecretStore(), database: cipherLike(dir, keys), context: "foreground", now: w.clock.now })).rejects.toMatchObject({ code: "MALFORMED" });
+  });
+
   it("keeps two accounts on one device in separate databases with separate keys and secrets", async () => {
     const w = world();
     const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));

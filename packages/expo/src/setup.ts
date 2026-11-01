@@ -17,7 +17,8 @@ export interface ExpoSqliteLike {
 export interface KavachSetupOptions {
   readonly accountName: string;
   readonly transport: Transport;
-  readonly recoveryProvider: RecoveryProvider;
+  /** Required when the retention policy enables identity continuity; a recovery-only profile may omit it (core enforces this at open). */
+  readonly recoveryProvider?: RecoveryProvider;
   readonly retentionPolicy: RetentionPolicy;
   readonly resetTrust: ResetTrustConfig;
   /**
@@ -124,7 +125,7 @@ export async function openKavach(options: KavachSetupOptions): Promise<KavachSet
   const client = await open({
     accountName: options.accountName,
     retentionPolicy: options.retentionPolicy,
-    recoveryProvider: options.recoveryProvider,
+    ...(options.recoveryProvider ? { recoveryProvider: options.recoveryProvider } : {}),
     resetTrust: options.resetTrust,
     secretStore,
     store,

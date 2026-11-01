@@ -1160,7 +1160,7 @@ class ClientImpl implements Client {
    * intermediate successor; for a first contact or a restore the verified links are returned and
    * the caller records them with the pin or the header. Any failure leaves the pin where it was.
    */
-  private async followChain(input: { accountId: Uint8Array; accountName: string; current?: AccountPin; finalIdentityId?: Uint8Array; firstPage: readonly SuccessionLink[]; next: bigint | undefined; budget?: ReadBudget | undefined }): Promise<{ pin: AccountPin | undefined; verified: VerifiedLink[]; accepted: SuccessionEffect[] }> {
+  private async followChain(input: { accountId: Uint8Array; accountName: string; current?: AccountPin; finalIdentityId?: Uint8Array; untilGeneration?: bigint; firstPage: readonly SuccessionLink[]; next: bigint | undefined; budget?: ReadBudget | undefined }): Promise<{ pin: AccountPin | undefined; verified: VerifiedLink[]; accepted: SuccessionEffect[] }> {
     const stage = "chain";
     if (!acceptsSuccession(this.policy)) throw new KavachError("UNSUPPORTED_TYPE", stage, "this deployment does not accept successions");
     const accountHex = toHex(input.accountId);
@@ -1174,8 +1174,11 @@ class ClientImpl implements Client {
     // recorded state; a different one is the authority signing two successors), so verification
     // starts at the pinned identity with only the transitions this device has not seen.
     const recorded = current ? await this.store.read((tx) => tx.list("successions", accountHex + ":").map(([, r]) => r)) : [];
+    // The bound, applied to every page alike: links past `untilGeneration` are not this call's to
+    // follow (a replacing device stops at the state its own succession left from).
+    const within = (l: SuccessionLink): boolean => input.untilGeneration === undefined || expectType<AccountSuccession>(parseDocument(l.wire), DocumentType.AccountSuccession, stage).newGeneration <= input.untilGeneration;
     const unseen = (links: readonly SuccessionLink[]): SuccessionLink[] =>
-      links.filter((l) => {
+      links.filter(within).filter((l) => {
         const doc = expectType<AccountSuccession>(parseDocument(l.wire), DocumentType.AccountSuccession, stage);
         const t = transitionOf(doc);
         const row = recorded.find((r) => unbig(r.previousGeneration) === t.previousGeneration && r.previousIdentityId === t.previousIdentityId);
@@ -1221,7 +1224,9 @@ class ClientImpl implements Client {
         if (cursor === undefined) tx.delete("chainProgress", accountHex);
         else tx.put("chainProgress", accountHex, { accountId: accountHex, startIdentityId: toHex(startIdentity), links: verified.map((v) => ({ wire: toHex(v.wire), certificate: toHex(v.certificate) })), nextGeneration: big(cursor), complete: false });
       });
+    const reached = (): boolean => input.untilGeneration !== undefined && state.generation >= input.untilGeneration;
     verifyMore(pending);
+    if (reached()) cursor = undefined;
     while (cursor !== undefined) {
       if (input.budget && (input.budget.remainingRecords <= 0 || this.now() >= input.budget.deadline)) {
         await persist();
@@ -1239,7 +1244,7 @@ class ClientImpl implements Client {
         throw new KavachError("METADATA_REQUIRED", stage, "the host did not finish serving the chain");
       }
       verifyMore(page.successions);
-      cursor = page.nextGeneration;
+      cursor = reached() ? undefined : page.nextGeneration;
       if (cursor !== undefined) await persist();
     }
     if (input.finalIdentityId && state.identityId !== toHex(input.finalIdentityId)) throw new KavachError("SUCCESSION_BINDING", stage, "the chain does not end at the served key");
@@ -1981,14 +1986,8 @@ class ClientImpl implements Client {
     const [me] = await this.transport.directory.resolveAccounts([this.accountName]);
     const served = me?.successions ?? [];
     const ownSuccession = authenticateSuccession(succession, this.trust, this.now());
-    const earlier = served.filter((l) => {
-      try {
-        return expectType<AccountSuccession>(parseDocument(l.wire), DocumentType.AccountSuccession, stage).newGeneration <= ownSuccession.previousGeneration;
-      } catch {
-        return false;
-      }
-    });
-    const history = earlier.length > 0 || me?.successionsNext !== undefined ? (await this.followChain({ accountId, accountName: this.accountName, finalIdentityId: previousPin.identityId, firstPage: earlier, next: earlier.length === served.length ? me?.successionsNext : undefined })).verified : [];
+    // Bounded by the generation this device's own succession left from, on every page alike.
+    const history = served.length > 0 || me?.successionsNext !== undefined ? (await this.followChain({ accountId, accountName: this.accountName, finalIdentityId: previousPin.identityId, untilGeneration: ownSuccession.previousGeneration, firstPage: served, next: me?.successionsNext })).verified : [];
     const accountSeed = roots.subarray(0, 32);
     const deviceSeed = roots.subarray(32, 64);
     const recoveryKey = roots.subarray(64, 96);
