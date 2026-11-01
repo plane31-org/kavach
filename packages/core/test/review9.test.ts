@@ -385,6 +385,31 @@ describe("fifth review: a paged history at activation", () => {
   });
 });
 
+describe("sixth review: missing history at activation", () => {
+  it("a withheld account resolution during activation keeps the proposal; the next call finishes with the older keys", async () => {
+    const w = world();
+    const { b, aliceId } = await pair(w);
+    await recover(w, "alice"); // A -> B, never synced
+    const d = await w.device("alice", new MemoryPlatformProvider("alice-3@platform"), new MemoryStore(), new MemorySecretStore());
+    const p = await d.client.prepareReplacement();
+    const token = w.host.authorizeReplacement({ accountName: "alice", successionId: p.successionId, expectedCertificateHash: p.expectedCertificateHash, certificate: p.certificate });
+    // The commit lands at the host; the resolution the activation needs is withheld.
+    d.t.knobs.withhold.add("certificates");
+    expect(await thrown(() => d.client.completeReplacement({ successionId: p.successionId, authorization: token }))).toBe("METADATA_REQUIRED");
+    expect([(await d.client.getState()).status, w.host.accounts.get("alice")?.generation]).toEqual(["replacementPrepared", 3n]);
+    expect(await d.secrets.get("pendingReplacement")).toBeDefined();
+    // Normal answers again: the same call finishes, with the chain and its keys recorded.
+    d.t.knobs.withhold.delete("certificates");
+    expect((await d.client.completeReplacement({ successionId: p.successionId, authorization: token })).generation).toBe(3n);
+    expect(await d.store.read((tx) => tx.list("identities").filter(([, i]) => i.accountId === toHex(aliceId) && !!i.accountKey).length)).toBe(3);
+    const r = await w.sync(d);
+    expect([r.errors, r.bootstrap]).toEqual([[], { circles: 1, pending: 0, failed: 0 }]);
+    expect((await d.client.circles.list()).map((c) => [c.owned, c.revision])).toEqual([[true, 3n]]);
+    await w.sync(b);
+    expect((await b.client.circles.list())[0]?.revision).toBe(3n);
+  });
+});
+
 describe("a recovery-only client without a provider has no vault", () => {
   it("registers without one, publishes none, and the host holds none", async () => {
     const recovery = { ...testPolicy, replacement: "recovery" as const };

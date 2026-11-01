@@ -1984,10 +1984,15 @@ class ClientImpl implements Client {
     // has signed with (an owned circle's snapshot from before an earlier replacement) and can
     // follow its own chain later (to learn of its retirement).
     const [me] = await this.transport.directory.resolveAccounts([this.accountName]);
-    const served = me?.successions ?? [];
+    // The evidence must be there before anything is written: without the account's resolution the
+    // history is unknown, not empty, and the proposal stays for the next call. An empty history is
+    // right only when the previous identity is the account root.
+    if (!me) throw new KavachError("METADATA_REQUIRED", stage, "the account's history is not served; the proposal stays");
+    const served = me.successions ?? [];
     const ownSuccession = authenticateSuccession(succession, this.trust, this.now());
+    if (served.length === 0 && me.successionsNext === undefined && !equalBytes(previousPin.identityId, accountId)) throw new KavachError("METADATA_REQUIRED", stage, "the account's earlier successions are not served; the proposal stays");
     // Bounded by the generation this device's own succession left from, on every page alike.
-    const history = served.length > 0 || me?.successionsNext !== undefined ? (await this.followChain({ accountId, accountName: this.accountName, finalIdentityId: previousPin.identityId, untilGeneration: ownSuccession.previousGeneration, firstPage: served, next: me?.successionsNext })).verified : [];
+    const history = served.length > 0 || me.successionsNext !== undefined ? (await this.followChain({ accountId, accountName: this.accountName, finalIdentityId: previousPin.identityId, untilGeneration: ownSuccession.previousGeneration, firstPage: served, next: me.successionsNext })).verified : [];
     const accountSeed = roots.subarray(0, 32);
     const deviceSeed = roots.subarray(32, 64);
     const recoveryKey = roots.subarray(64, 96);
