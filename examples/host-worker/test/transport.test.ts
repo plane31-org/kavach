@@ -1,6 +1,6 @@
 /** The reference HTTP transport types its failures: no answer or a server error is NETWORK, a client error is not. */
 import { describe, expect, it } from "vitest";
-import { isKavachError } from "@kavach/core";
+import { isKavachError } from "@blind-relay/core";
 import { httpTransport } from "../client/httpTransport.js";
 
 function transportWith(fetch: (input: string, init?: RequestInit) => Promise<Response>) {

@@ -1,8 +1,8 @@
 /** Devices as clients of the real Worker, through SELF.fetch. */
 import { SELF, env } from "cloudflare:test";
-import { open, toHex, type Client, type ClientEvent, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@kavach/core";
-import { MemorySecretStore, MemoryStore } from "@kavach/core/adapters";
-import { TestClock, testPolicy } from "@kavach/core/testing";
+import { open, toHex, type Client, type ClientEvent, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@blind-relay/core";
+import { MemorySecretStore, MemoryStore } from "@blind-relay/core/adapters";
+import { TestClock, testPolicy } from "@blind-relay/core/testing";
 import { httpTransport } from "../client/httpTransport.js";
 
 export class Platform implements RecoveryProvider {

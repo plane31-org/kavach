@@ -1,6 +1,6 @@
 /**
- * @kavach/core/adapters: the contracts an adapter or host author implements, and what their
- * tests need to drive them. Applications import `@kavach/core` instead.
+ * @blind-relay/core/adapters: the contracts an adapter or host author implements, and what their
+ * tests need to drive them. Applications import `@blind-relay/core` instead.
  *
  * A `Store` and `SecretStore` adapter implements the row tables and the transaction interface;
  * a `Transport` adapter implements the directory and relay calls; a `RecoveryProvider` keeps

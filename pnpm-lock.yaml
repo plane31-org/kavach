@@ -26,7 +26,7 @@ importers:
 
   examples/host-worker:
     dependencies:
-      '@kavach/core':
+      '@blind-relay/core':
         specifier: workspace:*
         version: link:../../packages/core
     devDependencies:
@@ -64,7 +64,7 @@ importers:
 
   packages/expo:
     dependencies:
-      '@kavach/core':
+      '@blind-relay/core':
         specifier: workspace:*
         version: link:../core
 

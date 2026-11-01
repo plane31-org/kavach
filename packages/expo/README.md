@@ -1,6 +1,6 @@
-# @kavach/expo
+# @blind-relay/expo
 
-The adapters an Expo app supplies to `@kavach/core`, as the first implementation profile (`spec/Kavach-v1-Moyo-profile.md`, section 3) describes them; `spec/Profile-template.md` lists what any product's profile decides. Each adapter is written against a small structural interface so it can be tested in Node with a fake, and driven on a device by the real module.
+The adapters an Expo app supplies to `@blind-relay/core`, as the first implementation profile (`spec/Kavach-v1-Moyo-profile.md`, section 3) describes them; `spec/Profile-template.md` lists what any product's profile decides. Each adapter is written against a small structural interface so it can be tested in Node with a fake, and driven on a device by the real module.
 
 | Adapter | Over | Status |
 | --- | --- | --- |
@@ -18,11 +18,11 @@ One call per account opens everything: the secret store namespaced by account, t
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
 import * as SQLite from "expo-sqlite";
-import { openKavach, BlockStoreRecoveryProvider, AppleKeychainRecoveryProvider } from "@kavach/expo";
+import { openKavach, BlockStoreRecoveryProvider, AppleKeychainRecoveryProvider } from "@blind-relay/expo";
 
 const { client, databaseFileName } = await openKavach({
   accountName,
-  transport,          // the app's authenticated fetch and sockets, a `Transport` from "@kavach/core/adapters"
+  transport,          // the app's authenticated fetch and sockets, a `Transport` from "@blind-relay/core/adapters"
   recoveryProvider,   // BlockStoreRecoveryProvider on Android, AppleKeychainRecoveryProvider on iOS
   retentionPolicy,    // the global windows plus `kinds`: one { kind, retentionMs, queue, history, newest } per record kind the app uses
   resetTrust,
@@ -49,9 +49,9 @@ When the database file survives but its key is gone (the secret store was cleare
 `openKavach` is these steps; an app with a different arrangement (a shared database, its own key management) uses the adapters directly:
 
 ```ts
-import { open } from "@kavach/core";
-import { randomBytes } from "@kavach/core/adapters";
-import { ExpoSecretStore, SqliteStore, expoSqliteDriver, installWebCrypto } from "@kavach/expo";
+import { open } from "@blind-relay/core";
+import { randomBytes } from "@blind-relay/core/adapters";
+import { ExpoSecretStore, SqliteStore, expoSqliteDriver, installWebCrypto } from "@blind-relay/expo";
 
 installWebCrypto(Crypto.getRandomValues);
 const secretStore = new ExpoSecretStore(SecureStore, { thisDeviceOnly: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY, namespace: `kavach.${accountName}`, keychainService: "app.getmoyo" });
@@ -68,6 +68,6 @@ Foreground and background tasks write concurrently without a shared counter and 
 
 ## Cipher suite backend
 
-`@kavach/core` runs on the portable backend (the noble libraries, pure JavaScript) unless told otherwise, which is what Hermes needs: it has no WebAssembly. On Node, `import { loadSodiumBackend } from "@kavach/core/sodium"` and `setCryptoBackend(await loadSodiumBackend())` before `open()` selects libsodium. Both backends pass the same vectors.
+`@blind-relay/core` runs on the portable backend (the noble libraries, pure JavaScript) unless told otherwise, which is what Hermes needs: it has no WebAssembly. On Node, `import { loadSodiumBackend } from "@blind-relay/core/sodium"` and `setCryptoBackend(await loadSodiumBackend())` before `open()` selects libsodium. Both backends pass the same vectors.
 
 `test/faults.sqlite.test.ts` runs the core's crash and lost-response sweeps over SQLite files on Node, as close to the phone's store as a test without the development build can get; the on-device run on SQLCipher is Moyo's gate.

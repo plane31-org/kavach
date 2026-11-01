@@ -4,8 +4,8 @@
  * account name, so two accounts on one device never share a database or a secret. The individual
  * adapters stay exported for apps that need a different arrangement.
  */
-import { KavachError, open, type Client, type ClientEvent, type RecoveryProvider, type ResetTrustConfig, type RetentionPolicy } from "@kavach/core";
-import { randomBytes, type SecretStore, type Transport } from "@kavach/core/adapters";
+import { KavachError, open, type Client, type ClientEvent, type RecoveryProvider, type ResetTrustConfig, type RetentionPolicy } from "@blind-relay/core";
+import { randomBytes, type SecretStore, type Transport } from "@blind-relay/core/adapters";
 import { ExpoSecretStore, type SecureStoreLike } from "./secretStore.js";
 import { SqliteStore, expoSqliteDriver, type ExpoSqliteDatabaseLike, type SqlDriver } from "./sqliteStore.js";
 

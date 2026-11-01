@@ -1,8 +1,29 @@
 {
-  "name": "@kavach/expo",
-  "version": "0.0.0",
+  "name": "@blind-relay/expo",
+  "version": "0.1.0",
   "description": "Kavach v1 adapters for Expo: SecureStore secrets, SQLite with SQLCipher store, Keychain and Block Store recovery providers, clock and background glue.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tritt234-cell/kavach.git",
+    "directory": "packages/expo"
+  },
+  "homepage": "https://github.com/tritt234-cell/kavach#readme",
+  "bugs": {
+    "url": "https://github.com/tritt234-cell/kavach/issues"
+  },
+  "keywords": [
+    "expo",
+    "react-native",
+    "end-to-end-encryption",
+    "e2ee",
+    "sqlcipher",
+    "secure-store"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,7 +36,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@kavach/core": "workspace:*"
+    "@blind-relay/core": "workspace:*"
   },
   "peerDependencies": {
     "expo-secure-store": "*",

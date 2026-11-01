@@ -1,6 +1,6 @@
 /** The core's client scenarios, unchanged in substance, against the real Worker. */
 import { describe, expect, it } from "vitest";
-import { toHex } from "@kavach/core";
+import { toHex } from "@blind-relay/core";
 import { circleOfTwo, clock, device } from "./world.js";
 import { enqueueLocation, latest, locationFromDegrees } from "./location.js";
 

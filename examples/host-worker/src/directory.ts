@@ -14,7 +14,7 @@ import {
   verifyDocument,
   type AccountDevice,
   type CircleSnapshot
-} from "@kavach/core/adapters";
+} from "@blind-relay/core/adapters";
 import type { Env } from "./env.js";
 import { HttpError, hex, unhex, type Caller } from "./wire.js";
 

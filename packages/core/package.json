@@ -1,8 +1,29 @@
 {
-  "name": "@kavach/core",
-  "version": "0.0.0",
+  "name": "@blind-relay/core",
+  "version": "0.1.0",
   "description": "Kavach v1 protocol: documents, cryptography, state machine. Pure TypeScript, no platform imports.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tritt234-cell/kavach.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://github.com/tritt234-cell/kavach#readme",
+  "bugs": {
+    "url": "https://github.com/tritt234-cell/kavach/issues"
+  },
+  "keywords": [
+    "end-to-end-encryption",
+    "e2ee",
+    "relay",
+    "protocol",
+    "circles",
+    "sealed-records"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

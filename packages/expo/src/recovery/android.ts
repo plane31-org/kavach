@@ -8,7 +8,7 @@
  * returned; the provider never retries without cloud backup, which could delete a prior cloud
  * copy. A successful store reports `backupState = pending`: a local write is never a backup.
  */
-import { Reader, Writer, concat, equalBytes, toHex, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@kavach/core/adapters";
+import { Reader, Writer, concat, equalBytes, toHex, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@blind-relay/core/adapters";
 
 /** The subset of the Block Store client the provider uses; a native module supplies it. */
 export interface BlockStoreLike {

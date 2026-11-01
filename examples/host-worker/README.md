@@ -7,7 +7,7 @@ A Cloudflare Worker that implements the directory and relay contract of the Kava
 | Directory | D1 (`migrations/0001_directory.sql`) | accounts with their current certificate, immutable certificates by hash, vaults and snapshots by compare-and-swap, join and leave requests, reset receipts, the reader subscription index, notifications |
 | Relay | one `StreamDO` per author stream (SQLite-backed Durable Object) | retained records by delivery sequence with acceptance time, one subscription per reader device with its cursor, the expiry watermark, the per-stream high-water pair and last-append outcome, epoch material while current or referenced |
 
-Deletion runs in the same transaction as the cursor advance that completes a record. The expiry prefix advances on the object's alarm. Reads are filtered by the caller's certificate. The behavioural reference is the in-memory host in `@kavach/core/testing`; the tests here run the core's scenarios against this Worker through `client/httpTransport.ts`.
+Deletion runs in the same transaction as the cursor advance that completes a record. The expiry prefix advances on the object's alarm. Reads are filtered by the caller's certificate. The behavioural reference is the in-memory host in `@blind-relay/core/testing`; the tests here run the core's scenarios against this Worker through `client/httpTransport.ts`.
 
 ## What a production host replaces
 

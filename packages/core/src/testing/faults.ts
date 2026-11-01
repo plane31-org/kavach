@@ -3,7 +3,7 @@
  * transaction boundary, a transport wrapper that loses responses after the host committed,
  * duplicates and reorders deliveries, withholds, replays, forks and tampers with documents,
  * and a sweep that runs one scenario once per boundary and checks the durable-state outcomes
- * of protocol section 11 after a restart. Exported under `@kavach/core/testing` only.
+ * of protocol section 11 after a restart. Exported under `@blind-relay/core/testing` only.
  */
 import { equalBytes, toHex } from "../bytes.js";
 import { KavachError } from "../errors.js";

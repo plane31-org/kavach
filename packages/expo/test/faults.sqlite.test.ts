@@ -10,8 +10,8 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
-import { ready } from "@kavach/core/adapters";
-import { crashSweep, lostResponseSweep, type DeviceName, type SweepStores } from "@kavach/core/testing";
+import { ready } from "@blind-relay/core/adapters";
+import { crashSweep, lostResponseSweep, type DeviceName, type SweepStores } from "@blind-relay/core/testing";
 import { SqliteStore, nodeSqliteDriver } from "../src/sqliteStore.js";
 import { openNodeDatabase } from "./sqlite.js";
 

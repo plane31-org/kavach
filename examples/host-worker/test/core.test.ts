@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { ready, toHex } from "@kavach/core/adapters";
-import { accountKeypair, identityId } from "@kavach/core/testing";
+import { ready, toHex } from "@blind-relay/core/adapters";
+import { accountKeypair, identityId } from "@blind-relay/core/testing";
 
 describe("core inside workerd", () => {
   it("loads the portable cipher suite and derives the fixture identity", async () => {

@@ -7,7 +7,7 @@
  * identity id. Logout erases nothing in the Keychain: deleting a synchronizable item deletes it
  * on every device, which is the opposite of "erase local access".
  */
-import { fromHex, toHex, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@kavach/core";
+import { fromHex, toHex, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@blind-relay/core";
 
 /** The native bridge the provider needs. Errors carry a `code` from the Security framework. */
 export interface SyncedKeychainLike {

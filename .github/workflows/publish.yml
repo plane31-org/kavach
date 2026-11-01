@@ -1,0 +1,46 @@
+name: publish
+# Publishes @blind-relay/core and @blind-relay/expo to npm with provenance when a version tag
+# is pushed (v0.1.0 for package version 0.1.0). Needs the NPM_TOKEN secret: an automation token
+# for the @blind-relay organisation. Nothing publishes from a laptop.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      - name: the tag names the package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          core=$(node -p "require('./packages/core/package.json').version")
+          expo=$(node -p "require('./packages/expo/package.json').version")
+          test "v$core" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} does not match core $core"; exit 1; }
+          test "$core" = "$expo" || { echo "core $core and expo $expo differ"; exit 1; }
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: vectors
+        run: scripts/vectors.sh
+      - run: pnpm --filter "./packages/*" build
+      - name: publish
+        run: pnpm --filter "./packages/*" publish --access public --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"

@@ -2,7 +2,7 @@
  * The core's Transport over the reference host's HTTP surface. Bytes travel as hex; the caller
  * is a bearer of `accountName:certificateHash` (the reference host's stand-in for real login).
  */
-import { KavachError, fromHex, toHex, type AppendOutcome, type Directory, type EpochBundle, type JoinRequest, type MutationOutcome, type ReadRecordsResult, type Relay, type ResolvedAccount, type Transport } from "@kavach/core/adapters";
+import { KavachError, fromHex, toHex, type AppendOutcome, type Directory, type EpochBundle, type JoinRequest, type MutationOutcome, type ReadRecordsResult, type Relay, type ResolvedAccount, type Transport } from "@blind-relay/core/adapters";
 
 export interface HttpTransportOptions {
   readonly baseUrl: string;
