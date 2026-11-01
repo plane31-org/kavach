@@ -1,7 +1,7 @@
 name: publish
-# Publishes @blind-relay/core and @blind-relay/expo to npm with provenance when a version tag
+# Publishes @plane31/blind-relay and @plane31/blind-relay-expo to npm with provenance when a version tag
 # is pushed (v0.1.0 for package version 0.1.0). Needs the NPM_TOKEN secret: an automation token
-# for the @blind-relay organisation. Nothing publishes from a laptop.
+# for the plane31 organisation. Nothing publishes from a laptop.
 on:
   push:
     tags: ["v*"]

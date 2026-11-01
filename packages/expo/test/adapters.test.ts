@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { MemorySecretStore, randomBytes, ready, toHex } from "@blind-relay/core/adapters";
+import { MemorySecretStore, randomBytes, ready, toHex } from "@plane31/blind-relay/adapters";
 import { ExpoSecretStore, type SecureStoreLike, type SecureStoreOptions } from "../src/secretStore.js";
 import { BlockStoreRecoveryProvider, blockStoreKey, decodeBlockStoreValue, encodeBlockStoreValue, type BlockStoreLike } from "../src/recovery/android.js";
 import { AppleKeychainRecoveryProvider, keychainAccount, type SyncedKeychainLike } from "../src/recovery/apple.js";

@@ -1,6 +1,6 @@
 /** The relay scenarios of the appendix (21 to 23, 27) and the profile's gate table, against the real Worker. */
 import { describe, expect, it } from "vitest";
-import { toHex } from "@blind-relay/core";
+import { toHex } from "@plane31/blind-relay";
 import { circleOfTwo, clock, device, hostJson, type Device } from "./world.js";
 import { enqueueCheckIn, enqueueLocation, enqueueStatus, latestStatus, locationFromDegrees } from "./location.js";
 

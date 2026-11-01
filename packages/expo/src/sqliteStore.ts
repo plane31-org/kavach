@@ -11,7 +11,7 @@
  * The adapter speaks to the database through `SqlDriver`, a three-method surface that
  * `expo-sqlite`'s synchronous API and Node's `node:sqlite` both satisfy.
  */
-import { KavachError, invokeSync, type KeyRange, type Store, type TableName, type Tables, type Tx } from "@blind-relay/core/adapters";
+import { KavachError, invokeSync, type KeyRange, type Store, type TableName, type Tables, type Tx } from "@plane31/blind-relay/adapters";
 
 export type SqlValue = string | number | null;
 

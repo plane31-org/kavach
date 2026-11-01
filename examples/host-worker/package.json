@@ -1,5 +1,5 @@
 {
-  "name": "@blind-relay/host-worker-example",
+  "name": "@plane31/blind-relay-host-worker-example",
   "private": true,
   "version": "0.0.0",
   "description": "Reference host for Kavach v1 on Cloudflare Workers: directory, per-author relay, notifications. Not published.",
@@ -11,7 +11,7 @@
     "dev": "wrangler dev"
   },
   "dependencies": {
-    "@blind-relay/core": "workspace:*"
+    "@plane31/blind-relay": "workspace:*"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.5.0",

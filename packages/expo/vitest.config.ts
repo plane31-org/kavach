@@ -7,6 +7,6 @@ const coreAdapters = fileURLToPath(new URL("../core/src/adapters/index.ts", impo
 const sodiumCjs = fileURLToPath(new URL("../core/node_modules/libsodium-wrappers-sumo/dist/modules-sumo/libsodium-wrappers.js", import.meta.url));
 
 export default defineConfig({
-  resolve: { alias: { "@blind-relay/core/testing": coreTesting, "@blind-relay/core/adapters": coreAdapters, "@blind-relay/core": core, "libsodium-wrappers-sumo": sodiumCjs } },
+  resolve: { alias: { "@plane31/blind-relay/testing": coreTesting, "@plane31/blind-relay/adapters": coreAdapters, "@plane31/blind-relay": core, "libsodium-wrappers-sumo": sodiumCjs } },
   test: { include: ["test/**/*.test.ts"], environment: "node" }
 });

@@ -4,7 +4,7 @@
  * because SecureStore stores text. No biometric prompt: background work is unattended, and a
  * prompt per read would stop it.
  */
-import { fromHex, toHex, type SecretName, type SecretStore } from "@blind-relay/core/adapters";
+import { fromHex, toHex, type SecretName, type SecretStore } from "@plane31/blind-relay/adapters";
 
 /** The subset of `expo-secure-store` this adapter uses, so it can be driven by a fake in tests. */
 export interface SecureStoreLike {

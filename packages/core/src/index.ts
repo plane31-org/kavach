@@ -1,10 +1,10 @@
 /**
- * @blind-relay/core: Kavach v1 protocol (revision 6, wire version 5).
+ * @plane31/blind-relay: Kavach v1 protocol (revision 6, wire version 5).
  *
  * This entry is what an application imports: the client, its types, the errors and the few
- * helpers an app needs around it. Adapter and host authors import `@blind-relay/core/adapters`;
- * test harnesses import `@blind-relay/core/testing`; the optional libsodium backend is
- * `@blind-relay/core/sodium`. Everything else is internal and reachable only by relative import.
+ * helpers an app needs around it. Adapter and host authors import `@plane31/blind-relay/adapters`;
+ * test harnesses import `@plane31/blind-relay/testing`; the optional libsodium backend is
+ * `@plane31/blind-relay/sodium`. Everything else is internal and reachable only by relative import.
  */
 export const PROTOCOL_NAME = "Kavach";
 export const PROTOCOL_REVISION = 8;

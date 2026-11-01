@@ -1,5 +1,5 @@
 /** The HTTP surface of the reference host: protocol section 13's directory and relay, as JSON. */
-import { DocumentType, expectType, parseDocument, type EncryptedRecord } from "@blind-relay/core/adapters";
+import { DocumentType, expectType, parseDocument, type EncryptedRecord } from "@plane31/blind-relay/adapters";
 import { Directory } from "./directory.js";
 import type { Env } from "./env.js";
 import { HttpError, big, body, error, hex, hostNow, json, requireCaller, unhex } from "./wire.js";

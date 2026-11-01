@@ -3,7 +3,7 @@
  * kept as a test helper (a copy of packages/core/test/location.ts): the fixture's record payload is one, and the scenarios need distinct
  * payloads with an event time. Nothing here ships; a product keeps its own codec in its profile.
  */
-import { KavachError, type Client, type EnqueueOptions, type EnqueueResult, type Newest } from "@blind-relay/core";
+import { KavachError, type Client, type EnqueueOptions, type EnqueueResult, type Newest } from "@plane31/blind-relay";
 
 export type LocationStatus = 0 | 1 | 2; // normal, stale, unavailable
 

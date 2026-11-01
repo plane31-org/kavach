@@ -1,5 +1,5 @@
 /** JSON over HTTP helpers for the reference host. Bytes travel as hex strings. */
-import { fromHex, toHex } from "@blind-relay/core/adapters";
+import { fromHex, toHex } from "@plane31/blind-relay/adapters";
 import type { Env } from "./env.js";
 
 export class HttpError extends Error {

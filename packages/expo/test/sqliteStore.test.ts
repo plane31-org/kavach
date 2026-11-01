@@ -2,8 +2,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
-import { KavachError, MemorySecretStore, MemoryStore, openStore, type KeyRange, randomBytes, ready, t1Activate, t1Header, t1Secrets, t3ApplyChange } from "@blind-relay/core/adapters";
-import { certify, deviceFromSeed, newDevice, openAccount } from "@blind-relay/core/testing";
+import { KavachError, MemorySecretStore, MemoryStore, openStore, type KeyRange, randomBytes, ready, t1Activate, t1Header, t1Secrets, t3ApplyChange } from "@plane31/blind-relay/adapters";
+import { certify, deviceFromSeed, newDevice, openAccount } from "@plane31/blind-relay/testing";
 import { SqliteStore, nodeSqliteDriver, type SqlDriver } from "../src/sqliteStore.js";
 import { openNodeDatabase } from "./sqlite.js";
 

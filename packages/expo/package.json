@@ -1,5 +1,5 @@
 {
-  "name": "@blind-relay/expo",
+  "name": "@plane31/blind-relay-expo",
   "version": "0.1.0",
   "description": "Kavach v1 adapters for Expo: SecureStore secrets, SQLite with SQLCipher store, Keychain and Block Store recovery providers, clock and background glue.",
   "license": "Apache-2.0",
@@ -36,7 +36,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@blind-relay/core": "workspace:*"
+    "@plane31/blind-relay": "workspace:*"
   },
   "peerDependencies": {
     "expo-secure-store": "*",

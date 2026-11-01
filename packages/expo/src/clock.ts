@@ -3,7 +3,7 @@
  * accurate-clock assumption, checked against a durable high-water mark and monotonic elapsed
  * time. A reading below the high-water mark is not trusted.
  */
-import { u64, type SecretStore } from "@blind-relay/core/adapters";
+import { u64, type SecretStore } from "@plane31/blind-relay/adapters";
 
 export interface HighWaterStorage {
   get(): Promise<bigint | undefined>;
