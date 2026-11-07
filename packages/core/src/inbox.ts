@@ -193,6 +193,8 @@ export interface StreamSyncSummary {
   hasMore: boolean;
   /** Record bytes read from the relay. */
   bytes: number;
+  /** Set when a read failed after the pages counted above: the caller reports it, with what landed. */
+  failure?: unknown;
 }
 
 function subscription(tx: Pick<Tx, "get">, streamId: Uint8Array, authorIdentityId: Uint8Array): SubscriptionRow {
@@ -258,23 +260,11 @@ export async function syncStream(deps: InboxDeps, streamId: Uint8Array, authorId
       from = page.nextSeq;
     }
   } catch (e) {
-    // The pages that landed before the failure are real work: the error carries the summary so
-    // far, and the caller merges it before reporting the failure.
-    throw withPartialSummary(e, summary);
+    // The pages that landed before the failure are real work: the summary keeps them and carries
+    // the failure beside them, untouched, for the caller to report.
+    summary.failure = e;
   }
   return summary;
-}
-
-const PARTIAL = Symbol("kavach.partialStreamSummary");
-
-function withPartialSummary(e: unknown, summary: StreamSyncSummary): unknown {
-  if (typeof e === "object" && e !== null) Object.defineProperty(e, PARTIAL, { value: summary, enumerable: false, configurable: true });
-  return e;
-}
-
-/** The summary a failed `syncStream` had accumulated before it failed, when it had read anything. */
-export function partialStreamSummary(e: unknown): StreamSyncSummary | undefined {
-  return typeof e === "object" && e !== null && PARTIAL in e ? ((e as Record<symbol, unknown>)[PARTIAL] as StreamSyncSummary) : undefined;
 }
 
 /** T7 for every record of one page, then the scan position, the eligible prefix and one acknowledgement. */

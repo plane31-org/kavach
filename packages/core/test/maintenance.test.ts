@@ -76,6 +76,21 @@ describe("review of 0.4.0", () => {
     expect((await b.client.history({ authorIdentityId: aliceId })).length).toBe(2);
   });
 
+  it("3: a throttled round ends the drain with the host's wait, instead of retrying every round", async () => {
+    const w = world();
+    const { a, b } = await pair(w);
+    for (let i = 0; i < 150; i++) await enqueueLocation(b.client, w.loc(i % 90));
+    await w.sync(b); // a backlog for Alice to read in several rounds
+    a.t.knobs.failWith.set("appendRecord", new KavachError("RATE_LIMITED", "transport", "429", { retryAfterMs: 60_000 }));
+    await enqueueLocation(a.client, w.loc(4));
+    const appends = () => a.t.calls.filter((c) => c === "appendRecord").length;
+    const before = appends();
+    const r = await a.client.syncUntilDrained({ catchUp: { maxRecords: 100 } });
+    expect([r.stoppedBecause, r.rounds, r.remaining.retryAfterMs, r.remaining.inboxHasMore]).toEqual(["rateLimited", 1, 60_000, "unknown"]);
+    expect(appends() - before).toBeLessThanOrEqual(1);
+    expect((await a.client.getState()).outbox).toBe(1);
+  });
+
   it("2: a download that fails on its second page still reports the first page's records and bytes", async () => {
     const w = world();
     const { a, b } = await pair(w);
@@ -83,8 +98,9 @@ describe("review of 0.4.0", () => {
     await w.sync(a);
     b.t.knobs.failReadsAfter = 1;
     const r = await w.sync(b);
-    expect(r.errors.map((e) => [e.operation, e.code])).toEqual([["inbox", "NETWORK"]]);
-    expect([r.inbox.stored, r.timings.bytesReceived > 10_000]).toEqual([100, true]);
+    // The transport's error is frozen: it is reported as it is, retryable, with the progress beside it.
+    expect(r.errors.map((e) => [e.operation, e.code, e.retryable])).toEqual([["inbox", "NETWORK", true]]);
+    expect([r.inbox.stored, r.inbox.streams, r.timings.bytesReceived > 10_000]).toEqual([100, 0, true]);
     const rest = await w.sync(b);
     expect([rest.errors, rest.inbox.stored]).toEqual([[], 50]);
   });

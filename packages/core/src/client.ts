@@ -12,7 +12,7 @@ import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { ensureHistoryIndex } from "./historyIndex.js";
-import { ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, partialStreamSummary, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
+import { ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
 import { drain, enqueue, outboxCount, outboxCounts, purgeOutbox, type EnqueueOptions, type OutboxCounts } from "./outbox.js";
 export type { EnqueueOptions } from "./outbox.js";
 
@@ -255,6 +255,8 @@ export type DrainStop =
   | "authentication"
   /** Nothing more is reported, but a round could not read its inbox fully (discovery or a stream failed), so emptiness is not established. */
   | "incomplete"
+  /** The host asked for a pause; `remaining.retryAfterMs` says how long, and the product schedules the next attempt. */
+  | "rateLimited"
   | "closed";
 
 /** The merged report of every round, with why the loop stopped and what remains. */
@@ -270,6 +272,8 @@ export interface DrainReport extends SyncReport {
     readonly chainsIncomplete: number;
     /** Authors whose current epoch has not reached this device: nothing to do but wait for them. */
     readonly waitingFor: number;
+    /** On `rateLimited`: the longest wait the host asked for in the last round, when it said one. */
+    readonly retryAfterMs?: number;
   };
 }
 
@@ -1073,6 +1077,11 @@ class ClientImpl implements Client {
         stop = "closed";
         break;
       }
+      if (r.errors.some((e) => e.code === "RATE_LIMITED")) {
+        // The host asked for a pause: no further round now; the wait goes back to the product.
+        stop = "rateLimited";
+        break;
+      }
       const bootstrapIncomplete = (await this.inspect()).bootstrap?.complete === false;
       const currentChains = await chains();
       const more = r.inbox.hasMore || bootstrapIncomplete || currentChains.size > 0;
@@ -1107,8 +1116,10 @@ class ClientImpl implements Client {
     const bootstrapIncomplete = this.closed ? false : (await this.inspect()).bootstrap?.complete === false;
     const chainsIncomplete = this.closed ? previousChains.size : (await chains()).size;
     const waitingFor = this.closed ? 0 : (await this.getState()).waitingFor.length;
-    const inboxHasMore = !last || inboxUncertain(last) || stop === "closed" ? "unknown" : merged.inbox.hasMore;
-    return { ...merged, rounds, stoppedBecause: stop, remaining: { inboxHasMore, bootstrapIncomplete, chainsIncomplete, waitingFor } };
+    const inboxHasMore = !last || inboxUncertain(last) || stop === "closed" || stop === "rateLimited" ? "unknown" : merged.inbox.hasMore;
+    const waits = (last?.errors ?? []).flatMap((e) => (e.code === "RATE_LIMITED" && e.retryAfterMs !== undefined ? [e.retryAfterMs] : []));
+    const retryAfterMs = waits.length ? Math.max(...waits) : undefined;
+    return { ...merged, rounds, stoppedBecause: stop, remaining: { inboxHasMore, bootstrapIncomplete, chainsIncomplete, waitingFor, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) } };
   }
 
   private async runSync(options: SyncOptions): Promise<SyncReport> {
@@ -1243,22 +1254,19 @@ class ClientImpl implements Client {
         const known = await this.store.read((tx) => tx.list("certificates").some(([, c]) => c.streamId === toHex(s.streamId)));
         if (!known) continue;
         const r = await syncStream(this.inboxDeps(), s.streamId, s.authorIdentityId, budget);
-        report.inbox.streams++;
+        // What landed counts, whether or not the stream then failed; a failed stream is not synced.
         report.inbox.stored += r.stored;
         report.inbox.keyPending += r.keyPending;
         report.inbox.invalid += r.invalid;
+        report.timings.bytesReceived += r.bytes;
+        if (r.failure !== undefined) {
+          report.errors.push({ ...syncError("inbox", r.failure), streamId: s.streamId, authorIdentityId: s.authorIdentityId });
+          continue;
+        }
+        report.inbox.streams++;
         if (r.acked !== undefined) report.inbox.acked++;
         if (r.hasMore) report.inbox.hasMore = true;
-        report.timings.bytesReceived += r.bytes;
       } catch (e) {
-        const partial = partialStreamSummary(e);
-        if (partial) {
-          // What landed before the failure is real work, and the report says so.
-          report.inbox.stored += partial.stored;
-          report.inbox.keyPending += partial.keyPending;
-          report.inbox.invalid += partial.invalid;
-          report.timings.bytesReceived += partial.bytes;
-        }
         report.errors.push({ ...syncError("inbox", e), streamId: s.streamId, authorIdentityId: s.authorIdentityId });
       }
     }

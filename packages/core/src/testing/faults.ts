@@ -321,7 +321,7 @@ export class MaliciousTransport implements Transport {
         if (k.failReadsAfter !== undefined) {
           if (k.failReadsAfter <= 0) {
             k.failReadsAfter = undefined;
-            throw new KavachError("NETWORK", "transport", "network unreachable");
+            throw Object.freeze(new KavachError("NETWORK", "transport", "network unreachable")); // frozen, as a transport may hand it over
           }
           k.failReadsAfter--;
         }
