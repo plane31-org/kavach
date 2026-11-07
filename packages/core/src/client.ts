@@ -235,6 +235,7 @@ export type ReplaceDeviceResult =
 
 export interface DrainOptions {
   readonly catchUp?: SyncOptions["catchUp"];
+  readonly skipMaintenance?: boolean;
   /** Rounds at most. Default 10. */
   readonly maxRounds?: number;
   /** A soft bound in milliseconds across every round: no round starts past it and each round's reading budget is the time left, but a transport call already in flight ends on its own timeout. Default 30,000. */
@@ -280,6 +281,12 @@ export interface SyncOptions {
    * at least one page.
    */
   readonly catchUp?: { readonly maxRecords?: number; readonly maxMs?: number };
+  /**
+   * Leave the housekeeping to a later sync: the retention purge, the periodic re-check of the
+   * reset-key list (a stale list is still fetched, since verification needs it) and the
+   * recovery-key re-save. For a short background window; the report says `maintenance: "skipped"`.
+   */
+  readonly skipMaintenance?: boolean;
 }
 
 export const DEFAULT_CATCH_UP = { maxRecords: 500, maxMs: 5_000 } as const;
@@ -291,10 +298,38 @@ export interface SyncReport {
   /** `hasMore`: a stream still has records on the relay that this sync's budget did not reach; sync again soon. */
   inbox: { streams: number; stored: number; keyPending: number; invalid: number; acked: number; hasMore: boolean };
   purged: number;
+  /** Whether this sync did its housekeeping (purge, list re-check, key re-save) or left it to a later one. */
+  maintenance: "done" | "skipped";
   /** Present while account recovery discovers circles through the host: pinned, pending and failed on this sync. */
   bootstrap?: { circles: number; pending: number; failed: number };
+  /** Wall-clock milliseconds per phase and record bytes moved, for diagnostics (section 14: counts and durations only). */
+  timings: SyncTimings;
   errors: SyncError[];
 }
+
+export interface SyncTimings {
+  resume: number;
+  bootstrap: number;
+  metadata: number;
+  preferences: number;
+  epoch: number;
+  outbox: number;
+  inbox: number;
+  maintenance: number;
+  total: number;
+  /** Record bytes handed to the relay. */
+  bytesSent: number;
+  /** Record bytes read from the relay. */
+  bytesReceived: number;
+}
+
+const emptyTimings = (): SyncTimings => ({ resume: 0, bootstrap: 0, metadata: 0, preferences: 0, epoch: 0, outbox: 0, inbox: 0, maintenance: 0, total: 0, bytesSent: 0, bytesReceived: 0 });
+
+/** A monotonic wall clock for durations; the protocol clock (`now`) is not used, since a test drives it by hand. */
+const wall = (): number => {
+  const g = globalThis as { performance?: { now?: () => number } };
+  return typeof g.performance?.now === "function" ? g.performance.now() : Date.now();
+};
 
 /** What `prepareReplacement()` returns: everything the product hands to the host for authorization. All public. */
 export interface ReplacementProposal {
@@ -985,6 +1020,8 @@ class ClientImpl implements Client {
       outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 },
       inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false },
       purged: 0,
+      maintenance: options.skipMaintenance ? "skipped" : "done",
+      timings: emptyTimings(),
       errors: []
     };
     let rounds = 0;
@@ -1010,7 +1047,7 @@ class ClientImpl implements Client {
         break;
       }
       const roundMs = Math.max(0, Math.min(remainingMs, options.catchUp?.maxMs ?? DEFAULT_CATCH_UP.maxMs));
-      const r = await this.sync({ catchUp: { maxMs: roundMs, ...(options.catchUp?.maxRecords !== undefined ? { maxRecords: options.catchUp.maxRecords } : {}) } });
+      const r = await this.sync({ catchUp: { maxMs: roundMs, ...(options.catchUp?.maxRecords !== undefined ? { maxRecords: options.catchUp.maxRecords } : {}) }, ...(options.skipMaintenance ? { skipMaintenance: true } : {}) });
       rounds++;
       last = r;
       // The round's work counts whether or not it was the last: what it accepted, stored and failed
@@ -1023,6 +1060,7 @@ class ClientImpl implements Client {
       merged.inbox.invalid += r.inbox.invalid;
       merged.inbox.acked += r.inbox.acked;
       merged.purged += r.purged;
+      for (const k of Object.keys(merged.timings) as (keyof SyncTimings)[]) merged.timings[k] += r.timings[k];
       merged.epoch = r.epoch;
       merged.errors.push(...r.errors);
       if (r.bootstrap) merged.bootstrap = r.bootstrap;
@@ -1070,14 +1108,36 @@ class ClientImpl implements Client {
   }
 
   private async runSync(options: SyncOptions): Promise<SyncReport> {
+    const started = wall();
     const report: SyncReport = {
       metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 },
       epoch: "unchanged",
       outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 },
       inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false },
       purged: 0,
+      maintenance: options.skipMaintenance ? "skipped" : "done",
+      timings: emptyTimings(),
       errors: []
     };
+    const maintain = !options.skipMaintenance;
+    let mark = started;
+    const phase = (name: keyof Omit<SyncTimings, "total" | "bytesSent" | "bytesReceived">): void => {
+      const now = wall();
+      report.timings[name] += now - mark;
+      mark = now;
+    };
+    const finish = (): SyncReport => {
+      report.timings.total = wall() - started;
+      return report;
+    };
+    try {
+      return await this.runSyncPhases(options, report, maintain, phase);
+    } finally {
+      finish();
+    }
+  }
+
+  private async runSyncPhases(options: SyncOptions, report: SyncReport, maintain: boolean, phase: (name: keyof Omit<SyncTimings, "total" | "bytesSent" | "bytesReceived">) => void): Promise<SyncReport> {
     this.syncBudget = {
       remainingRecords: Math.max(1, Math.floor(options.catchUp?.maxRecords ?? DEFAULT_CATCH_UP.maxRecords)),
       deadline: this.now() + BigInt(Math.max(0, Math.floor(options.catchUp?.maxMs ?? DEFAULT_CATCH_UP.maxMs)))
@@ -1095,6 +1155,7 @@ class ClientImpl implements Client {
         }
       }
     }
+    phase("resume");
     if (!this.account || !this.selfPin) return report;
     const meta = await this.store.read((tx) => tx.get("meta", META));
     if (!meta || meta.state === "RETIRED") return report;
@@ -1119,7 +1180,9 @@ class ClientImpl implements Client {
         return report;
       }
     } else if (meta.state !== "ACTIVE") return report;
-    await this.ensureBackup();
+    phase("resume");
+    if (maintain) await this.ensureBackup();
+    phase("maintenance");
     if (meta.bootstrap && !meta.bootstrap.complete) {
       try {
         report.bootstrap = await this.bootstrap(report, meta.bootstrap);
@@ -1127,16 +1190,19 @@ class ClientImpl implements Client {
         report.errors.push(syncError("bootstrap", e));
       }
     }
+    phase("bootstrap");
     try {
-      await this.syncMetadata(report);
+      await this.syncMetadata(report, maintain);
     } catch (e) {
       report.errors.push(syncError("metadata", e));
     }
+    phase("metadata");
     try {
       await this.pushPreferences(report);
     } catch (e) {
       report.errors.push(syncError("preference", e));
     }
+    phase("preferences");
     const after = await this.store.read((tx) => tx.get("meta", META));
     if (after?.state === "RETIRED" || this.closed) return report;
     try {
@@ -1144,12 +1210,16 @@ class ClientImpl implements Client {
     } catch (e) {
       report.errors.push(syncError("epoch", e));
     }
+    phase("epoch");
     if (this.closed) return report;
     try {
-      report.outbox = await drain(this.outboxDeps());
+      const drained = await drain(this.outboxDeps());
+      report.outbox = { sent: drained.sent, accepted: drained.accepted, cancelled: drained.cancelled, unknown: drained.unknown, retry: drained.retry };
+      report.timings.bytesSent += drained.bytes;
     } catch (e) {
       report.errors.push(syncError("outbox", e));
     }
+    phase("outbox");
     if (this.closed) return report;
     let subs: Awaited<ReturnType<Relay["listSubscriptions"]>> = [];
     try {
@@ -1174,16 +1244,19 @@ class ClientImpl implements Client {
         report.inbox.invalid += r.invalid;
         if (r.acked !== undefined) report.inbox.acked++;
         if (r.hasMore) report.inbox.hasMore = true;
+        report.timings.bytesReceived += r.bytes;
       } catch (e) {
         report.errors.push({ ...syncError("inbox", e), streamId: s.streamId, authorIdentityId: s.authorIdentityId });
       }
     }
-    report.purged = (await purgeHistory(this.store, this.policy, this.now())) + (await purgeOutbox(this.store, this.policy, this.now()));
+    phase("inbox");
+    if (maintain) report.purged = (await purgeHistory(this.store, this.policy, this.now())) + (await purgeOutbox(this.store, this.policy, this.now()));
+    phase("maintenance");
     await this.emitState();
     return report;
   }
 
-  private async syncMetadata(report: SyncReport): Promise<void> {
+  private async syncMetadata(report: SyncReport, maintain = true): Promise<void> {
     const { pin } = this.requireAccount("sync");
     // Own account: has this device been superseded?
     const [me] = await this.transport.directory.resolveAccounts([this.accountName]);
@@ -1205,9 +1278,9 @@ class ClientImpl implements Client {
         return;
       }
     }
-    // Reset-key list when due.
+    // Reset-key list when due: always when stale (verification needs it), periodically unless maintenance is skipped.
     const now = this.now();
-    const due = !this.trust.fresh(now) || now - this.trust.state.timeHighWater >= RESET_LIST_RECHECK_MS;
+    const due = !this.trust.fresh(now) || (maintain && now - this.trust.state.timeHighWater >= RESET_LIST_RECHECK_MS);
     if (due) {
       const wire = await this.transport.directory.getResetKeyList();
       if (wire) {
@@ -1901,7 +1974,7 @@ class ClientImpl implements Client {
   private async approve(circleId: Uint8Array, accountName: string): Promise<{ revision: bigint }> {
     const [resolved] = await this.transport.directory.resolveAccounts([accountName]);
     if (!resolved) throw new KavachError("METADATA_REQUIRED", "approve", "unknown account");
-    const report: SyncReport = { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false }, purged: 0, errors: [] };
+    const report: SyncReport = { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false }, purged: 0, maintenance: "done", timings: emptyTimings(), errors: [] };
     await this.acceptMemberCertificate(resolved, report);
     const requester = resolvedAccountId(resolved);
     const pinned = await this.pinFor(requester);

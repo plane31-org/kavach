@@ -191,6 +191,8 @@ export interface StreamSyncSummary {
   acked: bigint | undefined;
   /** The relay holds more records past the last page read; the budget stopped the catch-up. */
   hasMore: boolean;
+  /** Record bytes read from the relay. */
+  bytes: number;
 }
 
 function subscription(tx: Pick<Tx, "get">, streamId: Uint8Array, authorIdentityId: Uint8Array): SubscriptionRow {
@@ -236,7 +238,7 @@ export interface ReadBudget {
  * records past the last page when the budget stopped the loop.
  */
 export async function syncStream(deps: InboxDeps, streamId: Uint8Array, authorIdentityId: Uint8Array, budget: ReadBudget = { remainingRecords: READ_BATCH, deadline: deps.now() }): Promise<StreamSyncSummary> {
-  const summary: StreamSyncSummary = { read: 0, stored: 0, duplicate: 0, keyPending: 0, invalid: 0, expired: 0, acked: undefined, hasMore: false };
+  const summary: StreamSyncSummary = { read: 0, stored: 0, duplicate: 0, keyPending: 0, invalid: 0, expired: 0, acked: undefined, hasMore: false, bytes: 0 };
   const sub = await deps.store.read((tx) => subscription(tx, streamId, authorIdentityId));
   const unresolved = await deps.store.read((tx) => tx.list("unresolved", toHex(streamId) + ":"));
   let from = unresolved.length > 0 ? unbig(sub.ackPrefix) : unbig(sub.scanPos);
@@ -269,6 +271,7 @@ async function processPage(deps: InboxDeps, streamId: Uint8Array, authorIdentity
   }
   for (const item of page.records) {
     summary.read++;
+    summary.bytes += item.wire.length;
     if (item.deliverySeq <= page.expiredThrough) {
       summary.expired++;
       continue;

@@ -2,6 +2,15 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
+## 0.4.0 (unreleased)
+
+Protocol revision 9, no wire change. What the first product's integration asked for, where it belongs in the SDK.
+
+- **`sync({ skipMaintenance: true })`** and the same option on `syncUntilDrained`: the retention purge, the periodic re-check of the reset-key list and the recovery-key re-save are left to a later sync; a stale list is still fetched, since verification needs it. The report says `maintenance: "done" | "skipped"`. For a short background window.
+- **`SyncReport.timings`**: wall-clock milliseconds per phase (`resume`, `bootstrap`, `metadata`, `preferences`, `epoch`, `outbox`, `inbox`, `maintenance`, `total`) and record bytes moved (`bytesSent`, `bytesReceived`), within the safe-log rules; `syncUntilDrained` sums them across rounds.
+- **`RATE_LIMITED`**, a new retryable error code with `retryAfterMs` on `KavachError`: a 429 from the host is no longer folded into `NETWORK`. The transport contract (specification section 13) and the reference HTTP transport map it, with the wait taken from `Retry-After` in seconds or as a date. *Migration:* a transport of your own should raise it for 429; an exhaustive switch over `ErrorCode` gains a case.
+- **README, "Using it well"**: the heartbeat recipe (an empty record of a silent slot kind), slot kinds for transient signals, short background windows, and a code-to-action table.
+
 ## 0.3.0
 
 Protocol revision 9, no wire change. One release that moves generic plumbing out of products and into the SDK: a real `close()`, erasure of an account from a device, bounded multi-round sync, and account recovery as one call. The transport and host contracts are unchanged; the SDK still ships no HTTP package and no host library, and documents the transport's error contract instead.

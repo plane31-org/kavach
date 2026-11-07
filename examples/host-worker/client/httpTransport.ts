@@ -31,7 +31,14 @@ export function httpTransport(o: HttpTransportOptions): Transport {
       throw new KavachError("NETWORK", "transport", `${method} ${path}: ${e instanceof Error ? e.message : String(e)}`);
     }
     if (res.status === 404) return null as T;
-    if (res.status >= 500 || res.status === 408 || res.status === 429) throw new KavachError("NETWORK", "transport", `${method} ${path}: ${res.status}`);
+    if (res.status === 429) {
+      // The host asked for a pause: retryable, with the wait it named (seconds or an HTTP date).
+      const header = res.headers.get("retry-after");
+      const seconds = header === null ? NaN : Number(header);
+      const retryAfterMs = header === null ? undefined : Number.isFinite(seconds) ? Math.max(0, seconds) * 1000 : Math.max(0, Date.parse(header) - Date.now()) || undefined;
+      throw new KavachError("RATE_LIMITED", "transport", `${method} ${path}: 429`, retryAfterMs === undefined ? {} : { retryAfterMs });
+    }
+    if (res.status >= 500 || res.status === 408) throw new KavachError("NETWORK", "transport", `${method} ${path}: ${res.status}`);
     // The fetch promise resolves at the headers: a connection lost while the body streams fails
     // here, and is NETWORK too. A body that arrived but is not JSON is the host's bug, a plain error.
     let text: string;

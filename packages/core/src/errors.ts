@@ -52,6 +52,7 @@ export type ErrorCode =
   | "CLOSED"
   | "RECOVERY_REQUIRED"
   | "STORAGE_FAILURE"
+  | "RATE_LIMITED"
   /** The host could not be reached or did not answer in time; the same call may succeed later. A transport raises it, never a plain error. */
   | "NETWORK";
 
@@ -63,6 +64,7 @@ const RETRYABLE: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
   "LOCKED",
   "STORAGE_FAILURE",
   "NETWORK",
+  "RATE_LIMITED",
   "SUCCESSION_PENDING"
 ]);
 
@@ -75,13 +77,16 @@ export class KavachError extends Error {
   readonly code: ErrorCode;
   readonly stage: string;
   readonly retryable: boolean;
+  /** On `RATE_LIMITED`: how long the host asked the client to wait, when it said. */
+  readonly retryAfterMs: number | undefined;
 
-  constructor(code: ErrorCode, stage = "unknown", message?: string) {
+  constructor(code: ErrorCode, stage = "unknown", message?: string, options: { retryAfterMs?: number } = {}) {
     super(message ?? `${code} at ${stage}`);
     this.name = "KavachError";
     this.code = code;
     this.stage = stage;
     this.retryable = RETRYABLE.has(code);
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 

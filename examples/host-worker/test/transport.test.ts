@@ -16,6 +16,15 @@ async function failure(fn: () => Promise<unknown>): Promise<{ network: boolean; 
   }
 }
 
+async function caught(fn: () => Promise<unknown>): Promise<{ code: string | undefined; retryable: boolean | undefined; retryAfterMs: number | undefined }> {
+  try {
+    await fn();
+    throw new Error("did not throw");
+  } catch (e) {
+    return isKavachError(e) ? { code: e.code, retryable: e.retryable, retryAfterMs: e.retryAfterMs } : { code: undefined, retryable: undefined, retryAfterMs: undefined };
+  }
+}
+
 describe("httpTransport failures", () => {
   it("a connection failure is NETWORK and retryable", async () => {
     const t = transportWith(async () => {
@@ -27,8 +36,15 @@ describe("httpTransport failures", () => {
   it("a server error or a timeout status is NETWORK, a client error is a plain error", async () => {
     const answer = (status: number) => transportWith(async () => new Response(JSON.stringify({ error: "x" }), { status, headers: { "content-type": "application/json" } }));
     expect(await failure(() => answer(503).directory.resolveAccounts(["alice"]))).toEqual({ network: true, retryable: true });
-    expect(await failure(() => answer(429).directory.resolveAccounts(["alice"]))).toEqual({ network: true, retryable: true });
     expect(await failure(() => answer(400).directory.resolveAccounts(["alice"]))).toEqual({ network: false, retryable: undefined });
+  });
+
+  it("a 429 is RATE_LIMITED, retryable, with the wait the host named in seconds or as a date, or none", async () => {
+    const limited = (headers: Record<string, string>) => transportWith(async () => new Response(JSON.stringify({ error: "x" }), { status: 429, headers: { "content-type": "application/json", ...headers } }));
+    expect(await caught(() => limited({ "retry-after": "7" }).directory.resolveAccounts(["alice"]))).toEqual({ code: "RATE_LIMITED", retryable: true, retryAfterMs: 7000 });
+    const soon = await caught(() => limited({ "retry-after": new Date(Date.now() + 30_000).toUTCString() }).directory.resolveAccounts(["alice"]));
+    expect([soon.code, soon.retryable, (soon.retryAfterMs ?? 0) > 20_000 && (soon.retryAfterMs ?? 0) <= 30_000]).toEqual(["RATE_LIMITED", true, true]);
+    expect(await caught(() => limited({}).directory.resolveAccounts(["alice"]))).toEqual({ code: "RATE_LIMITED", retryable: true, retryAfterMs: undefined });
   });
 
   it("a body that fails while streaming is NETWORK; a body that is not JSON is a plain error", async () => {

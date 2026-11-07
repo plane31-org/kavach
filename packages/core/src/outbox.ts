@@ -199,6 +199,8 @@ export interface DrainSummary {
   cancelled: number;
   unknown: number;
   retry: number;
+  /** Record bytes handed to the relay by this drain. */
+  bytes: number;
 }
 
 /** "none": nothing to send, the drain ends. "skipped": a row was cancelled, the next one is tried. */
@@ -211,12 +213,13 @@ type HandoffStep = { kind: "none" } | { kind: "skipped" } | { kind: "sent"; key:
  * revalidates first.
  */
 export async function drain(deps: OutboxDeps, maxRecords = 1000): Promise<DrainSummary> {
-  const summary: DrainSummary = { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 };
+  const summary: DrainSummary = { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, bytes: 0 };
   for (let i = 0; i < maxRecords; i++) {
     const step = await handoffNext(deps, summary);
     if (step.kind === "none") break;
     if (step.kind === "skipped") continue; // a cancelled row counts against the limit, never ends the drain
     summary.sent++;
+    summary.bytes += step.row.wire.length / 2;
     let outcome: AppendOutcome | undefined;
     try {
       outcome = await step.outcome;

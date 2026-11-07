@@ -36,7 +36,8 @@ export {
   type ReplacementProposal,
   type SyncError,
   type SyncOptions,
-  type SyncReport
+  type SyncReport,
+  type SyncTimings
 } from "./client.js";
 
 // Errors -------------------------------------------------------------------------------------------
