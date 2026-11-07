@@ -2,7 +2,7 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
-## 0.4.0 (unreleased)
+## 0.4.0
 
 Protocol revision 9, no wire change. What the first product's integration asked for, where it belongs in the SDK.
 
