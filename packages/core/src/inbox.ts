@@ -242,21 +242,39 @@ export async function syncStream(deps: InboxDeps, streamId: Uint8Array, authorId
   const sub = await deps.store.read((tx) => subscription(tx, streamId, authorIdentityId));
   const unresolved = await deps.store.read((tx) => tx.list("unresolved", toHex(streamId) + ":"));
   let from = unresolved.length > 0 ? unbig(sub.ackPrefix) : unbig(sub.scanPos);
-  for (;;) {
-    // A failed read is the caller's to report: the sync names the stream in its report and goes
-    // on to the next one, rather than counting a stream it never read as synced.
-    const page = await deps.relay.readRecords(streamId, from, READ_BATCH);
-    await processPage(deps, streamId, authorIdentityId, page, summary);
-    budget.remainingRecords -= page.records.length;
-    const caughtUp = page.nextSeq >= page.tail || page.nextSeq <= from;
-    if (caughtUp) break;
-    if (budget.remainingRecords <= 0 || deps.now() >= budget.deadline) {
-      summary.hasMore = true;
-      break;
+  try {
+    for (;;) {
+      // A failed read is the caller's to report: the sync names the stream in its report and goes
+      // on to the next one, rather than counting a stream it never read as synced.
+      const page = await deps.relay.readRecords(streamId, from, READ_BATCH);
+      await processPage(deps, streamId, authorIdentityId, page, summary);
+      budget.remainingRecords -= page.records.length;
+      const caughtUp = page.nextSeq >= page.tail || page.nextSeq <= from;
+      if (caughtUp) break;
+      if (budget.remainingRecords <= 0 || deps.now() >= budget.deadline) {
+        summary.hasMore = true;
+        break;
+      }
+      from = page.nextSeq;
     }
-    from = page.nextSeq;
+  } catch (e) {
+    // The pages that landed before the failure are real work: the error carries the summary so
+    // far, and the caller merges it before reporting the failure.
+    throw withPartialSummary(e, summary);
   }
   return summary;
+}
+
+const PARTIAL = Symbol("kavach.partialStreamSummary");
+
+function withPartialSummary(e: unknown, summary: StreamSyncSummary): unknown {
+  if (typeof e === "object" && e !== null) Object.defineProperty(e, PARTIAL, { value: summary, enumerable: false, configurable: true });
+  return e;
+}
+
+/** The summary a failed `syncStream` had accumulated before it failed, when it had read anything. */
+export function partialStreamSummary(e: unknown): StreamSyncSummary | undefined {
+  return typeof e === "object" && e !== null && PARTIAL in e ? ((e as Record<symbol, unknown>)[PARTIAL] as StreamSyncSummary) : undefined;
 }
 
 /** T7 for every record of one page, then the scan position, the eligible prefix and one acknowledgement. */

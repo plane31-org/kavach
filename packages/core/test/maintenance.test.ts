@@ -61,6 +61,35 @@ describe("timings", () => {
   });
 });
 
+describe("review of 0.4.0", () => {
+  it("1: a throttled send reaches the report with its wait, and the record stays queued for the next sync", async () => {
+    const w = world();
+    const { a, b, aliceId } = await pair(w);
+    a.t.knobs.failWith.set("appendRecord", new KavachError("RATE_LIMITED", "transport", "429", { retryAfterMs: 5000 }));
+    await enqueueLocation(a.client, w.loc(2)); // the handoff happens here and is refused
+    const r = await w.sync(a);
+    expect(r.errors.map((e) => [e.operation, e.code, e.retryable, e.retryAfterMs])).toEqual([["outbox", "RATE_LIMITED", true, 5000]]);
+    expect([r.outbox.accepted, (await a.client.getState()).outbox]).toEqual([0, 1]);
+    const next = await w.sync(a);
+    expect([next.errors, next.outbox.accepted, (await a.client.getState()).outbox]).toEqual([[], 1, 0]);
+    await w.sync(b);
+    expect((await b.client.history({ authorIdentityId: aliceId })).length).toBe(2);
+  });
+
+  it("2: a download that fails on its second page still reports the first page's records and bytes", async () => {
+    const w = world();
+    const { a, b } = await pair(w);
+    for (let i = 0; i < 150; i++) await enqueueLocation(a.client, w.loc(i % 90));
+    await w.sync(a);
+    b.t.knobs.failReadsAfter = 1;
+    const r = await w.sync(b);
+    expect(r.errors.map((e) => [e.operation, e.code])).toEqual([["inbox", "NETWORK"]]);
+    expect([r.inbox.stored, r.timings.bytesReceived > 10_000]).toEqual([100, true]);
+    const rest = await w.sync(b);
+    expect([rest.errors, rest.inbox.stored]).toEqual([[], 50]);
+  });
+});
+
 describe("RATE_LIMITED", () => {
   it("is a retryable code and carries the wait the host named", () => {
     const e = new KavachError("RATE_LIMITED", "transport", "429", { retryAfterMs: 4000 });

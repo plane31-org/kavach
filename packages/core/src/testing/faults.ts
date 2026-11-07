@@ -113,6 +113,10 @@ export interface MaliciousKnobs {
   readonly hold: Map<MutationName, Promise<void>>;
   /** Called when a held mutation has reached its gate (the host has answered; the response is being held), so a test can act at exactly that point. */
   onHeld?: (name: MutationName) => void;
+  /** Mutations whose next call fails with exactly this error before reaching the host (consumed once). */
+  readonly failWith: Map<MutationName, KavachError>;
+  /** Record reads fail once with NETWORK after this many pages have been served. */
+  failReadsAfter?: number | undefined;
   /** Reads that answer "nothing" while present. */
   readonly withhold: Set<"snapshots" | "epochs" | "records" | "requests" | "currentEpoch" | "keyList" | "certificates" | "successions" | "circleList" | "subscriptions">;
   /** Older documents served instead of the current ones. */
@@ -142,6 +146,7 @@ export function emptyKnobs(): MaliciousKnobs {
     loseResponseOf: new Set(),
     refuse: new Set(),
     hold: new Map(),
+    failWith: new Map(),
     withhold: new Set(),
     replay: { snapshots: new Map() },
     fork: { snapshots: new Map(), manifests: new Map(), records: new Map(), certificates: new Map() },
@@ -298,6 +303,11 @@ export class MaliciousTransport implements Transport {
       appendRecord: (recordId, wire) => {
         // Must stay synchronous up to the inner call (T6h).
         this.calls.push("appendRecord");
+        const fail = k.failWith.get("appendRecord");
+        if (fail) {
+          k.failWith.delete("appendRecord");
+          return Promise.reject(fail);
+        }
         const p = r().appendRecord(recordId, wire);
         if (!k.loseResponseOf.has("appendRecord")) return p;
         k.loseResponseOf.delete("appendRecord");
@@ -308,6 +318,13 @@ export class MaliciousTransport implements Transport {
       },
       readRecords: async (streamId, afterSeq, limit): Promise<ReadRecordsResult> => {
         this.calls.push("readRecords");
+        if (k.failReadsAfter !== undefined) {
+          if (k.failReadsAfter <= 0) {
+            k.failReadsAfter = undefined;
+            throw new KavachError("NETWORK", "transport", "network unreachable");
+          }
+          k.failReadsAfter--;
+        }
         if (k.withhold.has("records")) {
           const probe = await r().readRecords(streamId, afterSeq, limit);
           return { ...probe, records: [], nextSeq: afterSeq };

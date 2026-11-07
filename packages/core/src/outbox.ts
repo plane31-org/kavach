@@ -201,6 +201,8 @@ export interface DrainSummary {
   retry: number;
   /** Record bytes handed to the relay by this drain. */
   bytes: number;
+  /** The error that ended the drain early, when a send failed before or without an answer (NETWORK, RATE_LIMITED); its record stays queued. */
+  blocked?: KavachError;
 }
 
 /** "none": nothing to send, the drain ends. "skipped": a row was cancelled, the next one is tried. */
@@ -223,8 +225,9 @@ export async function drain(deps: OutboxDeps, maxRecords = 1000): Promise<DrainS
     let outcome: AppendOutcome | undefined;
     try {
       outcome = await step.outcome;
-    } catch {
-      outcome = undefined; // lost response
+    } catch (e) {
+      outcome = undefined; // no answer: the identical bytes are retried, the relay answers from its checkpoint
+      if (e instanceof KavachError) summary.blocked ??= e; // and the reason reaches the report
     }
     const final = await recordOutcome(deps, step.key, outcome);
     if (final === "accepted") summary.accepted++;

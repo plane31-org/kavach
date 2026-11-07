@@ -12,7 +12,7 @@ import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { ensureHistoryIndex } from "./historyIndex.js";
-import { ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
+import { ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, partialStreamSummary, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
 import { drain, enqueue, outboxCount, outboxCounts, purgeOutbox, type EnqueueOptions, type OutboxCounts } from "./outbox.js";
 export type { EnqueueOptions } from "./outbox.js";
 
@@ -368,10 +368,14 @@ export interface SyncError {
   readonly authorIdentityId?: Uint8Array;
   /** On a `bootstrap` entry: the circle that could not be adopted on this sync; it is retried by the next. */
   readonly circleId?: Uint8Array;
+  /** On a `RATE_LIMITED` entry: the wait the host asked for, when it said. */
+  readonly retryAfterMs?: number;
 }
 
 function syncError(operation: string, e: unknown, extra: Partial<Pick<SyncError, "circleId" | "streamId" | "authorIdentityId">> = {}): SyncError {
-  return e instanceof KavachError ? { operation, code: e.code, stage: e.stage, retryable: e.retryable, ...extra } : { operation, code: "UNEXPECTED", stage: operation, retryable: false, ...extra };
+  return e instanceof KavachError
+    ? { operation, code: e.code, stage: e.stage, retryable: e.retryable, ...(e.retryAfterMs === undefined ? {} : { retryAfterMs: e.retryAfterMs }), ...extra }
+    : { operation, code: "UNEXPECTED", stage: operation, retryable: false, ...extra };
 }
 
 const RESET_LIST_RECHECK_MS = 86_400_000n;
@@ -1216,6 +1220,7 @@ class ClientImpl implements Client {
       const drained = await drain(this.outboxDeps());
       report.outbox = { sent: drained.sent, accepted: drained.accepted, cancelled: drained.cancelled, unknown: drained.unknown, retry: drained.retry };
       report.timings.bytesSent += drained.bytes;
+      if (drained.blocked) report.errors.push(syncError("outbox", drained.blocked)); // the records stay queued
     } catch (e) {
       report.errors.push(syncError("outbox", e));
     }
@@ -1246,6 +1251,14 @@ class ClientImpl implements Client {
         if (r.hasMore) report.inbox.hasMore = true;
         report.timings.bytesReceived += r.bytes;
       } catch (e) {
+        const partial = partialStreamSummary(e);
+        if (partial) {
+          // What landed before the failure is real work, and the report says so.
+          report.inbox.stored += partial.stored;
+          report.inbox.keyPending += partial.keyPending;
+          report.inbox.invalid += partial.invalid;
+          report.timings.bytesReceived += partial.bytes;
+        }
         report.errors.push({ ...syncError("inbox", e), streamId: s.streamId, authorIdentityId: s.authorIdentityId });
       }
     }
