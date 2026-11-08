@@ -72,6 +72,15 @@ Foreground and background tasks write concurrently without a shared counter and 
 
 ## Cipher suite backend
 
-`@plane31/blind-relay` runs on the portable backend (the noble libraries, pure JavaScript) unless told otherwise, which is what Hermes needs: it has no WebAssembly. On Node, `import { loadSodiumBackend } from "@plane31/blind-relay/sodium"` and `setCryptoBackend(await loadSodiumBackend())` before `open()` selects libsodium. Both backends pass the same vectors.
+`@plane31/blind-relay` runs on the portable backend (the noble libraries, pure JavaScript) unless told otherwise. Both backends pass the same vectors, so the choice changes nothing on the wire, only the time a signature, a verification or an epoch's sealed boxes take: Ed25519 and X25519 in pure JavaScript cost milliseconds each on a phone, and a rotation in a large circle seals one box per member.
+
+**On a device, pass a native libsodium binding.** Install `react-native-libsodium` (libsodium over JSI) and hand it to `openKavach` as `crypto`; the helper awaits its `ready` and installs the backend process-wide before the client opens. An app wiring the adapters by hand calls `installNativeCrypto(sodium)` first. The binding needs libsodium's standard API (`crypto_sign_*`, `crypto_box_*`, `crypto_scalarmult`, `crypto_generichash`, `crypto_aead_xchacha20poly1305_ietf_*`, `randombytes_buf`); where it lacks the sumo-only `crypto_core_ed25519_is_valid_point`, the once-per-certificate validity check runs on the portable implementation with the same rule. Without `crypto`, the portable backend stays.
+
+```ts
+import sodium from "react-native-libsodium";
+const setup = await openKavach({ ..., getRandomValues: Crypto.getRandomValues, crypto: sodium });
+```
+
+On Node, `import { loadSodiumBackend } from "@plane31/blind-relay/sodium"` and `setCryptoBackend(await loadSodiumBackend())` before `open()` selects the wasm build of libsodium.
 
 `test/faults.sqlite.test.ts` runs the core's crash and lost-response sweeps over SQLite files on Node, as close to the phone's store as a test without the development build can get; the on-device run on SQLCipher is the product's release gate.

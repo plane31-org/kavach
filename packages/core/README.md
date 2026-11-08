@@ -13,7 +13,7 @@ pnpm add @plane31/blind-relay
 - `@plane31/blind-relay`: `open` and the `Client` with `enqueue`, `newest`, `historyPage`, `sync`, the circles API, `subscribe` and `inspect`; the `KindDeclaration` and `RetentionPolicy` a product passes to `open`; `KavachError` and `ErrorCode`; the `RecoveryProvider` contract; `toHex`, `fromHex` and `equalBytes`.
 - `@plane31/blind-relay/adapters`: the `Store`, `Tx`, `SecretStore`, `Transport`, `Directory` and `Relay` contracts an adapter or host implements, with the table and row types; `MemoryStore` and `MemorySecretStore` as the behavioural reference; the signed-document codec a host verifies with; `buildResetKeyList` and `buildResetReceipt` for a host's key tooling.
 - `@plane31/blind-relay/testing`: the fault harness (a fake host, a crashing store, a malicious transport, the crash and lost-response sweeps) and the fixtures a test builds protocol state with.
-- `@plane31/blind-relay/sodium`: the optional libsodium backend for Node; the default backend is portable JavaScript, which is what Hermes needs.
+- `@plane31/blind-relay/sodium`: the optional libsodium backend for Node (wasm). The default backend is portable JavaScript; `sodiumBackend(sodium)` from the adapters entry builds the libsodium backend over any object with libsodium's API, which is how a phone runs the cipher suite natively (`@plane31/blind-relay-expo` wires `react-native-libsodium` through `openKavach`'s `crypto` option).
 
 Randomness comes from the Web Crypto global. A runtime without one (Hermes) installs it first; `@plane31/blind-relay-expo` does that from `expo-crypto`.
 

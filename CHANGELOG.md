@@ -2,6 +2,10 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
+## 0.5.0 (unreleased)
+
+- **A native cipher-suite backend on the phone.** `sodiumBackend(sodium)` (from `@plane31/blind-relay/adapters`) builds the libsodium backend over any object with libsodium's JavaScript API, and `openKavach({ crypto: sodium })` in the Expo package installs it from `react-native-libsodium` before the client opens (`installNativeCrypto` for apps wiring the adapters by hand). Ed25519 and X25519 then run in C instead of pure JavaScript, which is where a record's signature, a verification and an epoch's sealed boxes spend their time. Where the binding lacks the sumo-only point-validity check, that once-per-certificate check runs on the portable implementation with the same rule. Nothing on the wire changes; both backends pass the same vectors. The Node entry `@plane31/blind-relay/sodium` is now a thin wrapper over the same code.
+
 ## 0.4.0
 
 Protocol revision 9, no wire change. What the first product's integration asked for, where it belongs in the SDK.

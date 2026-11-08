@@ -67,6 +67,13 @@ importers:
       '@plane31/blind-relay':
         specifier: workspace:*
         version: link:../core
+    devDependencies:
+      '@types/libsodium-wrappers-sumo':
+        specifier: ^0.7.8
+        version: 0.7.8
+      libsodium-wrappers-sumo:
+        specifier: ^0.7.15
+        version: 0.7.16
 
 packages:
 

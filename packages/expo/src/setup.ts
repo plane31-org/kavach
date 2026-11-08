@@ -4,8 +4,8 @@
  * account name, so two accounts on one device never share a database or a secret. The individual
  * adapters stay exported for apps that need a different arrangement.
  */
-import { KavachError, open, type Client, type ClientEvent, type RecoveryProvider, type ResetTrustConfig, type RetentionPolicy } from "@plane31/blind-relay";
-import { SECRET_NAMES, randomBytes, type SecretStore, type Transport } from "@plane31/blind-relay/adapters";
+import { KavachError, open, setCryptoBackend, type Client, type ClientEvent, type RecoveryProvider, type ResetTrustConfig, type RetentionPolicy } from "@plane31/blind-relay";
+import { SECRET_NAMES, randomBytes, sodiumBackend, type SecretStore, type SodiumLike, type Transport } from "@plane31/blind-relay/adapters";
 import { ExpoSecretStore, type SecureStoreLike } from "./secretStore.js";
 import { SqliteStore, expoSqliteDriver, type ExpoSqliteDatabaseLike, type SqlDriver } from "./sqliteStore.js";
 
@@ -50,6 +50,13 @@ export interface KavachSetupOptions {
    * key is made; nothing ever falls back to a weaker source.
    */
   readonly getRandomValues?: GetRandomValues;
+  /**
+   * A native libsodium binding (`react-native-libsodium`, over JSI) to run the cipher suite on
+   * instead of the portable pure-JavaScript backend: Ed25519 and X25519 are many times faster,
+   * which is what a record's signature and an epoch's sealed boxes cost. Awaited (`ready`) and
+   * installed process-wide before the client opens; absent, the portable backend stays.
+   */
+  readonly crypto?: SodiumLike & { readonly ready?: Promise<unknown> };
 }
 
 export type GetRandomValues = <T extends ArrayBufferView>(array: T) => T;
@@ -125,8 +132,19 @@ export function databaseFileName(accountName: string, namespace = "kavach"): str
  * survived), SQLCipher refuses the new key and this throws `RECOVERY_REQUIRED`: the app deletes
  * the file and restores the account from its recovery provider.
  */
+/**
+ * Run the cipher suite on a native libsodium binding. Process-wide, like the Web Crypto install;
+ * `openKavach` calls it when given `crypto`. Both backends pass the same vectors, so nothing on
+ * the wire changes; only the time a signature or a sealed box takes.
+ */
+export async function installNativeCrypto(sodium: SodiumLike & { readonly ready?: Promise<unknown> }): Promise<void> {
+  if (sodium.ready) await sodium.ready;
+  setCryptoBackend(sodiumBackend(sodium));
+}
+
 export async function openKavach(options: KavachSetupOptions): Promise<KavachSetup> {
   installWebCrypto(options.getRandomValues);
+  if (options.crypto) await installNativeCrypto(options.crypto);
   const namespace = options.namespace ?? "kavach";
   const fileName = databaseFileName(options.accountName, namespace);
   const secretStore =

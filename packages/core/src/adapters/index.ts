@@ -13,6 +13,12 @@ export { Reader, Writer, compareBytes, concat, equalBytes, fromHex, toHex, u16, 
 
 // Cipher suite: readiness, randomness and the identifiers a host derives --------------------------
 export { bodyHash, identityId, randomBytes, ready, recordId, signingKeypairFromSeed, streamId, type SigningKeypair } from "../crypto.js";
+// Cipher-suite backends: the portable one, and a libsodium one over any object with libsodium's API
+// (a native binding on a phone). `setCryptoBackend` is on the main entry.
+export { nobleBackend } from "../crypto/noble.js";
+export { backendName } from "../crypto.js";
+export { sodiumBackend, type SodiumLike } from "../crypto/sodiumLike.js";
+export type { CryptoBackend } from "../crypto/backend.js";
 
 // Errors -------------------------------------------------------------------------------------------
 export { KavachError, isKavachError, type ErrorCode } from "../errors.js";

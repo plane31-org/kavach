@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import { toHex, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@plane31/blind-relay";
-import { MemorySecretStore, ready } from "@plane31/blind-relay/adapters";
+import { MemorySecretStore, backendName, nobleBackend, ready, type SodiumLike } from "@plane31/blind-relay/adapters";
+import { setCryptoBackend } from "@plane31/blind-relay";
+import { createRequire } from "node:module";
 import { FakeHost, TestClock, testPolicy, testResetKeyList, testResetKeys } from "@plane31/blind-relay/testing";
 import { nodeSqliteDriver, type SqlDriver, type SqlValue } from "../src/sqliteStore.js";
 import { databaseFileName, installWebCrypto, openKavach } from "../src/setup.js";
@@ -98,6 +100,24 @@ function world(): { host: FakeHost; clock: TestClock; resetTrust: { managementKe
 }
 
 describe("openKavach", () => {
+  it("runs the cipher suite on an injected libsodium when given one, and both backends read each other's bytes", async () => {
+    const w = world();
+    const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));
+    const keys = new Map<string, string>();
+    // Through its CommonJS build, as the core's Node entry does (the ESM build has shipped broken).
+    const mod = createRequire(import.meta.url)("libsodium-wrappers-sumo") as { default?: SodiumLike & { ready: Promise<void> } } & SodiumLike & { ready: Promise<void> };
+    const sodium = mod.default ?? mod;
+    const alice = await openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets: new MemorySecretStore(), database: cipherLike(dir, keys), context: "foreground", now: w.clock.now, crypto: sodium });
+    expect(backendName()).toBe("sodium");
+    await alice.client.initializeAccount();
+    const { circleId } = await alice.client.circles.create();
+    expect(circleId.length).toBe(16);
+    expect((await alice.client.sync()).errors).toEqual([]);
+    await alice.close();
+    setCryptoBackend(nobleBackend); // the rest of the suite runs on the portable backend
+    expect(backendName()).toBe("noble");
+  });
+
   it("takes no recovery provider on a recovery-only profile, and requires one where identity continuity is enabled", async () => {
     const w = world();
     const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));
