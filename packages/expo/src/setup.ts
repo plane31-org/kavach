@@ -5,7 +5,7 @@
  * adapters stay exported for apps that need a different arrangement.
  */
 import { KavachError, open, setCryptoBackend, type Client, type ClientEvent, type RecoveryProvider, type ResetTrustConfig, type RetentionPolicy } from "@plane31/blind-relay";
-import { SECRET_NAMES, buildSodiumBackend, nobleBackend, randomBytes, type SecretStore, type SodiumBackendReport, type SodiumLike, type Transport } from "@plane31/blind-relay/adapters";
+import { SECRET_NAMES, backendName, buildSodiumBackend, nobleBackend, randomBytes, type SecretStore, type SodiumBackendReport, type SodiumLike, type Transport } from "@plane31/blind-relay/adapters";
 import { ExpoSecretStore, type SecureStoreLike } from "./secretStore.js";
 import { SqliteStore, expoSqliteDriver, type ExpoSqliteDatabaseLike, type SqlDriver } from "./sqliteStore.js";
 
@@ -72,11 +72,17 @@ export interface KavachSetupOptions {
 }
 
 /**
- * Which cipher-suite backend the client opened on. `native` carries the per-function split;
- * `portable` carries a `reason` when a binding was given and could not be used, and none when
- * no `crypto` was passed. A release build logs this once to know what it runs.
+ * Which cipher-suite backend the client opened on, read from the process, not from the options:
+ * the backend is process-wide, so an app that called `installNativeCrypto` itself and opens
+ * without `crypto` is `native` too. `native` carries the per-function split when the binding
+ * went through `installNativeCrypto` (a backend set by other means has none); `portable` carries
+ * a `reason` when this call was given a binding and could not use it. A release build logs this
+ * once to know what it runs.
  */
-export type CryptoBackendStatus = { readonly kind: "native"; readonly report: SodiumBackendReport } | { readonly kind: "portable"; readonly reason?: string };
+export type CryptoBackendStatus = { readonly kind: "native"; readonly report?: SodiumBackendReport } | { readonly kind: "portable"; readonly reason?: string };
+
+/** The last binding `installNativeCrypto` installed, for the status report. */
+let installed: SodiumBackendReport | undefined;
 
 export type GetRandomValues = <T extends ArrayBufferView>(array: T) => T;
 
@@ -165,23 +171,28 @@ export async function installNativeCrypto(sodium: SodiumLike & { readonly ready?
   if (sodium.ready) await sodium.ready;
   const { backend, report } = buildSodiumBackend(sodium);
   setCryptoBackend(backend);
+  installed = report;
   return report;
 }
 
 /**
- * `openKavach`'s use of `installNativeCrypto`: the status the setup reports, and the fallback.
- * On a refused binding the portable backend is installed explicitly, so the status is what the
- * process runs on, whatever an earlier call installed.
+ * `openKavach`'s use of `installNativeCrypto`, with the fallback, then the status read from the
+ * active backend. On a refused binding the portable backend is installed explicitly, so the
+ * status is what the process runs on, whatever an earlier call installed.
  */
 async function selectCryptoBackend(options: Pick<KavachSetupOptions, "crypto" | "cryptoFallback">): Promise<CryptoBackendStatus> {
-  if (!options.crypto) return { kind: "portable" };
-  try {
-    return { kind: "native", report: await installNativeCrypto(options.crypto) };
-  } catch (e) {
-    if (options.cryptoFallback === "refuse") throw e;
-    setCryptoBackend(nobleBackend);
-    return { kind: "portable", reason: e instanceof Error ? e.message : String(e) };
+  let reason: string | undefined;
+  if (options.crypto) {
+    try {
+      await installNativeCrypto(options.crypto);
+    } catch (e) {
+      if (options.cryptoFallback === "refuse") throw e;
+      setCryptoBackend(nobleBackend);
+      reason = e instanceof Error ? e.message : String(e);
+    }
   }
+  if (backendName() === "sodium") return installed ? { kind: "native", report: installed } : { kind: "native" };
+  return reason === undefined ? { kind: "portable" } : { kind: "portable", reason };
 }
 
 export async function openKavach(options: KavachSetupOptions): Promise<KavachSetup> {

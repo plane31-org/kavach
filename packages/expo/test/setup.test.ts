@@ -9,7 +9,7 @@ import { setCryptoBackend } from "@plane31/blind-relay";
 import { createRequire } from "node:module";
 import { FakeHost, TestClock, testPolicy, testResetKeyList, testResetKeys } from "@plane31/blind-relay/testing";
 import { nodeSqliteDriver, type SqlDriver, type SqlValue } from "../src/sqliteStore.js";
-import { databaseFileName, installWebCrypto, openKavach } from "../src/setup.js";
+import { databaseFileName, installNativeCrypto, installWebCrypto, openKavach } from "../src/setup.js";
 import type { SecureStoreLike } from "../src/secretStore.js";
 import { openNodeDatabase } from "./sqlite.js";
 
@@ -108,15 +108,25 @@ describe("openKavach", () => {
     type Lib = typeof import("libsodium-wrappers-sumo");
     const mod = createRequire(import.meta.url)("libsodium-wrappers-sumo") as { default?: Lib } & Lib;
     const sodium: SodiumLike & { ready: Promise<void> } = mod.default ?? mod; // assignable without a cast
-    const alice = await openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets: new MemorySecretStore(), database: cipherLike(dir, keys), context: "foreground", now: w.clock.now, crypto: sodium });
+    // Installed by the app itself, as a hand-wired app does: the open without `crypto` still reports what the process runs on.
+    await installNativeCrypto(sodium);
+    const secrets = new MemorySecretStore(); // one secret store: the same account is reopened below
+    const alice = await openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets, database: cipherLike(dir, keys), context: "foreground", now: w.clock.now });
     expect(backendName()).toBe("sodium");
     expect(alice.cryptoBackend.kind).toBe("native");
-    if (alice.cryptoBackend.kind === "native") expect(alice.cryptoBackend.report.native).toContain("signDetached");
-    await alice.client.initializeAccount();
-    const { circleId } = await alice.client.circles.create();
-    expect(circleId.length).toBe(16);
-    expect((await alice.client.sync()).errors).toEqual([]);
+    if (alice.cryptoBackend.kind === "native") expect(alice.cryptoBackend.report?.native).toContain("signDetached");
     await alice.close();
+    const alice2 = await openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets, database: cipherLike(dir, keys), context: "foreground", now: w.clock.now, crypto: sodium });
+    expect(alice2.cryptoBackend.kind).toBe("native");
+    await alice2.close();
+    setCryptoBackend(nobleBackend);
+    const alice3 = await openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets, database: cipherLike(dir, keys), context: "foreground", now: w.clock.now, crypto: sodium });
+    expect(backendName()).toBe("sodium");
+    await alice3.client.initializeAccount();
+    const { circleId } = await alice3.client.circles.create();
+    expect(circleId.length).toBe(16);
+    expect((await alice3.client.sync()).errors).toEqual([]);
+    await alice3.close();
     setCryptoBackend(nobleBackend); // the rest of the suite runs on the portable backend
     expect(backendName()).toBe("noble");
   });

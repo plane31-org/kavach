@@ -75,6 +75,12 @@ describe("receiving through sync", () => {
     expect((await receive(bob.inbox, seven)).result).toBe("duplicate");
     const conflicting = wireFor(7, 41);
     expect(await receive(bob.inbox, conflicting)).toEqual({ result: "invalid", reason: "EQUIVOCATION" });
+    // A second body under a retained id is equivocation whatever kind it claims, declared or not; a fresh id of an undeclared kind is skipped.
+    const undeclared = (counter: number, lat: number): Uint8Array =>
+      buildRecordWire({ streamId: alice.pin.streamId, epoch: 1, counter, sentAt: clock.now(), kind: 99, headerClass: 0 }, sample(clock, lat), Uint8Array.from(Buffer.from(key, "hex")), randomBytes(24), alice.device.signing.secretKey);
+    expect(await receive(bob.inbox, undeclared(7, 42))).toEqual({ result: "invalid", reason: "EQUIVOCATION" });
+    expect((await receive(bob.inbox, undeclared(8, 42))).result).toBe("unknownKind");
+    expect((await receive(bob.inbox, undeclared(8, 42))).result).toBe("unknownKind"); // nothing retained to call it a duplicate against
     expect((await receive(bob.inbox, wireFor(6, 39))).result).toBe("history");
     const pin = await newestSlot(bob.store, alice.pin.identityId, 0, clock.now());
     expect(pin && toHex(pin.payload)).toBe(toHex(sample(clock, 40)));

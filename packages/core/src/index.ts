@@ -1,5 +1,5 @@
 /**
- * @plane31/blind-relay: Kavach v1 protocol (revision 9, wire version 5).
+ * @plane31/blind-relay: Kavach v1 protocol (revision 10, wire version 5).
  *
  * This entry is what an application imports: the client, its types, the errors and the few
  * helpers an app needs around it. Adapter and host authors import `@plane31/blind-relay/adapters`;
@@ -7,7 +7,7 @@
  * `@plane31/blind-relay/sodium`. Everything else is internal and reachable only by relative import.
  */
 export const PROTOCOL_NAME = "Kavach";
-export const PROTOCOL_REVISION = 9;
+export const PROTOCOL_REVISION = 10;
 
 // The client ---------------------------------------------------------------------------------------
 export {

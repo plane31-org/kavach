@@ -128,11 +128,18 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   const kind = opened.kind;
   const base = { recordId: opened.recordId, authorIdentityId: author.identityId, kind };
   const declared = kindOf(deps.policy, kind);
-  // The record authenticated and opened, so it is an authorized author's; an undeclared kind means
-  // the sender's app is newer than this one, not a forgery. Skipped and counted, never an alarm;
-  // the cursor passes it like any record this reader will not store.
-  if (!declared) return { result: "unknownKind", ...base };
   const authorHex = toHex(author.identityId);
+  if (!declared) {
+    // The record authenticated and opened, so it is an authorized author's; an undeclared kind
+    // means the sender's app is newer than this one, not a forgery. Skipped and counted, never an
+    // alarm; the cursor passes it like any record this reader will not store. One check first: a
+    // second body under an id this reader retains is the author speaking twice whatever kind the
+    // second claims, so it is still EQUIVOCATION (the reverse order, undeclared first, leaves
+    // nothing retained to compare against and is not detected).
+    const retained = tx.get("history", id) ?? deps.policy.kinds.map((k) => tx.get("newest", slotKey(authorHex, k.kind))).find((row) => row?.recordId === id);
+    if (retained) return retained.bodyHash === hash ? { result: "duplicate", recordId: opened.recordId } : { result: "invalid", reason: "EQUIVOCATION" };
+    return { result: "unknownKind", ...base };
+  }
   const fromCurrentDevice = !opened.superseded && !!cert?.current;
   const candidate = { generation, eventTime: clampEventTime(opened.eventTime, parsed.sentAt), epoch: parsed.epoch, counter: parsed.counter, recordId: id, bodyHash: hash, sentAt: parsed.sentAt, receivedAt: now, payload: opened.payload };
   if (!declared.history) {
