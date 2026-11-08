@@ -1,6 +1,6 @@
 {
   "name": "@plane31/blind-relay",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Kavach v1 protocol: documents, cryptography, state machine. Pure TypeScript, no platform imports.",
   "license": "Apache-2.0",
   "repository": {
