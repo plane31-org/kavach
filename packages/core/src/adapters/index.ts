@@ -17,6 +17,7 @@ export { bodyHash, identityId, randomBytes, ready, recordId, signingKeypairFromS
 // (a native binding on a phone). `setCryptoBackend` is on the main entry.
 export { nobleBackend } from "../crypto/noble.js";
 export { backendName } from "../crypto.js";
+export { currentBackend } from "../crypto/backend.js";
 export { buildSodiumBackend, sodiumBackend, type SodiumBackendReport, type SodiumLike } from "../crypto/sodiumLike.js";
 export type { CryptoBackend } from "../crypto/backend.js";
 

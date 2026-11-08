@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import { toHex, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@plane31/blind-relay";
-import { MemorySecretStore, backendName, nobleBackend, ready, type SodiumLike } from "@plane31/blind-relay/adapters";
+import { MemorySecretStore, backendName, nobleBackend, ready, sodiumBackend, type SodiumLike } from "@plane31/blind-relay/adapters";
 import { setCryptoBackend } from "@plane31/blind-relay";
 import { createRequire } from "node:module";
 import { FakeHost, TestClock, testPolicy, testResetKeyList, testResetKeys } from "@plane31/blind-relay/testing";
@@ -119,6 +119,17 @@ describe("openKavach", () => {
     const alice2 = await openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets, database: cipherLike(dir, keys), context: "foreground", now: w.clock.now, crypto: sodium });
     expect(alice2.cryptoBackend.kind).toBe("native");
     await alice2.close();
+    // A sodium backend installed by other means (another binding object, with a different split) carries no report: the report is the installed instance's, never inherited by name.
+    const other: SodiumLike = { ...sodium, crypto_scalarmult: undefined };
+    setCryptoBackend(sodiumBackend(other));
+    const aliceOther = await openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets, database: cipherLike(dir, keys), context: "foreground", now: w.clock.now });
+    expect(aliceOther.cryptoBackend).toEqual({ kind: "native" });
+    await aliceOther.close();
+    // Reinstalled through the helper, the report is back.
+    await installNativeCrypto(sodium);
+    const aliceAgain = await openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets, database: cipherLike(dir, keys), context: "foreground", now: w.clock.now });
+    expect(aliceAgain.cryptoBackend).toMatchObject({ kind: "native", report: { native: expect.arrayContaining(["scalarMult"]) } });
+    await aliceAgain.close();
     setCryptoBackend(nobleBackend);
     const alice3 = await openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets, database: cipherLike(dir, keys), context: "foreground", now: w.clock.now, crypto: sodium });
     expect(backendName()).toBe("sodium");

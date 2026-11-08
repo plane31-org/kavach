@@ -5,7 +5,7 @@
  * adapters stay exported for apps that need a different arrangement.
  */
 import { KavachError, open, setCryptoBackend, type Client, type ClientEvent, type RecoveryProvider, type ResetTrustConfig, type RetentionPolicy } from "@plane31/blind-relay";
-import { SECRET_NAMES, backendName, buildSodiumBackend, nobleBackend, randomBytes, type SecretStore, type SodiumBackendReport, type SodiumLike, type Transport } from "@plane31/blind-relay/adapters";
+import { SECRET_NAMES, backendName, buildSodiumBackend, currentBackend, nobleBackend, randomBytes, type CryptoBackend, type SecretStore, type SodiumBackendReport, type SodiumLike, type Transport } from "@plane31/blind-relay/adapters";
 import { ExpoSecretStore, type SecureStoreLike } from "./secretStore.js";
 import { SqliteStore, expoSqliteDriver, type ExpoSqliteDatabaseLike, type SqlDriver } from "./sqliteStore.js";
 
@@ -81,8 +81,8 @@ export interface KavachSetupOptions {
  */
 export type CryptoBackendStatus = { readonly kind: "native"; readonly report?: SodiumBackendReport } | { readonly kind: "portable"; readonly reason?: string };
 
-/** The last binding `installNativeCrypto` installed, for the status report. */
-let installed: SodiumBackendReport | undefined;
+/** The backend `installNativeCrypto` last installed, with its report: the report is only ever attached to that instance. */
+let installed: { readonly backend: CryptoBackend; readonly report: SodiumBackendReport } | undefined;
 
 export type GetRandomValues = <T extends ArrayBufferView>(array: T) => T;
 
@@ -171,7 +171,7 @@ export async function installNativeCrypto(sodium: SodiumLike & { readonly ready?
   if (sodium.ready) await sodium.ready;
   const { backend, report } = buildSodiumBackend(sodium);
   setCryptoBackend(backend);
-  installed = report;
+  installed = { backend, report };
   return report;
 }
 
@@ -191,7 +191,8 @@ async function selectCryptoBackend(options: Pick<KavachSetupOptions, "crypto" | 
       reason = e instanceof Error ? e.message : String(e);
     }
   }
-  if (backendName() === "sodium") return installed ? { kind: "native", report: installed } : { kind: "native" };
+  // The report belongs to one backend instance; a sodium backend installed by other means (another binding, the Node entry) gets none.
+  if (backendName() === "sodium") return installed && installed.backend === currentBackend() ? { kind: "native", report: installed.report } : { kind: "native" };
   return reason === undefined ? { kind: "portable" } : { kind: "portable", reason };
 }
 
