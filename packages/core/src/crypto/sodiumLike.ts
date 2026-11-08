@@ -16,9 +16,14 @@ import { KavachError } from "../errors.js";
 import type { BoxKeypair, CryptoBackend, SignKeypair } from "./backend.js";
 import { nobleBackend } from "./noble.js";
 
-/** The subset of libsodium's API the backend can use; everything but signing, boxing and hashing may be absent. */
+/**
+ * The subset of libsodium's API the backend can use; everything but signing, boxing and hashing
+ * may be absent. Shaped so that the typed wrappers (`libsodium-wrappers` and the bindings that
+ * reuse its declarations, `react-native-libsodium` among them) are assignable without a cast: the
+ * hash's key is passed explicitly (`null` for none), since the wrappers declare it required.
+ */
 export interface SodiumLike {
-  crypto_generichash(outLen: number, data: Uint8Array, key?: Uint8Array | null): Uint8Array;
+  crypto_generichash(outLen: number, data: Uint8Array, key: Uint8Array | null): Uint8Array;
   randombytes_buf(length: number): Uint8Array;
   crypto_sign_seed_keypair(seed: Uint8Array): { publicKey: Uint8Array; privateKey: Uint8Array };
   crypto_sign_detached(message: Uint8Array, secretKey: Uint8Array): Uint8Array;
@@ -72,17 +77,24 @@ function checkAndBuild(sodium: SodiumLike): { backend: CryptoBackend; report: So
   const key32 = Uint8Array.from({ length: 32 }, (_, i) => (255 - i * 7) & 0xff);
   const aad = Uint8Array.from([0, 1, 2, 250, 251, 252]);
 
-  /** A required function: present and agreeing with the portable implementation, or the binding is refused. */
-  const required = (name: string, check: () => boolean): void => {
+  /**
+   * A required function: present and agreeing with the portable implementation, or the binding is
+   * refused. The two failures are named apart, since they mean different things to whoever reads
+   * the error: a missing function is a binding that never installed (its JSI functions absent, or
+   * a default import that lacks one), a disagreeing one is a broken or incompatible build.
+   */
+  const required = (name: string, present: boolean, check: () => boolean): void => {
+    if (!present) throw new KavachError("INVALID_KEY", stage, `${name} is missing from the binding; the binding cannot be used`);
     let ok = false;
     try {
       ok = check();
     } catch {
       ok = false;
     }
-    if (!ok) throw new KavachError("INVALID_KEY", stage, `${name} is missing or disagrees with the portable implementation; the binding cannot be used`);
+    if (!ok) throw new KavachError("INVALID_KEY", stage, `${name} disagrees with the portable implementation; the binding cannot be used`);
     native.push(name);
   };
+  const fn = (f: unknown): boolean => typeof f === "function";
   /** An optional function: used when present and agreeing on the protocol's input types, portable otherwise. */
   const optional = (name: string, present: boolean, check: () => boolean): boolean => {
     let ok = false;
@@ -98,27 +110,27 @@ function checkAndBuild(sodium: SodiumLike): { backend: CryptoBackend; report: So
   };
 
   const nSign = n.signKeypairFromSeed(seed);
-  required("signKeypairFromSeed", () => {
+  required("signKeypairFromSeed", fn(sodium.crypto_sign_seed_keypair), () => {
     const kp = sodium.crypto_sign_seed_keypair(seed);
     return same(kp.publicKey, nSign.publicKey) && same(kp.privateKey, nSign.secretKey);
   });
-  required("signDetached", () => same(sodium.crypto_sign_detached(message, nSign.secretKey), n.signDetached(message, nSign.secretKey)));
-  required("verifyDetached", () => sodium.crypto_sign_verify_detached(n.signDetached(message, nSign.secretKey), message, nSign.publicKey) === true && sodium.crypto_sign_verify_detached(n.signDetached(message, nSign.secretKey), nonce24, nSign.publicKey) === false);
-  required("blake2b", () => same(sodium.crypto_generichash(32, message, null), n.blake2b(message, 32)) && same(sodium.crypto_generichash(64, message, key32), n.blake2b(message, 64, key32)));
+  required("signDetached", fn(sodium.crypto_sign_detached), () => same(sodium.crypto_sign_detached(message, nSign.secretKey), n.signDetached(message, nSign.secretKey)));
+  required("verifyDetached", fn(sodium.crypto_sign_verify_detached), () => sodium.crypto_sign_verify_detached(n.signDetached(message, nSign.secretKey), message, nSign.publicKey) === true && sodium.crypto_sign_verify_detached(n.signDetached(message, nSign.secretKey), nonce24, nSign.publicKey) === false);
+  required("blake2b", fn(sodium.crypto_generichash), () => same(sodium.crypto_generichash(32, message, null), n.blake2b(message, 32)) && same(sodium.crypto_generichash(64, message, key32), n.blake2b(message, 64, key32)));
   const nBox = n.boxKeypairFromSeed(seed);
-  required("boxKeypairFromSeed", () => {
+  required("boxKeypairFromSeed", fn(sodium.crypto_box_seed_keypair), () => {
     const kp = sodium.crypto_box_seed_keypair(seed);
     return same(kp.publicKey, nBox.publicKey) && same(kp.privateKey, nBox.secretKey);
   });
-  required("boxKeypair", () => {
+  required("boxKeypair", fn(sodium.crypto_box_keypair), () => {
     // A fresh keypair cannot be compared with a known one; its public key must be the one its secret derives.
     const kp = sodium.crypto_box_keypair();
     return kp.publicKey.length === 32 && kp.privateKey.length === 32 && same(kp.publicKey, n.scalarMult(kp.privateKey, X25519_BASE));
   });
   const other = n.boxKeypairFromSeed(key32);
-  required("boxEasy", () => same(sodium.crypto_box_easy(message, nonce24, other.publicKey, nBox.secretKey), n.boxEasy(message, nonce24, other.publicKey, nBox.secretKey)));
-  required("boxOpenEasy", () => same(sodium.crypto_box_open_easy(n.boxEasy(message, nonce24, other.publicKey, nBox.secretKey), nonce24, nBox.publicKey, other.secretKey), message));
-  required("randomBytes", () => sodium.randombytes_buf(16).length === 16);
+  required("boxEasy", fn(sodium.crypto_box_easy), () => same(sodium.crypto_box_easy(message, nonce24, other.publicKey, nBox.secretKey), n.boxEasy(message, nonce24, other.publicKey, nBox.secretKey)));
+  required("boxOpenEasy", fn(sodium.crypto_box_open_easy), () => same(sodium.crypto_box_open_easy(n.boxEasy(message, nonce24, other.publicKey, nBox.secretKey), nonce24, nBox.publicKey, other.secretKey), message));
+  required("randomBytes", fn(sodium.randombytes_buf), () => sodium.randombytes_buf(16).length === 16);
   const scalarMultNative = optional("scalarMult", typeof sodium.crypto_scalarmult === "function", () => same(sodium.crypto_scalarmult?.(nBox.secretKey, other.publicKey) ?? new Uint8Array(), n.scalarMult(nBox.secretKey, other.publicKey)));
   const aeadNative = optional("aead", typeof sodium.crypto_aead_xchacha20poly1305_ietf_encrypt === "function" && typeof sodium.crypto_aead_xchacha20poly1305_ietf_decrypt === "function", () => {
     // The protocol's associated data is binary; a binding that takes only strings throws here and falls back.

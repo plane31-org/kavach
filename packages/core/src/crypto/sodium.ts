@@ -4,7 +4,7 @@
  */
 import { createRequire } from "node:module";
 import type { CryptoBackend } from "./backend.js";
-import { sodiumBackend, type SodiumLike } from "./sodiumLike.js";
+import { sodiumBackend } from "./sodiumLike.js";
 
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
@@ -19,6 +19,5 @@ export async function loadSodiumBackend(): Promise<CryptoBackend> {
   const mod = require("libsodium-wrappers-sumo") as { default?: Sodium } & Sodium;
   const sodium: Sodium = mod.default ?? mod;
   await sodium.ready;
-  // The typed wrapper's overloads (output formats) do not match the structural interface; the calls made are the Uint8Array ones.
-  return sodiumBackend(sodium as unknown as SodiumLike);
+  return sodiumBackend(sodium);
 }

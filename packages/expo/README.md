@@ -74,14 +74,26 @@ Foreground and background tasks write concurrently without a shared counter and 
 
 `@plane31/blind-relay` runs on the portable backend (the noble libraries, pure JavaScript) unless told otherwise. Both backends pass the same vectors, so the choice changes nothing on the wire, only the time a signature, a verification or an epoch's sealed boxes take: Ed25519 and X25519 in pure JavaScript cost milliseconds each on a phone, and a rotation in a large circle seals one box per member.
 
-**On a device, pass a native libsodium binding.** Install `react-native-libsodium` (libsodium over JSI) and hand it to `openKavach` as `crypto`; the helper awaits its `ready` and installs the backend process-wide before the client opens. An app wiring the adapters by hand calls `installNativeCrypto(sodium)` first; it returns which operations run on the binding and which stayed portable. Import the binding as a namespace: its default export lacks `crypto_sign_seed_keypair`, and the backend refuses a binding without it.
+**On a device, pass a native libsodium binding.** Install `react-native-libsodium` (libsodium over JSI) and hand it to `openKavach` as `crypto`; the helper awaits its `ready` and installs the backend process-wide before the client opens. An app wiring the adapters by hand calls `installNativeCrypto(sodium)` first; it returns which operations run on the binding and which stayed portable. Import the binding as a namespace: its default export lacks `crypto_sign_seed_keypair`, and the backend refuses a binding without it. The namespace is assignable to `crypto` as the binding types it, with no cast.
 
 ```ts
 import * as sodium from "react-native-libsodium";
 const setup = await openKavach({ ..., getRandomValues: Crypto.getRandomValues, crypto: sodium });
+console.log(setup.cryptoBackend); // { kind: "native", report: { native: [...], portable: [...] } } or { kind: "portable", reason?: string }
 ```
 
-Each function the binding provides is checked once, at install, against the portable implementation on known inputs. What the binding lacks, or cannot do on the protocol's inputs, stays portable with the same rule; a binding that answers differently is refused with `INVALID_KEY`, never used. With react-native-libsodium 1.7 the signatures, the boxes and the hash run native, which is where the time goes; the AEAD stays portable because that binding accepts only string associated data while the protocol's is binary, and the X25519 agreement, the validity check and `memzero` stay portable because the binding does not expose them. Nothing on the wire depends on the split. Without `crypto`, the portable backend stays.
+Each function the binding provides is checked once, at install, against the portable implementation on known inputs. What the binding lacks, or cannot do on the protocol's inputs, stays portable with the same rule. A binding that cannot be used at all, because a required function is missing (its native side never installed), because one disagrees with the portable implementation, or because `ready` rejected, is never used: by default the client opens on the portable backend, which is the reference the binding is checked against and reads and writes the same bytes, and `setup.cryptoBackend` carries the reason, so a performance option never keeps the app from opening. Pass `cryptoFallback: "refuse"` to make it fatal instead (`openKavach` throws the `INVALID_KEY`). Log `cryptoBackend` once in a release build to know what it runs. Nothing on the wire depends on the split. Without `crypto`, the portable backend stays.
+
+With react-native-libsodium 1.7 the signatures, the boxes and the hash run native, which is where the time goes; the AEAD stays portable because that binding accepts only string associated data while the protocol's is binary, and the X25519 agreement, the validity check and `memzero` stay portable because the binding does not expose them at run time (its type declarations list them).
+
+**Tested where.** The SDK's own tests run the backend on Node over `libsodium-wrappers-sumo` 0.7.16, with the binding's shape (which functions are absent, string-only associated data) reproduced in a test double; the self-check at install is what makes a real binding safe to use. On devices the first product reported react-native-libsodium 1.7.0 on Expo SDK 58 and React Native 0.88: Android works as installed; iOS does not build, because `ios/Libsodium.mm` casts the bridge to `RCTCxxBridge`, which 0.88 removed, and a naive fix compiles but never installs the JSI functions under bridgeless mode (the `bridge` is an `RCTBridgeProxy`, an `NSProxy`, so `respondsToSelector:` answers NO for `runtime`; checking with `class_respondsToSelector(object_getClass(bridge), @selector(runtime))` works). Until the binding ships a TurboModule fix, patch it (`patch-package`) and keep the default fallback, which turns a binding that failed to install into a slower app rather than one that does not open. Report the versions you run to the SDK's issue tracker so this list stays current.
+
+**pnpm 10 skips the binding's postinstall**, which unpacks its prebuilt libraries (the iOS podspec unpacks on its own; the gap is Android). In a pnpm workspace, allow it in `pnpm-workspace.yaml`:
+
+```yaml
+onlyBuiltDependencies:
+  - react-native-libsodium
+```
 
 On Node, `import { loadSodiumBackend } from "@plane31/blind-relay/sodium"` and `setCryptoBackend(await loadSodiumBackend())` before `open()` selects the wasm build of libsodium.
 

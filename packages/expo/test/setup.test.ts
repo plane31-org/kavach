@@ -105,10 +105,13 @@ describe("openKavach", () => {
     const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));
     const keys = new Map<string, string>();
     // Through its CommonJS build, as the core's Node entry does (the ESM build has shipped broken).
-    const mod = createRequire(import.meta.url)("libsodium-wrappers-sumo") as { default?: SodiumLike & { ready: Promise<void> } } & SodiumLike & { ready: Promise<void> };
-    const sodium = mod.default ?? mod;
+    type Lib = typeof import("libsodium-wrappers-sumo");
+    const mod = createRequire(import.meta.url)("libsodium-wrappers-sumo") as { default?: Lib } & Lib;
+    const sodium: SodiumLike & { ready: Promise<void> } = mod.default ?? mod; // assignable without a cast
     const alice = await openKavach({ accountName: "alice", transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, secrets: new MemorySecretStore(), database: cipherLike(dir, keys), context: "foreground", now: w.clock.now, crypto: sodium });
     expect(backendName()).toBe("sodium");
+    expect(alice.cryptoBackend.kind).toBe("native");
+    if (alice.cryptoBackend.kind === "native") expect(alice.cryptoBackend.report.native).toContain("signDetached");
     await alice.client.initializeAccount();
     const { circleId } = await alice.client.circles.create();
     expect(circleId.length).toBe(16);
@@ -116,6 +119,39 @@ describe("openKavach", () => {
     await alice.close();
     setCryptoBackend(nobleBackend); // the rest of the suite runs on the portable backend
     expect(backendName()).toBe("noble");
+  });
+
+  it("opens on the portable backend when the binding cannot be used, naming the reason, and refuses only when asked", async () => {
+    const w = world();
+    const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));
+    const keys = new Map<string, string>();
+    type Lib = typeof import("libsodium-wrappers-sumo");
+    const mod = createRequire(import.meta.url)("libsodium-wrappers-sumo") as { default?: Lib } & Lib;
+    const lib = mod.default ?? mod;
+    // A binding whose native side never installed: its JSI functions are absent.
+    const uninstalled = { ...lib, crypto_sign_detached: undefined } as unknown as SodiumLike;
+    const common = { transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, database: cipherLike(dir, keys), context: "foreground" as const, now: w.clock.now };
+    const alice = await openKavach({ ...common, accountName: "alice", secrets: new MemorySecretStore(), crypto: uninstalled });
+    expect(alice.cryptoBackend).toEqual({ kind: "portable", reason: expect.stringMatching(/signDetached is missing/) });
+    expect(backendName()).toBe("noble");
+    await alice.client.initializeAccount();
+    expect((await alice.client.sync()).errors).toEqual([]);
+    await alice.close();
+    // A binding that disagrees is named as such; `refuse` makes it fatal.
+    const wrong = { ...lib, crypto_sign_detached: (m: Uint8Array, sk: Uint8Array) => lib.crypto_sign_detached(m, sk).map((b) => b ^ 1) } as unknown as SodiumLike;
+    const bob = await openKavach({ ...common, accountName: "bob", transport: w.transport("bob"), secrets: new MemorySecretStore(), crypto: wrong });
+    expect(bob.cryptoBackend).toEqual({ kind: "portable", reason: expect.stringMatching(/signDetached disagrees/) });
+    await bob.close();
+    await expect(openKavach({ ...common, accountName: "carol", transport: w.transport("carol"), secrets: new MemorySecretStore(), crypto: wrong, cryptoFallback: "refuse" })).rejects.toMatchObject({ code: "INVALID_KEY" });
+    // A rejected `ready` is a refused binding too.
+    const broken = Object.assign({ ...lib }, { ready: Promise.reject(new Error("no native module")) }) as unknown as SodiumLike & { ready: Promise<void> };
+    const dave = await openKavach({ ...common, accountName: "dave", transport: w.transport("dave"), secrets: new MemorySecretStore(), crypto: broken });
+    expect(dave.cryptoBackend).toEqual({ kind: "portable", reason: "no native module" });
+    await dave.close();
+    // Without a binding, portable and no reason.
+    const erin = await openKavach({ ...common, accountName: "erin", transport: w.transport("erin"), secrets: new MemorySecretStore() });
+    expect(erin.cryptoBackend).toEqual({ kind: "portable" });
+    await erin.close();
   });
 
   it("takes no recovery provider on a recovery-only profile, and requires one where identity continuity is enabled", async () => {

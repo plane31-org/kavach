@@ -128,6 +128,8 @@ export type ClientEvent =
   | { kind: "circleChanged"; circleId: Uint8Array; revision: bigint; status: CircleState["status"] }
   | { kind: "accountKeyChanged"; accountName: string; quarantined: boolean }
   | { kind: "securityError"; code: string; detail: string }
+  /** An authenticated record of a kind this build does not declare was skipped: the author runs a newer app. Suggest an update; not a security event. */
+  | { kind: "unknownKind"; recordKind: RecordKind; authorIdentityId: Uint8Array }
   | { kind: "stateChanged"; state: ClientState };
 
 export interface OpenOptions {
@@ -299,8 +301,8 @@ export interface SyncReport {
   metadata: { certificates: number; snapshots: number; rotations: number; quarantined: number; resets: number; successions: number };
   epoch: "unchanged" | "prepared" | "paused" | "pending";
   outbox: { sent: number; accepted: number; cancelled: number; unknown: number; retry: number };
-  /** `hasMore`: a stream still has records on the relay that this sync's budget did not reach; sync again soon. */
-  inbox: { streams: number; stored: number; keyPending: number; invalid: number; acked: number; hasMore: boolean };
+  /** `hasMore`: a stream still has records on the relay that this sync's budget did not reach; sync again soon. `unknownKind`: authenticated records of undeclared kinds, skipped. */
+  inbox: { streams: number; stored: number; keyPending: number; invalid: number; unknownKind: number; acked: number; hasMore: boolean };
   purged: number;
   /** Whether this sync did its housekeeping (purge, list re-check, key re-save) or left it to a later one. */
   maintenance: "done" | "skipped";
@@ -587,6 +589,7 @@ class ClientImpl implements Client {
           if (r.result === "updated" || r.result === "history") this.emit({ kind: "recordStored", recordKind: r.kind, authorIdentityId: r.authorIdentityId, recordId: r.recordId, tookSlot: r.result === "updated" && (kindOf(this.policy, r.kind)?.newest ?? false) });
         },
         waiting: (identityId: Uint8Array) => this.emit({ kind: "waiting", identityId }),
+        unknownKind: (recordKind: RecordKind, authorIdentityId: Uint8Array) => this.emit({ kind: "unknownKind", recordKind, authorIdentityId }),
         securityError: (code: string, detail: string) => this.emit({ kind: "securityError", code, detail })
       }
     };
@@ -1026,7 +1029,7 @@ class ClientImpl implements Client {
       metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 },
       epoch: "unchanged",
       outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 },
-      inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false },
+      inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, acked: 0, hasMore: false },
       purged: 0,
       maintenance: options.skipMaintenance ? "skipped" : "done",
       timings: emptyTimings(),
@@ -1066,6 +1069,7 @@ class ClientImpl implements Client {
       merged.inbox.stored += r.inbox.stored;
       merged.inbox.keyPending += r.inbox.keyPending;
       merged.inbox.invalid += r.inbox.invalid;
+      merged.inbox.unknownKind += r.inbox.unknownKind;
       merged.inbox.acked += r.inbox.acked;
       merged.purged += r.purged;
       for (const k of Object.keys(merged.timings) as (keyof SyncTimings)[]) merged.timings[k] += r.timings[k];
@@ -1128,7 +1132,7 @@ class ClientImpl implements Client {
       metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 },
       epoch: "unchanged",
       outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 },
-      inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false },
+      inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, acked: 0, hasMore: false },
       purged: 0,
       maintenance: options.skipMaintenance ? "skipped" : "done",
       timings: emptyTimings(),
@@ -1258,6 +1262,7 @@ class ClientImpl implements Client {
         report.inbox.stored += r.stored;
         report.inbox.keyPending += r.keyPending;
         report.inbox.invalid += r.invalid;
+        report.inbox.unknownKind += r.unknownKind;
         report.timings.bytesReceived += r.bytes;
         if (r.failure !== undefined) {
           report.errors.push({ ...syncError("inbox", r.failure), streamId: s.streamId, authorIdentityId: s.authorIdentityId });
@@ -1995,7 +2000,7 @@ class ClientImpl implements Client {
   private async approve(circleId: Uint8Array, accountName: string): Promise<{ revision: bigint }> {
     const [resolved] = await this.transport.directory.resolveAccounts([accountName]);
     if (!resolved) throw new KavachError("METADATA_REQUIRED", "approve", "unknown account");
-    const report: SyncReport = { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, acked: 0, hasMore: false }, purged: 0, maintenance: "done", timings: emptyTimings(), errors: [] };
+    const report: SyncReport = { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, acked: 0, hasMore: false }, purged: 0, maintenance: "done", timings: emptyTimings(), errors: [] };
     await this.acceptMemberCertificate(resolved, report);
     const requester = resolvedAccountId(resolved);
     const pinned = await this.pinFor(requester);

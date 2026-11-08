@@ -17,8 +17,9 @@ let full: SodiumLike;
 let partial: SodiumLike;
 
 beforeAll(async () => {
-  const mod = require("libsodium-wrappers-sumo") as { default?: SodiumLike & { ready: Promise<void> } } & SodiumLike & { ready: Promise<void> };
-  const sodium = mod.default ?? mod;
+  type Lib = typeof import("libsodium-wrappers-sumo");
+  const mod = require("libsodium-wrappers-sumo") as { default?: Lib } & Lib;
+  const sodium: SodiumLike & { ready: Promise<void> } = mod.default ?? mod; // the typed wrapper is assignable as is, no cast
   await sodium.ready;
   full = sodium;
   // A binding without the sumo-only validity check, as react-native-libsodium may be.
@@ -100,8 +101,9 @@ describe("buildSodiumBackend against a native-shaped binding", () => {
   it("a binding that answers differently on the same input is refused, never used", () => {
     const wrong: SodiumLike = { ...full, crypto_sign_detached: (m, sk) => full.crypto_sign_detached(m, sk).map((b) => b ^ 1) };
     expect(() => sodiumBackend(wrong)).toThrow(KavachError);
+    expect(() => sodiumBackend(wrong)).toThrow(/signDetached disagrees/);
     const missing = { ...full, crypto_sign_seed_keypair: undefined } as unknown as SodiumLike; // a default import of react-native-libsodium
-    expect(() => sodiumBackend(missing)).toThrow(/signKeypairFromSeed/);
+    expect(() => sodiumBackend(missing)).toThrow(/signKeypairFromSeed is missing/);
   });
 });
 

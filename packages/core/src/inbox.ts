@@ -26,12 +26,16 @@ export type ReceiveResult =
   | { readonly result: "duplicate"; readonly recordId: Uint8Array }
   | { readonly result: "keyPending"; readonly streamId: Uint8Array; readonly epoch: number }
   | { readonly result: "expired"; readonly reason: "window" | "CLOCK_SKEW" }
+  /** Authenticated and opened, but of a kind this reader's policy does not declare: a newer app version is sending it. Not stored, not an alarm. */
+  | { readonly result: "unknownKind"; readonly recordId: Uint8Array; readonly authorIdentityId: Uint8Array; readonly kind: RecordKind }
   | { readonly result: "invalid"; readonly reason: string };
 
 export interface InboxEvents {
   received?(r: ReceiveResult): void;
   /** The author's current epoch has no key for this device yet: show the person as waiting. */
   waiting?(authorIdentityId: Uint8Array): void;
+  /** An authenticated record of an undeclared kind was skipped: the app may suggest an update. */
+  unknownKind?(kind: RecordKind, authorIdentityId: Uint8Array): void;
   securityError?(code: string, detail: string): void;
 }
 
@@ -124,7 +128,10 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   const kind = opened.kind;
   const base = { recordId: opened.recordId, authorIdentityId: author.identityId, kind };
   const declared = kindOf(deps.policy, kind);
-  if (!declared) return { result: "invalid", reason: "BAD_PAYLOAD" }; // a kind this product did not declare
+  // The record authenticated and opened, so it is an authorized author's; an undeclared kind means
+  // the sender's app is newer than this one, not a forgery. Skipped and counted, never an alarm;
+  // the cursor passes it like any record this reader will not store.
+  if (!declared) return { result: "unknownKind", ...base };
   const authorHex = toHex(author.identityId);
   const fromCurrentDevice = !opened.superseded && !!cert?.current;
   const candidate = { generation, eventTime: clampEventTime(opened.eventTime, parsed.sentAt), epoch: parsed.epoch, counter: parsed.counter, recordId: id, bodyHash: hash, sentAt: parsed.sentAt, receivedAt: now, payload: opened.payload };
@@ -175,6 +182,7 @@ export async function receive(deps: InboxDeps, wire: Uint8Array): Promise<Receiv
     r = await deps.store.transaction((tx) => storeRecord(tx, deps, wire, now));
   }
   if (r.result === "invalid" && r.reason === "EQUIVOCATION") deps.events?.securityError?.("EQUIVOCATION", "a different valid body for a retained record id");
+  if (r.result === "unknownKind") deps.events?.unknownKind?.(r.kind, r.authorIdentityId);
   deps.events?.received?.(r);
   return r;
 }
@@ -187,6 +195,8 @@ export interface StreamSyncSummary {
   duplicate: number;
   keyPending: number;
   invalid: number;
+  /** Authenticated records of kinds this reader does not declare, skipped. */
+  unknownKind: number;
   expired: number;
   acked: bigint | undefined;
   /** The relay holds more records past the last page read; the budget stopped the catch-up. */
@@ -240,7 +250,7 @@ export interface ReadBudget {
  * records past the last page when the budget stopped the loop.
  */
 export async function syncStream(deps: InboxDeps, streamId: Uint8Array, authorIdentityId: Uint8Array, budget: ReadBudget = { remainingRecords: READ_BATCH, deadline: deps.now() }): Promise<StreamSyncSummary> {
-  const summary: StreamSyncSummary = { read: 0, stored: 0, duplicate: 0, keyPending: 0, invalid: 0, expired: 0, acked: undefined, hasMore: false, bytes: 0 };
+  const summary: StreamSyncSummary = { read: 0, stored: 0, duplicate: 0, keyPending: 0, invalid: 0, unknownKind: 0, expired: 0, acked: undefined, hasMore: false, bytes: 0 };
   const sub = await deps.store.read((tx) => subscription(tx, streamId, authorIdentityId));
   const unresolved = await deps.store.read((tx) => tx.list("unresolved", toHex(streamId) + ":"));
   let from = unresolved.length > 0 ? unbig(sub.ackPrefix) : unbig(sub.scanPos);
@@ -314,6 +324,9 @@ async function processPage(deps: InboxDeps, streamId: Uint8Array, authorIdentity
       // the host's or the author's doing: it is named to the app and never stored.
       summary.invalid++;
       deps.events?.securityError?.(r.reason, `record at sequence ${item.deliverySeq} refused`);
+    } else if (r.result === "unknownKind") {
+      summary.unknownKind++;
+      deps.events?.unknownKind?.(r.kind, r.authorIdentityId);
     } else if (r.result === "expired") summary.expired++;
     else if (r.result === "duplicate") summary.duplicate++;
     else summary.stored++;

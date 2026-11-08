@@ -5,7 +5,7 @@
  * adapters stay exported for apps that need a different arrangement.
  */
 import { KavachError, open, setCryptoBackend, type Client, type ClientEvent, type RecoveryProvider, type ResetTrustConfig, type RetentionPolicy } from "@plane31/blind-relay";
-import { SECRET_NAMES, buildSodiumBackend, randomBytes, type SecretStore, type SodiumBackendReport, type SodiumLike, type Transport } from "@plane31/blind-relay/adapters";
+import { SECRET_NAMES, buildSodiumBackend, nobleBackend, randomBytes, type SecretStore, type SodiumBackendReport, type SodiumLike, type Transport } from "@plane31/blind-relay/adapters";
 import { ExpoSecretStore, type SecureStoreLike } from "./secretStore.js";
 import { SqliteStore, expoSqliteDriver, type ExpoSqliteDatabaseLike, type SqlDriver } from "./sqliteStore.js";
 
@@ -56,10 +56,27 @@ export interface KavachSetupOptions {
    * of the portable pure-JavaScript backend: Ed25519 signatures and X25519 boxes are many times
    * faster, which is what a record and an epoch's sealed boxes cost. Awaited (`ready`) and
    * installed process-wide before the client opens; absent, the portable backend stays. See
-   * `installNativeCrypto` for what stays portable on a given binding.
+   * `installNativeCrypto` for what stays portable on a given binding, and `cryptoFallback` for a
+   * binding that cannot be used.
    */
   readonly crypto?: SodiumLike & { readonly ready?: Promise<unknown> };
+  /**
+   * What happens when `crypto` cannot be used (a function missing because the binding's native
+   * side never installed, one that disagrees with the portable implementation, or `ready`
+   * rejecting). `portable`, the default: the client opens on the portable backend, which is the
+   * reference the binding is checked against and reads and writes the same bytes, and
+   * `KavachSetup.cryptoBackend` names the reason, so a performance option never keeps the app
+   * from opening. `refuse`: `openKavach` throws the `INVALID_KEY` (or the rejection) instead.
+   */
+  readonly cryptoFallback?: "portable" | "refuse";
 }
+
+/**
+ * Which cipher-suite backend the client opened on. `native` carries the per-function split;
+ * `portable` carries a `reason` when a binding was given and could not be used, and none when
+ * no `crypto` was passed. A release build logs this once to know what it runs.
+ */
+export type CryptoBackendStatus = { readonly kind: "native"; readonly report: SodiumBackendReport } | { readonly kind: "portable"; readonly reason?: string };
 
 export type GetRandomValues = <T extends ArrayBufferView>(array: T) => T;
 
@@ -82,6 +99,8 @@ export interface KavachSetup {
   readonly databaseFileName: string;
   /** Close the client (operations in flight finish, nothing is emitted afterwards), then the database connection this call opened. Idempotent. */
   close(): Promise<void>;
+  /** The cipher-suite backend in use: native with its split, or portable, with the reason when a binding was refused. */
+  readonly cryptoBackend: CryptoBackendStatus;
 }
 
 export interface KavachEraseOptions {
@@ -149,9 +168,25 @@ export async function installNativeCrypto(sodium: SodiumLike & { readonly ready?
   return report;
 }
 
+/**
+ * `openKavach`'s use of `installNativeCrypto`: the status the setup reports, and the fallback.
+ * On a refused binding the portable backend is installed explicitly, so the status is what the
+ * process runs on, whatever an earlier call installed.
+ */
+async function selectCryptoBackend(options: Pick<KavachSetupOptions, "crypto" | "cryptoFallback">): Promise<CryptoBackendStatus> {
+  if (!options.crypto) return { kind: "portable" };
+  try {
+    return { kind: "native", report: await installNativeCrypto(options.crypto) };
+  } catch (e) {
+    if (options.cryptoFallback === "refuse") throw e;
+    setCryptoBackend(nobleBackend);
+    return { kind: "portable", reason: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export async function openKavach(options: KavachSetupOptions): Promise<KavachSetup> {
   installWebCrypto(options.getRandomValues);
-  if (options.crypto) await installNativeCrypto(options.crypto);
+  const cryptoBackend = await selectCryptoBackend(options);
   const namespace = options.namespace ?? "kavach";
   const fileName = databaseFileName(options.accountName, namespace);
   const secretStore =
@@ -180,7 +215,7 @@ export async function openKavach(options: KavachSetupOptions): Promise<KavachSet
     })();
     return closed;
   };
-  return { client, store, secretStore, databaseFileName: fileName, close };
+  return { client, store, secretStore, databaseFileName: fileName, close, cryptoBackend };
 }
 
 /**

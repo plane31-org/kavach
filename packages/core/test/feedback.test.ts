@@ -512,7 +512,7 @@ describe("feedback findings", () => {
     w.clock.advance(3_600_000n);
     await w.sync(b);
     expect((await b.client.history({ authorIdentityId: aliceId })).length).toBe(0);
-    // A kind the product did not declare: refused at enqueue, and invalid on a reader that lacks it.
+    // A kind the product did not declare: refused at enqueue; on a reader that lacks it, skipped and counted, no alarm (a newer sender, not a forgery).
     const narrow = { ...policy, kinds: policy.kinds.filter((k) => k.kind !== 2) };
     const c = await w.device("carol", undefined, undefined, undefined, narrow);
     await c.client.initializeAccount();
@@ -529,8 +529,12 @@ describe("feedback findings", () => {
     await enqueueStatus(a.client, Uint8Array.of(7));
     await w.sync(a);
     const rd = await w.sync(d);
-    expect([rd.inbox.stored, rd.inbox.invalid]).toEqual([0, 1]);
-    expect(d.events.some((e) => e.kind === "securityError" && e.code === "BAD_PAYLOAD")).toBe(true);
+    expect([rd.inbox.stored, rd.inbox.invalid, rd.inbox.unknownKind]).toEqual([0, 0, 1]);
+    expect(d.events.some((e) => e.kind === "securityError")).toBe(false);
+    expect(d.events.some((e) => e.kind === "unknownKind" && e.recordKind === 2 && toHex(e.authorIdentityId) === toHex(aliceId))).toBe(true);
+    // The cursor passed it: a second sync reads nothing more.
+    const again = await w.sync(d);
+    expect([again.inbox.stored, again.inbox.unknownKind, again.inbox.hasMore]).toEqual([0, 0, false]);
   });
 
   it("24: the envelope carries the kind and the event time, the slot orders by it, and the host sees only the declared header class", async () => {
