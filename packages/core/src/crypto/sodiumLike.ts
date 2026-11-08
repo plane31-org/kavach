@@ -41,13 +41,26 @@ export interface SodiumBackendReport {
 }
 
 const same = (a: Uint8Array, b: Uint8Array): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
+/** The X25519 base point, for deriving a public key from a secret scalar on the portable implementation. */
+const X25519_BASE = Uint8Array.from([9, ...new Array<number>(31).fill(0)]);
 
 /** Build the backend; see the module comment for how each function is checked. */
 export function sodiumBackend(sodium: SodiumLike): CryptoBackend {
   return buildSodiumBackend(sodium).backend;
 }
 
+/** One build per binding object: the checks run once in a JavaScript context, however often the same binding is installed. */
+const built = new WeakMap<SodiumLike, { backend: CryptoBackend; report: SodiumBackendReport }>();
+
 export function buildSodiumBackend(sodium: SodiumLike): { backend: CryptoBackend; report: SodiumBackendReport } {
+  const cached = built.get(sodium);
+  if (cached) return cached;
+  const result = checkAndBuild(sodium);
+  built.set(sodium, result);
+  return result;
+}
+
+function checkAndBuild(sodium: SodiumLike): { backend: CryptoBackend; report: SodiumBackendReport } {
   const stage = "sodiumBackend";
   const native: string[] = [];
   const portable: string[] = [];
@@ -98,8 +111,9 @@ export function buildSodiumBackend(sodium: SodiumLike): { backend: CryptoBackend
     return same(kp.publicKey, nBox.publicKey) && same(kp.privateKey, nBox.secretKey);
   });
   required("boxKeypair", () => {
+    // A fresh keypair cannot be compared with a known one; its public key must be the one its secret derives.
     const kp = sodium.crypto_box_keypair();
-    return kp.publicKey.length === 32 && kp.privateKey.length === 32 && same(n.boxKeypairFromSeed(kp.privateKey).publicKey.length === 32 ? sodium.crypto_scalarmult?.(kp.privateKey, nBox.publicKey) ?? n.scalarMult(kp.privateKey, nBox.publicKey) : new Uint8Array(), n.scalarMult(kp.privateKey, nBox.publicKey));
+    return kp.publicKey.length === 32 && kp.privateKey.length === 32 && same(kp.publicKey, n.scalarMult(kp.privateKey, X25519_BASE));
   });
   const other = n.boxKeypairFromSeed(key32);
   required("boxEasy", () => same(sodium.crypto_box_easy(message, nonce24, other.publicKey, nBox.secretKey), n.boxEasy(message, nonce24, other.publicKey, nBox.secretKey)));

@@ -74,6 +74,29 @@ describe("buildSodiumBackend against a native-shaped binding", () => {
     expect(buildSodiumBackend(full).report.portable).toEqual([]);
   });
 
+  it("a generated keypair whose public key is not its secret's is refused; a scalarmult that throws falls back; one build per binding", () => {
+    const mismatched: SodiumLike = {
+      ...full,
+      crypto_box_keypair: () => {
+        const kp = full.crypto_box_keypair();
+        return { publicKey: full.crypto_box_keypair().publicKey, privateKey: kp.privateKey };
+      }
+    };
+    expect(() => sodiumBackend(mismatched)).toThrow(/boxKeypair/);
+    const throwing: SodiumLike = {
+      ...full,
+      crypto_scalarmult: () => {
+        throw new Error("not implemented");
+      }
+    };
+    const { backend, report } = buildSodiumBackend(throwing);
+    expect(report.portable).toEqual(["scalarMult"]);
+    const a = backend.boxKeypairFromSeed(new Uint8Array(32).fill(1));
+    const b = backend.boxKeypairFromSeed(new Uint8Array(32).fill(2));
+    expect(toHex(backend.scalarMult(a.secretKey, b.publicKey))).toBe(toHex(nobleBackend.scalarMult(a.secretKey, b.publicKey)));
+    expect(buildSodiumBackend(throwing)).toBe(buildSodiumBackend(throwing)); // cached: the checks ran once
+  });
+
   it("a binding that answers differently on the same input is refused, never used", () => {
     const wrong: SodiumLike = { ...full, crypto_sign_detached: (m, sk) => full.crypto_sign_detached(m, sk).map((b) => b ^ 1) };
     expect(() => sodiumBackend(wrong)).toThrow(KavachError);
