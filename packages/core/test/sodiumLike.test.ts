@@ -8,7 +8,8 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { toHex } from "../src/bytes.js";
 import { C } from "../src/crypto.js";
 import { nobleBackend } from "../src/crypto/noble.js";
-import { sodiumBackend, type SodiumLike } from "../src/crypto/sodiumLike.js";
+import { buildSodiumBackend, sodiumBackend, type SodiumLike } from "../src/crypto/sodiumLike.js";
+import { KavachError } from "../src/errors.js";
 import { fixture, hex } from "./fixture.js";
 
 const require = createRequire(import.meta.url);
@@ -24,6 +25,61 @@ beforeAll(async () => {
   const { crypto_core_ed25519_is_valid_point: _omitted, ...rest } = sodium;
   void _omitted;
   partial = rest as SodiumLike;
+});
+
+/** react-native-libsodium 1.7, as its native source shapes it: no scalarmult, memzero or validity check; AEAD on string AAD only. */
+function nativeShaped(sodium: SodiumLike): SodiumLike {
+  const { crypto_core_ed25519_is_valid_point: _a, crypto_scalarmult: _b, memzero: _c, ...rest } = sodium;
+  void _a;
+  void _b;
+  void _c;
+  const stringOnly = (aad: unknown): void => {
+    if (typeof aad !== "string") throw new Error("crypto_aead_xchacha20poly1305_ietf_encrypt: input type not yet implemented");
+  };
+  return {
+    ...rest,
+    crypto_aead_xchacha20poly1305_ietf_encrypt: (m, aad, sn, nonce, key) => {
+      stringOnly(aad);
+      return sodium.crypto_aead_xchacha20poly1305_ietf_encrypt?.(m, aad, sn, nonce, key) ?? new Uint8Array();
+    },
+    crypto_aead_xchacha20poly1305_ietf_decrypt: (sn, c, aad, nonce, key) => {
+      stringOnly(aad);
+      return sodium.crypto_aead_xchacha20poly1305_ietf_decrypt?.(sn, c, aad, nonce, key) ?? new Uint8Array();
+    }
+  };
+}
+
+describe("buildSodiumBackend against a native-shaped binding", () => {
+  it("runs signatures and boxes on the binding, the rest portable, and says so", () => {
+    const { backend, report } = buildSodiumBackend(nativeShaped(full));
+    expect([...report.native].sort()).toEqual(["blake2b", "boxEasy", "boxKeypair", "boxKeypairFromSeed", "boxOpenEasy", "randomBytes", "signDetached", "signKeypairFromSeed", "verifyDetached"]);
+    expect([...report.portable].sort()).toEqual(["aead", "isValidSignPoint", "memzero", "scalarMult"]);
+    // The protocol's binary associated data works through the fallback, and the bytes match the portable backend.
+    const key = new Uint8Array(32).fill(4);
+    const nonce = new Uint8Array(24).fill(6);
+    const aad = Uint8Array.from([0, 255, 7]);
+    const msg = new TextEncoder().encode("binary aad");
+    expect(toHex(backend.aeadEncrypt(msg, aad, nonce, key))).toBe(toHex(nobleBackend.aeadEncrypt(msg, aad, nonce, key)));
+    expect(toHex(backend.aeadDecrypt(nobleBackend.aeadEncrypt(msg, aad, nonce, key), aad, nonce, key))).toBe(toHex(msg));
+    const a = backend.boxKeypairFromSeed(new Uint8Array(32).fill(1));
+    const b = backend.boxKeypairFromSeed(new Uint8Array(32).fill(2));
+    expect(toHex(backend.scalarMult(a.secretKey, b.publicKey))).toBe(toHex(nobleBackend.scalarMult(a.secretKey, b.publicKey)));
+    expect(backend.isValidSignPoint(new Uint8Array(32))).toBe(false);
+    const z = Uint8Array.from([9, 9]);
+    backend.memzero(z);
+    expect([...z]).toEqual([0, 0]);
+  });
+
+  it("the full wasm libsodium runs everything natively", () => {
+    expect(buildSodiumBackend(full).report.portable).toEqual([]);
+  });
+
+  it("a binding that answers differently on the same input is refused, never used", () => {
+    const wrong: SodiumLike = { ...full, crypto_sign_detached: (m, sk) => full.crypto_sign_detached(m, sk).map((b) => b ^ 1) };
+    expect(() => sodiumBackend(wrong)).toThrow(KavachError);
+    const missing = { ...full, crypto_sign_seed_keypair: undefined } as unknown as SodiumLike; // a default import of react-native-libsodium
+    expect(() => sodiumBackend(missing)).toThrow(/signKeypairFromSeed/);
+  });
 });
 
 describe("sodiumBackend over an injected libsodium", () => {

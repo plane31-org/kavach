@@ -5,7 +5,7 @@
  * adapters stay exported for apps that need a different arrangement.
  */
 import { KavachError, open, setCryptoBackend, type Client, type ClientEvent, type RecoveryProvider, type ResetTrustConfig, type RetentionPolicy } from "@plane31/blind-relay";
-import { SECRET_NAMES, randomBytes, sodiumBackend, type SecretStore, type SodiumLike, type Transport } from "@plane31/blind-relay/adapters";
+import { SECRET_NAMES, buildSodiumBackend, randomBytes, type SecretStore, type SodiumBackendReport, type SodiumLike, type Transport } from "@plane31/blind-relay/adapters";
 import { ExpoSecretStore, type SecureStoreLike } from "./secretStore.js";
 import { SqliteStore, expoSqliteDriver, type ExpoSqliteDatabaseLike, type SqlDriver } from "./sqliteStore.js";
 
@@ -51,10 +51,12 @@ export interface KavachSetupOptions {
    */
   readonly getRandomValues?: GetRandomValues;
   /**
-   * A native libsodium binding (`react-native-libsodium`, over JSI) to run the cipher suite on
-   * instead of the portable pure-JavaScript backend: Ed25519 and X25519 are many times faster,
-   * which is what a record's signature and an epoch's sealed boxes cost. Awaited (`ready`) and
-   * installed process-wide before the client opens; absent, the portable backend stays.
+   * A native libsodium binding (`react-native-libsodium`, over JSI; import it as a namespace,
+   * since its default export lacks `crypto_sign_seed_keypair`) to run the cipher suite on instead
+   * of the portable pure-JavaScript backend: Ed25519 signatures and X25519 boxes are many times
+   * faster, which is what a record and an epoch's sealed boxes cost. Awaited (`ready`) and
+   * installed process-wide before the client opens; absent, the portable backend stays. See
+   * `installNativeCrypto` for what stays portable on a given binding.
    */
   readonly crypto?: SodiumLike & { readonly ready?: Promise<unknown> };
 }
@@ -134,12 +136,17 @@ export function databaseFileName(accountName: string, namespace = "kavach"): str
  */
 /**
  * Run the cipher suite on a native libsodium binding. Process-wide, like the Web Crypto install;
- * `openKavach` calls it when given `crypto`. Both backends pass the same vectors, so nothing on
- * the wire changes; only the time a signature or a sealed box takes.
+ * `openKavach` calls it when given `crypto`. Each function the binding provides is checked once
+ * against the portable implementation; what it lacks, or cannot do on the protocol's binary
+ * inputs, stays portable, and the report says which (react-native-libsodium 1.7 runs the AEAD,
+ * X25519 agreement and the validity check portable, signatures and boxes native). A binding that
+ * answers differently on the same input is refused with `INVALID_KEY`. Nothing on the wire changes.
  */
-export async function installNativeCrypto(sodium: SodiumLike & { readonly ready?: Promise<unknown> }): Promise<void> {
+export async function installNativeCrypto(sodium: SodiumLike & { readonly ready?: Promise<unknown> }): Promise<SodiumBackendReport> {
   if (sodium.ready) await sodium.ready;
-  setCryptoBackend(sodiumBackend(sodium));
+  const { backend, report } = buildSodiumBackend(sodium);
+  setCryptoBackend(backend);
+  return report;
 }
 
 export async function openKavach(options: KavachSetupOptions): Promise<KavachSetup> {
