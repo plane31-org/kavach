@@ -256,6 +256,9 @@ describe("retention policy validation", () => {
     void _r;
     expect(() => validatePolicy(noModel)).toThrow(expect.objectContaining({ code: "MALFORMED" }));
     expect(() => validatePolicy({ ...good, kinds: [{ ...good.kinds[0], kind: 256 }] })).toThrow(expect.objectContaining({ code: "MALFORMED" }));
+    // Revision 11: header classes 0 to 7; anything else, or a non-integer, is malformed.
+    expect(validatePolicy({ ...good, kinds: [{ ...good.kinds[0], headerClass: 7 }] }).kinds[0]?.headerClass).toBe(7);
+    for (const headerClass of [8, -1, 1.5, "2"]) expect(() => validatePolicy({ ...good, kinds: [{ ...good.kinds[0], headerClass }] })).toThrow(expect.objectContaining({ code: "MALFORMED" }));
     expect(() => validatePolicy({ ...good, kinds: [{ ...good.kinds[0], history: false, newest: false }] })).toThrow(expect.objectContaining({ code: "MALFORMED" }));
     expect(validatePolicy(good).maxOutboxRecords).toBe(2000);
     expect(() => validatePolicy(undefined)).toThrow(expect.objectContaining({ code: "MALFORMED" }));

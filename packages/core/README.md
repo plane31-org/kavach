@@ -2,7 +2,7 @@
 
 The Kavach v1 protocol in pure TypeScript: end-to-end encrypted, relayed, durable records between a person's devices and the devices of the people they share with, for circles of up to 100 accounts, through a server that stores only what it cannot open and deletes each record once every reader has it. The package is product-agnostic: a product declares its record kinds and keeps its payload codecs in its own profile. The specification is `spec/Kavach-v1.md` in the repository; `spec/Profile-template.md` lists what a product decides.
 
-Status: protocol revision 10, package 0.x. The primitives are audited libraries; the composition is not yet independently reviewed, and nothing here is production-ready. The API may change between 0.x minor versions; the protocol revision is tracked separately in the specification.
+Status: protocol revision 11, package 0.x. The primitives are audited libraries; the composition is not yet independently reviewed, and nothing here is production-ready. The API may change between 0.x minor versions; the protocol revision is tracked separately in the specification.
 
 ```
 pnpm add @plane31/blind-relay
@@ -24,6 +24,8 @@ Randomness comes from the Web Crypto global. A runtime without one (Hermes) inst
 **High-frequency transient signals are slot kinds too.** Live position, speed, heading, battery: declare the kind `latestWins` with `history: false`, and only the newest frame per author is stored; the relay keeps a frame only until every reader has it. Nothing in the host needs to overwrite records in place, and nothing could, since the relay cannot open them or know who already holds one. The record counter stays monotonic because replay protection depends on it; it costs nothing.
 
 **Short background windows.** `sync({ catchUp: { maxRecords, maxMs }, skipMaintenance: true })` reads within a budget and leaves the retention purge, the periodic reset-key-list re-check and the recovery-key re-save to the next foreground sync (`report.maintenance` says which). `syncUntilDrained({ maxRounds, maxMs, skipMaintenance })` runs rounds within a soft time bound and says why it stopped. `report.timings` gives wall-clock milliseconds per phase and the bytes moved, so a budget overrun can be attributed. Opening the encrypted store in a fresh background context is the platform's cost, not the SDK's; measure it separately.
+
+**Header classes 4 to 7 (revision 11).** The class is three header bits the relay may see, 0 to 7, with no meaning in the protocol: the product's host decides which values wake readers and how it stores each. A reader or host before revision 11 rejects a class above 3 as malformed, and the SDK cannot know when the field has moved, so the order is: the host first, then every reader on a revision 11 SDK with no kind above 3, then senders declaring the new values.
 
 **Introducing a record kind.** Ship the readers first where you can, but a reader that meets a kind its policy does not declare is not in trouble: the record authenticated and opened, so it is an authorized author's and the author's app is newer. The reader skips it, counts it (`report.inbox.unknownKind`) and emits `unknownKind` with the author, which is the moment to suggest an update. No `securityError` is raised; those are for records that fail authentication or equivocate. An enqueue of a kind the sender did not declare is still `MALFORMED`.
 

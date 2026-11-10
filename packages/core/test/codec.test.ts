@@ -171,14 +171,22 @@ describe("slot-only records and header classes (revisions 6 and 8)", () => {
     expect(toHex(rebuilt)).toBe(v.wire);
   });
 
-  it("the header carries a class of 0 to 3 in bits 1 and 2, nothing else, and the kind only inside the envelope", () => {
+  it("the header carries a class of 0 to 7 in bits 1 to 3, nothing else, and the kind only inside the envelope", () => {
     const base = { streamId: hex(alice.stream_id), epoch: 1, counter: 0, sentAt: now };
-    expect([0, 1, 2, 3].map((c) => encodeRecordHeader({ ...base, headerClass: c as HeaderClass })[50])).toEqual([0, 2, 4, 6]);
+    expect([0, 1, 2, 3, 4, 5, 6, 7].map((c) => encodeRecordHeader({ ...base, headerClass: c as HeaderClass })[50])).toEqual([0, 2, 4, 6, 8, 10, 12, 14]);
     const both = hex(fx.status_record.wire);
     both[50] = 6;
     expect(code(() => parseDocument(both))).toBe("ACCEPTED"); // class 3 is a legal declaration since revision 8
     both[50] = 8;
-    expect(code(() => parseDocument(both))).toBe("MALFORMED");
+    expect(code(() => parseDocument(both))).toBe("ACCEPTED"); // class 4: bit 3 joined the class at revision 11
+    both[50] = 0x10;
+    expect(code(() => parseDocument(both))).toBe("MALFORMED"); // bit 4 is reserved
+    both[50] = 0x01;
+    expect(code(() => parseDocument(both))).toBe("MALFORMED"); // bit 0 stays reserved
+    // The revision 11 vector: class 5, verified and opened like any record.
+    const wide = expectType<EncryptedRecord>(verifyDocument(hex(fx.wide_class_record.wire), aliceDsk.publicKey), DocumentType.EncryptedRecord);
+    expect([wide.headerClass, wide.flags, wide.counter]).toEqual([5, 10, 8]);
+    expect(decodeEnvelope(openRecord(wide, hex(fx.wide_class_record.epoch_key))).kind).toBe(fx.wide_class_record.expected.kind);
     expect(code(() => decodeEnvelope(new Uint8Array(9)))).toBe("MALFORMED");
     expect(code(() => decodeEnvelope(concat(fromHex("02"), new Uint8Array(9))))).toBe("MALFORMED");
     expect(decodeEnvelope(concat(fromHex("01ff"), new Uint8Array(8))).kind).toBe(255);

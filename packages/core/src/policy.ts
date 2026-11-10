@@ -17,8 +17,12 @@ export interface KindDeclaration {
   readonly history: boolean;
   /** Whether one newest-per-author slot is kept, from the author's current device, ordered by event time. */
   readonly newest: boolean;
-  /** The two header bits the relay may see for this kind (0 to 3, 0 when absent), for routing and notifications without content. */
-  readonly headerClass: 0 | 1 | 2 | 3;
+  /**
+   * The header bits the relay may see for this kind (0 to 7, 0 when absent), for routing and
+   * notifications without content; what each value means is the product's and its host's. Values
+   * 4 to 7 need revision 11 on the host and every reader first: an earlier reader rejects them.
+   */
+  readonly headerClass: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
 }
 
 /**
@@ -73,8 +77,8 @@ export function validatePolicy(policy: unknown): RetentionPolicy {
     if (typeof k.history !== "boolean" || typeof k.newest !== "boolean") throw new KavachError("MALFORMED", stage, `kinds[${i}].history and .newest must be booleans`);
     if (!k.history && !k.newest) throw new KavachError("MALFORMED", stage, `kinds[${i}] keeps nothing: declare history or newest`);
     const headerClass = k.headerClass ?? 0;
-    if (headerClass !== 0 && headerClass !== 1 && headerClass !== 2 && headerClass !== 3) throw new KavachError("MALFORMED", stage, `kinds[${i}].headerClass must be 0 to 3`);
-    return { kind, retentionMs: big(`kinds[${i}].retentionMs`, k.retentionMs), queue: k.queue, history: k.history, newest: k.newest, headerClass };
+    if (typeof headerClass !== "number" || !Number.isInteger(headerClass) || headerClass < 0 || headerClass > 7) throw new KavachError("MALFORMED", stage, `kinds[${i}].headerClass must be 0 to 7`);
+    return { kind, retentionMs: big(`kinds[${i}].retentionMs`, k.retentionMs), queue: k.queue, history: k.history, newest: k.newest, headerClass: headerClass as KindDeclaration["headerClass"] };
   });
   if (p.replacement !== "continuity" && p.replacement !== "recovery" && p.replacement !== "both") throw new KavachError("MALFORMED", stage, "replacement must be continuity, recovery or both");
   return {

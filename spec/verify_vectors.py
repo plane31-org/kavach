@@ -78,8 +78,8 @@ def parse(wire):
         if ids!=sorted(set(ids)) or d['author'] not in ids: raise Bad('MALFORMED')
     elif t==4:
         d.update(stream=r.take(32),epoch=r.n(4),counter=r.n(4),sent=r.n(8),flags=r.n(1))
-        if d['epoch']==0 or d['flags']&~6: raise Bad('MALFORMED')
-        d['header_class']=(d['flags']>>1)&3  # revision 8: the kind is inside the envelope; the header shows only the declared class
+        if d['epoch']==0 or d['flags']&~0x0e: raise Bad('MALFORMED')
+        d['header_class']=(d['flags']>>1)&7  # revision 8: the kind is inside the envelope; the header shows only the declared class. Revision 11: three bits, 1 to 3
         d['header']=wire[:r.i]; d['nonce']=r.take(24); n=r.n(4)
         if not 26<=n<=4122: raise Bad('SIZE_LIMIT')
         d['ciphertext']=r.take(n)
@@ -400,7 +400,7 @@ def build():
     negative('N02_type',rec[:1]+b'\xff'+rec[2:],pk,'UNSUPPORTED_TYPE')
     negative('N03_truncated',rec[:-1],pk,'MALFORMED')
     negative('N04_trailing_byte',rec+b'\0',pk,'MALFORMED')
-    negative('N05_reserved_flag',rec[:50]+b'\x08'+rec[51:],pk,'MALFORMED')  # bit 3: bit 2 is the status kind since revision 6
+    negative('N05_reserved_flag',rec[:50]+b'\x10'+rec[51:],pk,'MALFORMED')  # bit 4: bit 3 joined the header class at revision 11 (bit 2 at revision 6)
     negative('N06_changed_ciphertext',rec[:79]+bytes([rec[79]^1])+rec[80:],pk,'BAD_SIGNATURE')
     negative('N07_wrong_signer',rec,bytes(bob['d'].verify_key),'BAD_SIGNATURE')
     negative('N08_excessive_length',rec[:75]+U32(4123)+rec[79:],pk,'SIZE_LIMIT')
@@ -470,6 +470,12 @@ def build():
     verify(status_record,pk)
     vectors['status_record']={'wire':status_record.hex(),'record_id':status_rid.hex(),'epoch_key':group_key.hex(),'payload':status_payload.hex(),'plaintext':envelope(2,None,status_payload).hex(),
         'expected':{'kind':2,'header_class':2,'flags':4,'epoch':2,'counter':7,'event_time_ms':None,'pins':False,'notifies':False}}
+    # Revision 11: a header class above 3 (5: bits 1 and 3), the record otherwise ordinary. Malformed to a reader before revision 11.
+    wide_record,_,wide_rid=record(alice,2,8,now,5,bytes(range(72,96)),group_key,bytes([9,8,7]),kind=1)
+    assert parse(wide_record)['header_class']==5 and parse(wide_record)['flags']==0x0a
+    verify(wide_record,pk)
+    vectors['wide_class_record']={'wire':wide_record.hex(),'record_id':wide_rid.hex(),'epoch_key':group_key.hex(),'payload':bytes([9,8,7]).hex(),
+        'expected':{'kind':1,'header_class':5,'flags':10,'epoch':2,'counter':8,'note':'revision 11: the class is bits 1 to 3; a reader before it rejects this wire as MALFORMED'}}
     vectors['boundary_100']={
         'seed_rule':'For i=1..99: accountSeed=H(C("fixture-account")||u32(i)); deviceSeed=H(C("fixture-device")||u32(i)); ephemeral seed for all i=0..99: H(C("fixture-ephemeral")||u32(i)). i=0 is Alice. DeviceId=H(C("fixture-device-id")||deviceSeed)[:16]. TEST ONLY.',
         'epoch_key':group_key.hex(),'accounts':[x['wire'].hex() for x in group],

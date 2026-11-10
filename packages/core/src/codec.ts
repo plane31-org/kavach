@@ -56,11 +56,17 @@ export const MIN_VAULT_CIPHERTEXT = 90;
 export const MAX_VAULT_CIPHERTEXT = 4_990;
 export const VAULT_ENTRY_BYTES = 49;
 export const RECORD_HEADER_BYTES = 51;
-/** Header flags: bits 1 and 2 carry the record's header class (0 to 3), the one thing about a record the relay may see; bit 0 and bits 3 to 7 are reserved. */
+/**
+ * Header flags: bits 1 to 3 carry the record's header class (0 to 7, revision 11; bits 1 and 2
+ * alone, 0 to 3, before it), the one thing about a record the relay may see and a value the
+ * protocol gives no meaning; bit 0 (an urgency flag in an earlier design) and bits 4 to 7 are
+ * reserved. A class above 3 is malformed to a reader before revision 11, so a product uses one
+ * only once its host and every reader have moved.
+ */
 export const HEADER_CLASS_SHIFT = 1;
-export const HEADER_CLASS_MASK = 0x06;
+export const HEADER_CLASS_MASK = 0x0e;
 const RESERVED_FLAGS = ~HEADER_CLASS_MASK & 0xff;
-export type HeaderClass = 0 | 1 | 2 | 3;
+export type HeaderClass = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
 
 export enum DocumentType {
   AccountDevice = 1,

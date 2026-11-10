@@ -27,6 +27,8 @@ export interface Fixture {
   phone_replacement: { new_device_seed: string; new_device_id: string; stable_identity_id: string; new_certificate: string };
   boundary_100: { seed_rule: string; accounts: string[] };
   status_record: { wire: string; record_id: string; epoch_key: string; payload: string; expected: { kind: number; flags: number; epoch: number; counter: number; pins: boolean; notifies: boolean } };
+  /** Revision 11: a header class above 3 (bits 1 to 3). */
+  wide_class_record: { wire: string; record_id: string; epoch_key: string; payload: string; expected: { kind: number; header_class: number; flags: number; epoch: number; counter: number } };
 }
 
 export const fixture: Fixture = JSON.parse(

@@ -2,6 +2,13 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
+## 0.7.0
+
+Protocol revision 11: one reserved flag bit joins the header class. No existing byte changes.
+
+- **The header class is three bits, 0 to 7.** Flag bit 3 of the record header, reserved until now, joins bits 1 and 2; classes 0 to 3 encode as before, so every existing record is the same bytes. The class keeps its meaning, an opaque per-kind value the relay may see and the product's host interprets; the protocol still names no delivery policy. Bit 0 stays reserved (no urgency flag), bits 4 to 7 too. `KindDeclaration.headerClass` accepts 0 to 7, `HeaderClass` widens, `PROTOCOL_REVISION` is 11. The fixture gains a class 5 record vector, its reserved-flag negative moves to bit 4, and `verify_vectors.py` follows. *Rollout:* a reader or host before revision 11 rejects a class above 3 as malformed. Ship the host first, then every reader, with no kind above 3; declare the new values only once the field has moved. The SDK cannot enforce the order; the README states it.
+- No reader-side check of a record's class against the reader's declaration, by design: the class is the author's signed choice, the host has already acted on it, and two builds of one app may declare a kind differently during a rollout.
+
 ## 0.6.0
 
 Protocol revision 10, no wire change. What the first device run of 0.5.0 turned up.
