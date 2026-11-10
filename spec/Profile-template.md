@@ -8,7 +8,7 @@ One row per kind the product uses, as declared in the retention policy passed to
 
 | Kind | Number | Meaning | `retentionMs` | `queue` | `history` | `newest` | `headerClass` | Event time |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| | 0 to 255 | what the record means to the product | how long a reader keeps it, from `sentAt` | `keepAll` or `latestWins` | kept in pageable history | one newest-per-author slot | 0 to 3, what the relay may see | what `eventTime` the product passes, or none |
+| | 0 to 255 | what the record means to the product | how long a reader keeps it, from `sentAt` | `keepAll` or `latestWins` | kept in pageable history | one newest-per-author slot | 0 to 7, what the relay may see (4 to 7 need revision 11 on the host and every reader) | what `eventTime` the product passes, or none |
 
 For each kind: the payload codec (byte layout, version byte, bounds, what it must never carry), how the product sends it (`enqueue(kind, payload, { eventTime, idempotencyKey })`) and how it reads it (`newest(identityId, kind)`, `historyPage`), and how the product answers `recordStored` and `refresh`.
 
@@ -16,9 +16,9 @@ For each kind: the payload codec (byte layout, version byte, bounds, what it mus
 
 Which replacement models the product enables, `continuity`, `recovery` or `both` (specification section 4, from amendment A1), and the resulting promise in one sentence; where the authority key is custodied and how fresh authentication is enforced before it signs, when `recovery` or `both` is enabled; and the product's record of amendment decisions D1 to D5. These are the product's decisions and live here, never in the SDK.
 
-## 2. Notifications by header class
+## 2. Header classes: notifications and storage
 
-For each header class the kinds use: visible push, silent wake-up, or nothing; the wording of a visible push, which never carries content; and the join-request notification to an owner.
+The protocol gives a header class no meaning; the profile does. For each of the values 0 to 7 the product uses: which kinds carry it, what the host does on receipt (visible push, silent wake-up, or nothing) and how the host stores records of it (every record until read, or the latest only); the wording of a visible push, which never carries content; and the join-request notification to an owner. A value above 3 is malformed to a host or reader before revision 11, so the profile states the rollout order (host, then every reader, then senders) and which values are in use.
 
 ## 3. Retention policy
 
