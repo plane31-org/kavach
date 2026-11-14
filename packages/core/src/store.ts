@@ -242,7 +242,10 @@ export interface ResetReceiptRow {
   accountName: string;
   oldIdentityId: string;
   newIdentityId: string;
-  receiptHash: string;
+  /** Every accepted receipt of this reset: the first and each re-attestation. */
+  receiptHashes: string[];
+  /** Rows written before 0.7.1 carried one hash here (the first accepted receipt's on every row, wrongly). Read as a one-element list. */
+  receiptHash?: string;
 }
 
 export interface ClockRow {

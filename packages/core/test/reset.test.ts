@@ -108,9 +108,30 @@ describe("K01 to K22 against the fixture, with K19 at 30 days", () => {
     expect(restored.state.retired.has(alice.identity_id)).toBe(true);
     expect(run(() => restored.apply(receipt, newCert, "alice", resetIid(), now + 10_000n))).toBe("DUPLICATE");
     // Each row carries its own receipt's hash, and the accepted set is rebuilt from exactly those.
-    expect(rows.events.map((e) => e.receiptHash)).toEqual([toHex(H(receipt))]);
+    expect(rows.events.map((e) => e.receiptHashes)).toEqual([[toHex(H(receipt))]]);
     expect([...restored.state.acceptedReceipts]).toEqual([toHex(H(receipt))]);
     expect(run(() => restored.install(kl1, now + 9_999n))).toBe("RESET_CLOCK_UNTRUSTED");
     expect(new ResetTrust({ managementKey: root, minimumVersion: 1n }, emptyResetTrust).fresh(now)).toBe(false);
+  });
+
+  it("a re-attested receipt stays a duplicate after a restart, even once its signing key has left the list", () => {
+    const trust = new ResetTrust({ managementKey: root, minimumVersion: 1n });
+    trust.install(kl1, now);
+    expect(run(() => trust.apply(receipt, newCert, "alice", aliceIid, now + 10_000n))).toBe("ACCOUNT_KEY_CHANGED");
+    trust.install(kl2, now + 20_000n);
+    expect(run(() => trust.apply(reissued, newCert, "alice", resetIid(), now + 20_000n))).toBe("DUPLICATE"); // K09: the current key re-attests the event
+    // A third list with a fresh key only: both earlier signers are gone.
+    const managementKey = signingKeypairFromSeed(hex(rkm.management_seed));
+    const standby = signingKeypairFromSeed(cryptoMod.H(cryptoMod.C("fixture-standby-3")));
+    const kl3 = codecMod.buildResetKeyList({ version: 3n, issuedAt: now + 30_000n, expiresAt: now + 30_000n + 30n * 86_400_000n, keys: [{ keyId: new Uint8Array(16).fill(3), publicKey: standby.publicKey }] }, managementKey.secretKey);
+    expect(run(() => trust.install(kl3, now + 30_000n))).toBe("INSTALLED");
+    expect(run(() => trust.apply(reissued, newCert, "alice", resetIid(), now + 30_000n))).toBe("DUPLICATE");
+    expect(run(() => trust.apply(receipt, newCert, "alice", resetIid(), now + 30_000n))).toBe("DUPLICATE");
+    // Restored from rows: the same answers, because every accepted hash was persisted with the binding.
+    const rows = trust.toRows();
+    expect(rows.events[0]?.receiptHashes).toEqual([toHex(H(receipt)), toHex(H(reissued))]);
+    const restored = ResetTrust.fromRows({ managementKey: root, minimumVersion: 1n }, rows);
+    expect(run(() => restored.apply(reissued, newCert, "alice", resetIid(), now + 30_000n))).toBe("DUPLICATE");
+    expect(run(() => restored.apply(receipt, newCert, "alice", resetIid(), now + 30_000n))).toBe("DUPLICATE");
   });
 });

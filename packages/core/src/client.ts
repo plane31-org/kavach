@@ -504,7 +504,7 @@ class ClientImpl implements Client {
     const rows = await this.store.read((tx) => ({
       list: tx.get("resetList", "list"),
       clock: tx.get("clock", "clock"),
-      events: tx.list("resetReceipts").map(([k, r]) => ({ resetId: k, accountName: r.accountName, oldIdentityId: r.oldIdentityId, newIdentityId: r.newIdentityId, receiptHash: r.receiptHash })),
+      events: tx.list("resetReceipts").map(([k, r]) => ({ resetId: k, accountName: r.accountName, oldIdentityId: r.oldIdentityId, newIdentityId: r.newIdentityId, receiptHashes: r.receiptHashes ?? (r.receiptHash ? [r.receiptHash] : []) })),
       retired: tx.list("retiredIdentities").map(([k]) => k)
     }));
     this.trust = ResetTrust.fromRows(this.options.resetTrust, {
@@ -1770,7 +1770,7 @@ class ClientImpl implements Client {
     const rows = this.trust.toRows();
     if (rows.list) tx.put("resetList", "list", rows.list);
     tx.put("clock", "clock", rows.clock);
-    for (const e of rows.events) tx.put("resetReceipts", e.resetId, { accountName: e.accountName, oldIdentityId: e.oldIdentityId, newIdentityId: e.newIdentityId, receiptHash: e.receiptHash });
+    for (const e of rows.events) tx.put("resetReceipts", e.resetId, { accountName: e.accountName, oldIdentityId: e.oldIdentityId, newIdentityId: e.newIdentityId, receiptHashes: e.receiptHashes });
     for (const r of rows.retired) tx.put("retiredIdentities", r, { identityId: r });
   }
 

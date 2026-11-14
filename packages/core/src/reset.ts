@@ -32,8 +32,8 @@ export interface ResetBinding {
   readonly accountName: string;
   readonly oldIdentityId: string;
   readonly newIdentityId: string;
-  /** The hash of the receipt wire that established this binding; the accepted set is derived from these. */
-  readonly receiptHash: string;
+  /** The hashes of every receipt accepted for this reset: the one that established the binding and each re-attestation of it. The accepted set is their union. */
+  readonly receiptHashes: readonly string[];
 }
 
 export interface ResetTrustState {
@@ -117,7 +117,7 @@ export class ResetTrust {
     if (!signer) throw new KavachError("RESET_KEY_REVOKED", stage, "the signing key is not in the current list");
     const receipt = expectType<AccountResetReceipt>(verifyDocument(receiptWire, signer.publicKey), DocumentType.AccountResetReceipt, stage);
     const cert = expectType<AccountDevice>(verifyDocument(newCertificate), DocumentType.AccountDevice, stage);
-    const binding: ResetBinding = { accountName: receipt.accountName, oldIdentityId: toHex(receipt.oldIdentityId), newIdentityId: toHex(receipt.newIdentityId), receiptHash };
+    const binding: ResetBinding = { accountName: receipt.accountName, oldIdentityId: toHex(receipt.oldIdentityId), newIdentityId: toHex(receipt.newIdentityId), receiptHashes: [receiptHash] };
     if (receipt.accountName !== accountName || cert.accountName !== accountName || !equalBytes(identityId(accountName, cert.accountKey), receipt.newIdentityId)) {
       throw new KavachError("RESET_BINDING", stage, "receipt, account and certificate do not bind");
     }
@@ -138,7 +138,9 @@ export class ResetTrust {
     const accepted = new Set(this.state.acceptedReceipts);
     accepted.add(receiptHash);
     const events = new Map(this.state.events);
-    if (!known) events.set(resetId, binding); // a re-attested receipt of a known reset keeps the first binding
+    // A re-attestation of a known reset keeps the binding and adds its hash, so that it is still a
+    // duplicate after a restart, whatever happens to its signing key.
+    events.set(resetId, known ? { ...known, receiptHashes: [...known.receiptHashes, receiptHash] } : binding);
     const retired = new Set(this.state.retired);
     retired.add(binding.oldIdentityId);
     this.state = { ...this.state, acceptedReceipts: accepted, events, retired, timeHighWater: t };
@@ -151,7 +153,7 @@ export class ResetTrust {
     return {
       list: this.state.current ? { wire: toHex(this.state.current.wire), version: big(this.state.current.list.version), hash: toHex(this.state.current.list.bodyHash), checkedAt: big(this.state.timeHighWater) } : undefined,
       clock: { highWater: big(this.state.timeHighWater) },
-      events: [...this.state.events.entries()].map(([resetId, b]) => ({ resetId, ...b })),
+      events: [...this.state.events.entries()].map(([resetId, b]) => ({ resetId, accountName: b.accountName, oldIdentityId: b.oldIdentityId, newIdentityId: b.newIdentityId, receiptHashes: [...b.receiptHashes] })),
       retired: [...this.state.retired]
     };
   }
@@ -161,9 +163,9 @@ export class ResetTrust {
     return new ResetTrust(config, {
       current,
       timeHighWater: unbig(rows.clock.highWater),
-      // The accepted set is the bindings' hashes: one row, one receipt, nothing to pair up.
-      acceptedReceipts: new Set(rows.events.map((e) => e.receiptHash)),
-      events: new Map(rows.events.map((e) => [e.resetId, { accountName: e.accountName, oldIdentityId: e.oldIdentityId, newIdentityId: e.newIdentityId, receiptHash: e.receiptHash }])),
+      // The accepted set is the union of the bindings' hashes: every receipt a row holds, nothing to pair up.
+      acceptedReceipts: new Set(rows.events.flatMap((e) => e.receiptHashes)),
+      events: new Map(rows.events.map((e) => [e.resetId, { accountName: e.accountName, oldIdentityId: e.oldIdentityId, newIdentityId: e.newIdentityId, receiptHashes: e.receiptHashes }])),
       retired: new Set(rows.retired)
     });
   }
@@ -172,6 +174,6 @@ export class ResetTrust {
 export interface ResetTrustRows {
   list: { wire: string; version: string; hash: string; checkedAt: string } | undefined;
   clock: { highWater: string };
-  events: { resetId: string; accountName: string; oldIdentityId: string; newIdentityId: string; receiptHash: string }[];
+  events: { resetId: string; accountName: string; oldIdentityId: string; newIdentityId: string; receiptHashes: string[] }[];
   retired: string[];
 }
