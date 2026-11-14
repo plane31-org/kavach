@@ -13,6 +13,32 @@ async function fresh(w: World, name: string): Promise<Dev> {
   return w.device(name, new MemoryPlatformProvider(`${name}-${Math.random()}@platform`), new MemoryStore(), new MemorySecretStore());
 }
 
+describe("getState()", () => {
+  it("takes one store read, however many tables it looks at", async () => {
+    const w = world();
+    const store = new MemoryStore();
+    let reads = 0;
+    const read = store.read.bind(store);
+    store.read = (fn) => {
+      reads++;
+      return read(fn);
+    };
+    const a = await w.device("alice", new MemoryPlatformProvider("alice-reads@platform"), store, new MemorySecretStore());
+    await a.client.initializeAccount();
+    const b = await fresh(w, "bob");
+    await b.client.initializeAccount();
+    const { circleId } = await a.client.circles.create();
+    await b.client.circles.requestJoin(circleId, (await a.client.getState()).identityId ?? new Uint8Array());
+    await w.sync(a);
+    await a.client.circles.approve(circleId, "bob");
+    await w.sync(a);
+    reads = 0;
+    const state = await a.client.getState();
+    expect([state.status, state.circles.length]).toEqual(["ready", 1]);
+    expect(reads).toBe(1);
+  });
+});
+
 describe("close()", () => {
   it("refuses new work, lets the sync in flight finish its boundary, and emits nothing afterwards", async () => {
     const w = world();

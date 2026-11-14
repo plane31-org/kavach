@@ -5,6 +5,8 @@ import { buildRecordWire } from "../src/codec.js";
 import { randomBytes, ready } from "../src/crypto.js";
 import { history, newestSlot, purgeHistory, receive, syncStream } from "../src/inbox.js";
 import { drain, enqueue } from "../src/outbox.js";
+import { KavachError } from "../src/errors.js";
+import { openRecordWire } from "../src/record.js";
 import { FakeHost } from "../src/testing/fakeHost.js";
 import { Clock, setupDevice, type Device } from "./harness.js";
 import { encodeLocation, locationFromDegrees } from "./location.js";
@@ -85,6 +87,45 @@ describe("receiving through sync", () => {
     const pin = await newestSlot(bob.store, alice.pin.identityId, 0, clock.now());
     expect(pin && toHex(pin.payload)).toBe(toHex(sample(clock, 40)));
     expect((await history(bob.store, bob.inbox.policy, { authorIdentityId: alice.pin.identityId })).length).toBe(3);
+  });
+
+  it("the inbox refuses a damaged record with the same code as the opener: one parse, the same checks", async () => {
+    const { clock, alice, bob } = await trio();
+    const key = await alice.store.read((tx) => tx.get("epochs", "1")?.epochKey ?? "");
+    await enqueue(alice.outbox, 0, sample(clock));
+    await drain(alice.outbox);
+    await syncStream(bob.inbox, aliceStream(alice), alice.pin.identityId); // Bob holds the epoch key
+    const good = buildRecordWire({ streamId: alice.pin.streamId, epoch: 1, counter: 20, sentAt: clock.now(), kind: 0, headerClass: 0 }, sample(clock, 11), Uint8Array.from(Buffer.from(key, "hex")), randomBytes(24), alice.device.signing.secretKey);
+    const view = { identityId: alice.pin.identityId, certificates: new Map([[toHex(alice.pin.certificateHash), { certificateHash: alice.pin.certificateHash, signingKey: alice.pin.signingKey, streamId: alice.pin.streamId, current: true }]]) };
+    const opener = (w: Uint8Array): string => {
+      try {
+        openRecordWire(w, view, () => Uint8Array.from(Buffer.from(key, "hex")));
+        return "OK";
+      } catch (e) {
+        return e instanceof KavachError ? e.code : "?";
+      }
+    };
+    const inbox = async (w: Uint8Array): Promise<string> => {
+      try {
+        const r = await receive(bob.inbox, w);
+        return r.result === "invalid" ? r.reason : r.result;
+      } catch (e) {
+        return e instanceof KavachError ? e.code : "?";
+      }
+    };
+    const damaged: Record<string, Uint8Array> = {
+      trailingByte: Uint8Array.from([...good, 0]),
+      signatureBit: Uint8Array.from(good.map((b, i) => (i === good.length - 1 ? b ^ 1 : b))),
+      ciphertextBit: Uint8Array.from(good.map((b, i) => (i === 100 ? b ^ 1 : b))),
+      reservedFlag: Uint8Array.from(good.map((b, i) => (i === 50 ? b | 0x10 : b))),
+      epochZero: Uint8Array.from(good.map((b, i) => (i >= 34 && i < 38 ? 0 : b)))
+    };
+    for (const [name, w] of Object.entries(damaged)) {
+      const expected = opener(w);
+      expect(expected, name).not.toBe("OK");
+      expect(await inbox(w), name).toBe(expected);
+    }
+    expect(await inbox(good)).toBe("updated");
   });
 
   it("a record that cannot be opened offline holds the prefix while later records flow, and opens after the next sync", async () => {
