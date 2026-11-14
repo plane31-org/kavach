@@ -115,12 +115,14 @@ describe("the succession verifier replays the fixture's cases", () => {
     expect(after.revision).toBe("2"); // T3 rotated the audience to the new key
   });
 
-  it("an obsolete attestation of an accepted transition, under a removed key, is dropped and changes nothing", async () => {
+  it("an attestation of an accepted transition stays DUPLICATE after its key left the list (order one), and changes nothing; a fork under the removed key is refused as unauthenticated", async () => {
     const { store, trust } = await pinnedAlice();
     await run(store, trust, hex(v.succession_wire), hex(v.successor_certificate));
     const before = await store.read((tx) => JSON.stringify([tx.get("pins", v.account_id), tx.list("identities"), tx.list("successions")]));
     trust.install(hex(fx.reset_key_management.list_v2_wire), now + 20_000n);
-    expect(await run(store, trust, hex(v.succession_wire), hex(v.successor_certificate), now + 30_000n)).toBe("RESET_KEY_REVOKED");
+    expect(await run(store, trust, hex(v.succession_wire), hex(v.successor_certificate), now + 30_000n)).toBe("DUPLICATE");
+    // A different successor for the same state, signed by the removed key: authentication comes before any claim of equivocation.
+    expect(await run(store, trust, hex(v.forked_wire), hex(v.other_certificate), now + 30_000n)).toBe("RESET_KEY_REVOKED");
     const after = await store.read((tx) => JSON.stringify([tx.get("pins", v.account_id), tx.list("identities"), tx.list("successions")]));
     expect(after).toBe(before);
   });

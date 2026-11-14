@@ -86,7 +86,7 @@ export class SqliteStore implements Store {
       try {
         this.db.exec("BEGIN IMMEDIATE");
       } catch (e) {
-        throw new KavachError("LOCKED", "sqliteStore", `could not begin: ${String(e)}`);
+        throw new KavachError("LOCKED", "sqliteStore", `could not begin: ${String(e)}`, { cause: e });
       }
       const tx = new SqliteTx(this.db);
       let result: R;
@@ -100,7 +100,7 @@ export class SqliteStore implements Store {
         this.db.exec("COMMIT");
       } catch (e) {
         this.rollback();
-        throw new KavachError("STORAGE_FAILURE", "sqliteStore", `commit failed: ${String(e)}`);
+        throw new KavachError("STORAGE_FAILURE", "sqliteStore", `commit failed: ${String(e)}`, { cause: e });
       }
       return result;
     } finally {

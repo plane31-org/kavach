@@ -227,27 +227,29 @@ export function applySuccession(tx: Tx, input: SuccessionInput): SuccessionEffec
   const parsed = expectType<AccountSuccession>(parseDocument(input.wire), DocumentType.AccountSuccession, stage);
   const t = transitionOf(parsed);
 
-  // Order 1: authenticate the attestation under the current list. A failure here records nothing
-  // and changes nothing, so an obsolete attestation of an accepted transition is merely dropped.
+  // Order one (section 4): a transition already accepted stays trusted whatever happened to its
+  // key since, and a second attestation of it is DUPLICATE, checked no further. Only the identical
+  // transition takes this exit: anything else is authenticated before it is called anything.
+  const recorded = tx.list("successions", t.accountId + ":").map(([, r]) => r);
+  const atState = recorded.find((r) => unbig(r.previousGeneration) === t.previousGeneration && r.previousIdentityId === t.previousIdentityId);
+  const pinRow = tx.get("pins", t.accountId);
+  if (atState && sameTransition(rowTransition(atState), t)) {
+    if (!pinRow) throw new KavachError("STORAGE_FAILURE", stage, "a recorded succession without its pin");
+    return { outcome: "DUPLICATE", accountId: parsed.accountId, accountName: t.accountName, previousIdentityId: parsed.previousIdentityId, newIdentityId: parsed.newIdentityId, generation: t.newGeneration, transition: t, pin: rowToPin(pinRow) };
+  }
+
+  // Order two: authenticate the unseen attestation under the current list. A failure here records
+  // nothing and changes nothing; unauthenticated bytes are evidence against nobody.
   const now = input.now;
   authenticateSuccession(input.wire, input.trust, now);
   if (now === undefined) throw new KavachError("RESET_CLOCK_UNTRUSTED", stage);
 
-  // Order 2: compare the transition with the recorded ones for this account.
-  const recorded = tx.list("successions", t.accountId + ":").map(([, r]) => r);
-  const atState = recorded.find((r) => unbig(r.previousGeneration) === t.previousGeneration && r.previousIdentityId === t.previousIdentityId);
+  // Order three: a different transition at a recorded state, or a known id with other bytes.
+  if (atState) throw new KavachError("EQUIVOCATION", stage, "two successors for one account state");
   const byId = recorded.find((r) => r.successionId === t.successionId);
-  const pinRow = tx.get("pins", t.accountId);
-  if (atState) {
-    if (sameTransition(rowTransition(atState), t)) {
-      if (!pinRow) throw new KavachError("STORAGE_FAILURE", stage, "a recorded succession without its pin");
-      return { outcome: "DUPLICATE", accountId: parsed.accountId, accountName: t.accountName, previousIdentityId: parsed.previousIdentityId, newIdentityId: parsed.newIdentityId, generation: t.newGeneration, transition: t, pin: rowToPin(pinRow) };
-    }
-    throw new KavachError("EQUIVOCATION", stage, "two successors for one account state");
-  }
   if (byId && !sameTransition(rowTransition(byId), t)) throw new KavachError("EQUIVOCATION", stage, "a known succession id with a different transition");
 
-  // Order 3: a new transition against the pinned state, with the one validator every path uses.
+  // Order four: a new transition against the pinned state, with the one validator every path uses.
   if (!pinRow) throw new KavachError("SUCCESSION_BINDING", stage, "no pin for the account");
   const pin = rowToPin(pinRow);
   const { cert } = validateTransition(parsed, input.newCertificate, pinnedState(tx, pin, input.trust));

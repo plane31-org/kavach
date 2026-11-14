@@ -50,15 +50,16 @@ export interface InboxDeps {
 
 // Views over the store --------------------------------------------------------------------------
 
-function authorViewFor(tx: Pick<Tx, "get" | "list">, streamId: Uint8Array): { view: AuthorView; identityId: Uint8Array } | undefined {
-  const certs = tx.list("certificates").filter(([, c]) => c.streamId === toHex(streamId));
-  const first = certs[0]?.[1];
+/** One scan of the certificates: the author the stream belongs to, every certificate of that author, and the stream's certificate generation. */
+function authorViewFor(tx: Pick<Tx, "get" | "list">, streamId: Uint8Array): { view: AuthorView; identityId: Uint8Array; generation: bigint } | undefined {
+  const streamHex = toHex(streamId);
+  const rows = tx.list("certificates").map(([, c]) => c);
+  const first = rows.find((c) => c.streamId === streamHex);
   if (!first) return undefined;
-  const all = tx.list("certificates").filter(([, c]) => c.identityId === first.identityId);
   const certificates = new Map(
-    all.map(([, c]) => [c.certificateHash, { certificateHash: fromHex(c.certificateHash), signingKey: fromHex(c.signingKey), streamId: fromHex(c.streamId), current: c.current }])
+    rows.filter((c) => c.identityId === first.identityId).map((c) => [c.certificateHash, { certificateHash: fromHex(c.certificateHash), signingKey: fromHex(c.signingKey), streamId: fromHex(c.streamId), current: c.current }])
   );
-  return { view: { identityId: fromHex(first.identityId), certificates }, identityId: fromHex(first.identityId) };
+  return { view: { identityId: fromHex(first.identityId), certificates }, identityId: fromHex(first.identityId), generation: unbig(first.generation) };
 }
 
 function isAuthorized(tx: Pick<Tx, "get" | "list">, authorIdentityId: Uint8Array, self: Uint8Array): boolean {
@@ -124,7 +125,7 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   const id = toHex(opened.recordId);
   const hash = toHex(bodyHash(opened.record.body));
   const cert = [...author.view.certificates.values()].find((c) => equalBytes(c.streamId, parsed.streamId));
-  const generation = unbig(tx.list("certificates").find(([, c]) => c.streamId === toHex(parsed.streamId))?.[1].generation ?? "0");
+  const generation = author.generation;
   const kind = opened.kind;
   const base = { recordId: opened.recordId, authorIdentityId: author.identityId, kind };
   const declared = kindOf(deps.policy, kind);

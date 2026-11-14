@@ -2,6 +2,18 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
+## 0.7.1
+
+Protocol revision 11, no wire change. What an architecture review of the code turned up: four defects and four small improvements, no refactor of the client.
+
+- **Reset receipts keep their own hash.** The persisted `resetReceipts` rows all carried the first accepted receipt's hash, so after a reload the accepted set held one hash and a re-presented older receipt was recognised only through its reset id, after the fresh-list and signer checks; under a since-rotated key it was refused as `RESET_KEY_REVOKED` instead of answered `DUPLICATE`. The hash now lives on the binding and the accepted set is rebuilt from the rows. Rows written before this carry a wrong hash and are still caught by the reset id.
+- **Succession verification follows section 4's order inside `applySuccession`.** A recorded, identical transition is `DUPLICATE` before any authentication, whatever happened to its key since (order one); anything else authenticates first, then the equivocation checks, then the transition validator. The chain follower already filtered recorded links, so only the direct path changes: an attestation of an accepted transition under a removed key is `DUPLICATE`, not `RESET_KEY_REVOKED`. A fork under a removed key is still refused as unauthenticated before it is called equivocation.
+- **The reset's table list is typed.** `RESET_TABLE_POLICY` in the store says `clear` or `keep` for every table; a new table does not compile until it is listed.
+- **T10 and T11 live in `transactions.ts`** (`t10PrepareReset`, `t10FinishReset`, `t11PrepareReplacement`, `t11ActivateReplacement`), with `packPendingRoots` and `unpackPendingRoots` replacing the offset slicing of the pending-roots secret. Behaviour unchanged.
+- **One certificate scan per inbound record** instead of three.
+- **`KavachError` carries `cause`** when it wraps a storage or primitive failure; code and stage carry nothing from it.
+- **README**: the retired `Location` exports are gone from the entry-point list, the fixture note names every regeneration, and the root manifest's description no longer names a product.
+
 ## 0.7.0
 
 Protocol revision 11: one reserved flag bit joins the header class. No existing byte changes.

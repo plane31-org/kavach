@@ -214,8 +214,8 @@ export function aeadOpen(key: Uint8Array, nonce: Uint8Array, aad: Uint8Array, ci
   if (key.length !== KEY_BYTES || nonce.length !== NONCE_BYTES) throw new KavachError("INVALID_KEY", stage);
   try {
     return be().aeadDecrypt(ciphertextAndTag, aad, nonce, key);
-  } catch {
-    throw new KavachError("DECRYPT_FAILED", stage);
+  } catch (e) {
+    throw new KavachError("DECRYPT_FAILED", stage, undefined, { cause: e });
   }
 }
 

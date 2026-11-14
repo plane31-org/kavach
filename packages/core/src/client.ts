@@ -3,7 +3,7 @@
  * transport, the recovery provider and the reset trust. States are emitted only after the
  * corresponding durable transition.
  */
-import { concat, equalBytes, fromHex, toHex } from "./bytes.js";
+import { equalBytes, fromHex, toHex } from "./bytes.js";
 import { resolveAudience, type ResolvedAudience } from "./audience.js";
 import { acceptSnapshot, checkMemberResolution, createCircleSnapshot, newCircleId, pinCircle, successorSnapshot, type CircleState } from "./circle.js";
 import { DocumentType, buildCircleSnapshot, expectType, parseDocument, parseVaultHeader, verifyDocument, type AccountDevice, type AccountSuccession, type RecordKind } from "./codec.js";
@@ -25,7 +25,7 @@ import { acceptsSuccession, allowsContinuity, kindOf, validatePolicy, type Repla
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
 import type { BootstrapRetryRow, CircleRow, MetaRow, PendingResetRow, ReplacementRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
-import { META, REVISION, STREAM, VAULT, openStore, t1Activate, t1Header, t1Secrets, t2PrepareActivation, t3ApplyChange, t3Circle, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault } from "./transactions.js";
+import { META, REVISION, STREAM, VAULT, openStore, packPendingRoots, type PendingRoots, t1Activate, t1Header, t1Secrets, t10FinishReset, t10PrepareReset, t11ActivateReplacement, t11PrepareReplacement, t2PrepareActivation, t3ApplyChange, t3Circle, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault, unpackPendingRoots } from "./transactions.js";
 import { applySuccession, authenticateSuccession, pinnedState, recordChainIn, rootIdentityIn, rootState, sameTransition, transitionOf, validateTransition, verifyChain, type SuccessionEffect, type VerifiedLink } from "./succession.js";
 import type { CircleListing, Directory, Relay, ResolvedAccount, SuccessionLink, Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
@@ -34,7 +34,6 @@ import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccou
 export type { HistoryEntry, HistoryPage, HistoryQuery, Newest, ReceiveResult } from "./inbox.js";
 
 /** accountSeed, deviceSeed, recoveryKey, instanceId and deviceId of a pending reset, in the secret store. */
-const RESET_ROOTS_BYTES = 32 * 3 + 16 + 16;
 
 /** The vault's entries as the circle rows say they should be. Entries of circles without a row are kept. */
 function reconcileEntries(entries: readonly VaultEntry[], rows: readonly CircleRow[]): VaultEntry[] {
@@ -505,14 +504,12 @@ class ClientImpl implements Client {
     const rows = await this.store.read((tx) => ({
       list: tx.get("resetList", "list"),
       clock: tx.get("clock", "clock"),
-      accepted: tx.list("resetReceipts").map(([k]) => k),
-      events: tx.list("resetReceipts").map(([k, r]) => ({ resetId: k, accountName: r.accountName, oldIdentityId: r.oldIdentityId, newIdentityId: r.newIdentityId })),
+      events: tx.list("resetReceipts").map(([k, r]) => ({ resetId: k, accountName: r.accountName, oldIdentityId: r.oldIdentityId, newIdentityId: r.newIdentityId, receiptHash: r.receiptHash })),
       retired: tx.list("retiredIdentities").map(([k]) => k)
     }));
     this.trust = ResetTrust.fromRows(this.options.resetTrust, {
       list: rows.list,
       clock: rows.clock ?? { highWater: "0" },
-      accepted: rows.events.map((e) => e.resetId).length ? (await this.store.read((tx) => tx.list("resetReceipts").map(([, r]) => r.receiptHash))) : [],
       events: rows.events,
       retired: rows.retired
     });
@@ -1167,8 +1164,8 @@ class ClientImpl implements Client {
       if (row && !row.stale) {
         try {
           const link = await this.findOwnLink(row);
-          const roots = await this.secrets.get("pendingReplacement");
-          if (link && roots && roots.length === RESET_ROOTS_BYTES) await this.activateReplacement(row, roots, link.wire);
+          const roots = unpackPendingRoots(await this.secrets.get("pendingReplacement"));
+          if (link && roots) await this.activateReplacement(row, roots, link.wire);
         } catch (e) {
           report.errors.push(syncError("resumeReplacement", e));
         }
@@ -1773,8 +1770,7 @@ class ClientImpl implements Client {
     const rows = this.trust.toRows();
     if (rows.list) tx.put("resetList", "list", rows.list);
     tx.put("clock", "clock", rows.clock);
-    const hashes = rows.accepted;
-    for (const e of rows.events) tx.put("resetReceipts", e.resetId, { accountName: e.accountName, oldIdentityId: e.oldIdentityId, newIdentityId: e.newIdentityId, receiptHash: hashes.find((h) => h) ?? "" });
+    for (const e of rows.events) tx.put("resetReceipts", e.resetId, { accountName: e.accountName, oldIdentityId: e.oldIdentityId, newIdentityId: e.newIdentityId, receiptHash: e.receiptHash });
     for (const r of rows.retired) tx.put("retiredIdentities", r, { identityId: r });
   }
 
@@ -2177,7 +2173,7 @@ class ClientImpl implements Client {
     if (opened.kind !== "fresh") throw new KavachError("MALFORMED", stage, "an account already exists on this device");
     const existing = await this.store.read((tx) => tx.get("replacement", "pending"));
     const roots = await this.secrets.get("pendingReplacement");
-    if (existing && !existing.stale && roots && roots.length === RESET_ROOTS_BYTES) return proposalOf(existing);
+    if (existing && !existing.stale && unpackPendingRoots(roots)) return proposalOf(existing);
     const [resolved] = await this.transport.directory.resolveAccounts([this.accountName]);
     if (!resolved) throw new KavachError("ACCOUNT_RECOVERY_REQUIRED", stage, "unknown account");
     const current = expectType<AccountDevice>(verifyDocument(resolved.certificate), DocumentType.AccountDevice, stage);
@@ -2196,7 +2192,7 @@ class ClientImpl implements Client {
     const pin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage), undefined, accountId);
     const vault = this.vaultEnabled ? buildVault({ accountName: this.accountName, accountKey: account.account.publicKey, vaultRevision: 1n }, { accountSeed, lastDeviceGeneration: generation, lastCertificateHash: pin.certificateHash, entries: [] }, recoveryKey) : undefined;
     // T11: roots in the secret store, the exact bytes in the store, before anything is sent.
-    await this.secrets.set("pendingReplacement", concat(accountSeed, device.deviceSeed, recoveryKey, instanceId, device.deviceId));
+    await this.secrets.set("pendingReplacement", packPendingRoots({ accountSeed, deviceSeed: device.deviceSeed, recoveryKey, instanceId, deviceId: device.deviceId }));
     const row: ReplacementRow = {
       successionId: toHex(successionId),
       accountName: this.accountName,
@@ -2210,7 +2206,7 @@ class ClientImpl implements Client {
       stale: false,
       conflictGeneration: undefined
     };
-    await this.store.transaction((tx) => tx.put("replacement", "pending", row));
+    await this.store.transaction((tx) => t11PrepareReplacement(tx, row));
     await this.emitState();
     return proposalOf(row);
   }
@@ -2223,7 +2219,8 @@ class ClientImpl implements Client {
     if (!row || row.successionId !== toHex(input.successionId)) throw new KavachError("MALFORMED", stage, "no such prepared replacement on this device");
     if (row.stale) throw new KavachError("REPLACEMENT_CONFLICT", stage, row.conflictGeneration === undefined ? "the account moved" : `the account is at generation ${row.conflictGeneration}`);
     const roots = await this.secrets.get("pendingReplacement");
-    if (!roots || roots.length !== RESET_ROOTS_BYTES) throw new KavachError("RECOVERY_REQUIRED", stage, "replacement prepared without its roots");
+    const pendingRoots = unpackPendingRoots(roots);
+    if (!pendingRoots) throw new KavachError("RECOVERY_REQUIRED", stage, "replacement prepared without its roots");
     let outcome: Awaited<ReturnType<Directory["succeedAccount"]>>;
     try {
       outcome = await this.transport.directory.succeedAccount({
@@ -2251,7 +2248,7 @@ class ClientImpl implements Client {
       } catch {
         current = undefined;
       }
-      await this.store.transaction((tx) => tx.put("replacement", "pending", { ...row, stale: true, conflictGeneration: current === undefined ? undefined : big(current) }));
+      await this.store.transaction((tx) => t11PrepareReplacement(tx, { ...row, stale: true, conflictGeneration: current === undefined ? undefined : big(current) }));
       await this.secrets.delete("pendingReplacement");
       await this.emitState();
       throw new KavachError("REPLACEMENT_CONFLICT", stage, current === undefined ? "the account moved" : `the account is at generation ${current}`);
@@ -2260,7 +2257,7 @@ class ClientImpl implements Client {
     if ((outcome.status !== "COMMITTED" && outcome.status !== "ALREADY_COMMITTED") || !outcome.succession) {
       throw new KavachError("SUCCESSION_PENDING", stage, `host answered ${outcome.status}`);
     }
-    return this.activateReplacement(row, roots, outcome.succession);
+    return this.activateReplacement(row, pendingRoots, outcome.succession);
   }
 
   /** Our own link on the host's chain, if the proposal committed: the one naming our succession id and certificate. */
@@ -2292,7 +2289,7 @@ class ClientImpl implements Client {
    * pinned from the host, then the T1 header under the new identity with the account id carried
    * from the proposal. A succession that does not verify leaves the proposal intact.
    */
-  private async activateReplacement(row: ReplacementRow, roots: Uint8Array, succession: Uint8Array): Promise<{ identityId: Uint8Array; generation: bigint }> {
+  private async activateReplacement(row: ReplacementRow, roots: PendingRoots, succession: Uint8Array): Promise<{ identityId: Uint8Array; generation: bigint }> {
     const stage = "completeReplacement";
     await this.ensureResetList();
     const previousWire = await this.transport.directory.getCertificate(fromHex(row.expectedCertificateHash));
@@ -2315,11 +2312,7 @@ class ClientImpl implements Client {
     if (served.length === 0 && me.successionsNext === undefined && !equalBytes(previousPin.identityId, accountId)) throw new KavachError("METADATA_REQUIRED", stage, "the account's earlier successions are not served; the proposal stays");
     // Bounded by the generation this device's own succession left from, on every page alike.
     const history = served.length > 0 || me.successionsNext !== undefined ? (await this.followChain({ accountId, accountName: this.accountName, finalIdentityId: previousPin.identityId, untilGeneration: ownSuccession.previousGeneration, firstPage: served, next: me.successionsNext })).verified : [];
-    const accountSeed = roots.subarray(0, 32);
-    const deviceSeed = roots.subarray(32, 64);
-    const recoveryKey = roots.subarray(64, 96);
-    const instanceId = roots.subarray(96, 112);
-    const deviceId = roots.subarray(112, 128);
+    const { accountSeed, deviceSeed, recoveryKey, instanceId, deviceId } = roots;
     const account = openAccount(this.accountName, accountSeed, accountId);
     const device = deviceFromSeed(deviceSeed, deviceId);
     const certificate = fromHex(row.certificate);
@@ -2337,13 +2330,7 @@ class ClientImpl implements Client {
       const effect = applySuccession(tx, { wire: succession, newCertificate: certificate, policy: this.policy, trust: this.trust, now: this.now() });
       if (!equalBytes(effect.newIdentityId, account.identityId) || toHex(effect.accountId) !== row.accountId) throw new KavachError("SUCCESSION_BINDING", stage, "the succession does not name this device's key");
       this.persistTrustIn(tx);
-      t1Header(tx, { account, device, certificate, instanceId, generation: doc.generation });
-      if (row.vault !== undefined && row.vaultHash !== undefined) t9Vault(tx, { revision: "1", hash: row.vaultHash, wire: row.vault, pending: false, dirty: false });
-      t3ApplyChange(tx, { kind: "ownActivation" });
-      t1Activate(tx);
-      const meta = tx.get("meta", META);
-      if (meta) tx.put("meta", META, { ...meta, bootstrap: { complete: false } });
-      tx.delete("replacement", "pending");
+      t11ActivateReplacement(tx, { account, device, certificate, instanceId, generation: doc.generation, vault: row.vault !== undefined && row.vaultHash !== undefined ? { revision: "1", hash: row.vaultHash, wire: row.vault, pending: false, dirty: false } : undefined });
     });
     await this.secrets.delete("pendingReplacement");
     this.account = account;
@@ -2481,8 +2468,8 @@ class ClientImpl implements Client {
     const instanceId = randomBytes(16);
     // Persisted before it is sent: the host may commit the new identity and the response be lost,
     // and the only keys that can continue are these. Roots in the secret store, wires in the store.
-    await this.secrets.set("pendingReset", concat(accountSeed, device.deviceSeed, recoveryKey, instanceId, device.deviceId));
-    await this.store.transaction((tx) => tx.put("pendingReset", "pending", { resetId: toHex(resetId), oldIdentityId: toHex(pin.identityId), certificate: toHex(certificate), vault: vault ? toHex(vault.wire) : undefined, vaultHash: vault ? toHex(vault.hash) : undefined }));
+    await this.secrets.set("pendingReset", packPendingRoots({ accountSeed, deviceSeed: device.deviceSeed, recoveryKey, instanceId, deviceId: device.deviceId }));
+    await this.store.transaction((tx) => t10PrepareReset(tx, { resetId: toHex(resetId), oldIdentityId: toHex(pin.identityId), certificate: toHex(certificate), vault: vault ? toHex(vault.wire) : undefined, vaultHash: vault ? toHex(vault.hash) : undefined }));
     return this.resumeReset(stage, options.reauthProof);
   }
 
@@ -2490,12 +2477,13 @@ class ClientImpl implements Client {
   private async resumeReset(stage: string, reauthProof?: Uint8Array): Promise<{ identityId: Uint8Array }> {
     const row = await this.store.read((tx) => tx.get("pendingReset", "pending"));
     const roots = await this.secrets.get("pendingReset");
-    if (!row || !roots || roots.length !== RESET_ROOTS_BYTES) throw new KavachError("RECOVERY_REQUIRED", stage, "reset pending without its roots");
+    const pendingRoots = unpackPendingRoots(roots);
+    if (!row || !pendingRoots) throw new KavachError("RECOVERY_REQUIRED", stage, "reset pending without its roots");
     const certificate = fromHex(row.certificate);
     expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage);
     const outcome = await this.transport.directory.resetAccount({ accountName: this.accountName, expectedOldIdentityId: fromHex(row.oldIdentityId), newCertificate: certificate, newVault: row.vault === undefined ? undefined : fromHex(row.vault), resetId: fromHex(row.resetId), reauthProof: reauthProof ?? new Uint8Array() });
     if ((outcome.status !== "COMMITTED" && outcome.status !== "ALREADY_COMMITTED") || !outcome.receipt) throw new KavachError("NOT_AUTHORIZED", stage, `host refused reset: ${outcome.status}`);
-    return this.finishReset(stage, row, roots);
+    return this.finishReset(stage, row, pendingRoots);
   }
 
   /**
@@ -2503,25 +2491,14 @@ class ClientImpl implements Client {
    * identity. Nothing of the old identity's keys survives. Safe to run again after a crash at
    * any point, until the pending row is gone.
    */
-  private async finishReset(stage: string, row: PendingResetRow, roots: Uint8Array): Promise<{ identityId: Uint8Array }> {
-    const accountSeed = roots.subarray(0, 32);
-    const deviceSeed = roots.subarray(32, 64);
-    const recoveryKey = roots.subarray(64, 96);
-    const instanceId = roots.subarray(96, 112);
-    const deviceId = roots.subarray(112, 128);
+  private async finishReset(stage: string, row: PendingResetRow, roots: PendingRoots): Promise<{ identityId: Uint8Array }> {
+    const { accountSeed, deviceSeed, recoveryKey, instanceId, deviceId } = roots;
     const account = openAccount(this.accountName, accountSeed);
     const device = deviceFromSeed(deviceSeed, deviceId);
     const certificate = fromHex(row.certificate);
     const newPin = pinFromCertificate(expectType<AccountDevice>(verifyDocument(certificate), DocumentType.AccountDevice, stage));
     await t1Secrets(this.secrets, { accountSeed, deviceSeed, recoveryKey, instanceId });
-    await this.store.transaction((tx) => {
-      for (const table of ["meta", "self", "pins", "certificates", "quarantine", "circles", "revision", "vault", "epochs", "stream", "outbox", "history", "historyIndex", "enqueueKeys", "newest", "successions", "identities", "keyChanges", "replacement", "preferences", "chainProgress", "readerEpochs", "subscriptions", "unresolved", "activation", "pendingReset"] as const) {
-        for (const [k] of tx.list(table)) tx.delete(table, k);
-      }
-      t1Header(tx, { account, device, certificate, instanceId, generation: 1n });
-      if (row.vault !== undefined && row.vaultHash !== undefined) t9Vault(tx, { revision: "1", hash: row.vaultHash, wire: row.vault, pending: false, dirty: false });
-      t1Activate(tx);
-    });
+    await this.store.transaction((tx) => t10FinishReset(tx, { account, device, certificate, instanceId, vault: row.vault !== undefined && row.vaultHash !== undefined ? { revision: "1", hash: row.vaultHash, wire: row.vault, pending: false, dirty: false } : undefined }));
     await this.secrets.delete("pendingReset");
     this.account = account;
     this.device = device;
@@ -2544,8 +2521,9 @@ class ClientImpl implements Client {
     const row = await this.store.read((tx) => tx.get("pendingReset", "pending"));
     if (!row) return;
     const [roots, accountSeed] = await Promise.all([this.secrets.get("pendingReset"), this.secrets.get("accountSeed")]);
-    if (!roots || roots.length !== RESET_ROOTS_BYTES || !accountSeed || !equalBytes(accountSeed, roots.subarray(0, 32))) return;
-    await this.finishReset("load", row, roots);
+    const pendingRoots = unpackPendingRoots(roots);
+    if (!pendingRoots || !accountSeed || !equalBytes(accountSeed, pendingRoots.accountSeed)) return;
+    await this.finishReset("load", row, pendingRoots);
   }
 
   async close(): Promise<void> {

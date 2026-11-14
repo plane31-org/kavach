@@ -2,7 +2,7 @@
   "name": "kavach",
   "private": true,
   "version": "0.0.0",
-  "description": "Kavach v1: end-to-end encrypted location sharing and check-ins for small circles",
+  "description": "Kavach v1: end-to-end encrypted, relayed, durable records for small circles; the first product shares locations and check-ins",
   "license": "Apache-2.0",
   "packageManager": "pnpm@9.12.0",
   "engines": {

@@ -404,6 +404,45 @@ export interface Tables {
 
 export type TableName = keyof Tables;
 
+/**
+ * What an account reset (T10) does to each table: `clear`, the old identity's state goes; `keep`,
+ * the reset trust (key list, receipts, retired identities, clock high-water mark) survives, since
+ * it is what lets the new identity refuse the old one's replay. Typed over every table, so a new
+ * table does not compile until someone decides.
+ */
+export const RESET_TABLE_POLICY: Readonly<Record<TableName, "clear" | "keep">> = {
+  meta: "clear",
+  self: "clear",
+  pins: "clear",
+  certificates: "clear",
+  quarantine: "clear",
+  circles: "clear",
+  revision: "clear",
+  vault: "clear",
+  epochs: "clear",
+  stream: "clear",
+  outbox: "clear",
+  history: "clear",
+  historyIndex: "clear",
+  enqueueKeys: "clear",
+  newest: "clear",
+  readerEpochs: "clear",
+  subscriptions: "clear",
+  unresolved: "clear",
+  activation: "clear",
+  resetList: "keep",
+  resetReceipts: "keep",
+  retiredIdentities: "keep",
+  clock: "keep",
+  pendingReset: "clear",
+  successions: "clear",
+  identities: "clear",
+  keyChanges: "clear",
+  replacement: "clear",
+  preferences: "clear",
+  chainProgress: "clear"
+};
+
 /** Bounds for `Tx.range`: every given bound applies; an absent one is open. */
 export interface KeyRange {
   readonly prefix?: string;

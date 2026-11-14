@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { toHex } from "../src/bytes.js";
-import { ready, signingKeypairFromSeed } from "../src/crypto.js";
+import { H, ready, signingKeypairFromSeed } from "../src/crypto.js";
 import { KavachError } from "../src/errors.js";
 import { ResetTrust, emptyResetTrust } from "../src/reset.js";
 import { fixture, hex, str } from "./fixture.js";
@@ -107,6 +107,9 @@ describe("K01 to K22 against the fixture, with K19 at 30 days", () => {
     expect(restored.state.timeHighWater).toBe(now + 10_000n);
     expect(restored.state.retired.has(alice.identity_id)).toBe(true);
     expect(run(() => restored.apply(receipt, newCert, "alice", resetIid(), now + 10_000n))).toBe("DUPLICATE");
+    // Each row carries its own receipt's hash, and the accepted set is rebuilt from exactly those.
+    expect(rows.events.map((e) => e.receiptHash)).toEqual([toHex(H(receipt))]);
+    expect([...restored.state.acceptedReceipts]).toEqual([toHex(H(receipt))]);
     expect(run(() => restored.install(kl1, now + 9_999n))).toBe("RESET_CLOCK_UNTRUSTED");
     expect(new ResetTrust({ managementKey: root, minimumVersion: 1n }, emptyResetTrust).fresh(now)).toBe(false);
   });

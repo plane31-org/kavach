@@ -80,8 +80,12 @@ export class KavachError extends Error {
   /** On `RATE_LIMITED`: how long the host asked the client to wait, when it said. */
   readonly retryAfterMs: number | undefined;
 
-  constructor(code: ErrorCode, stage = "unknown", message?: string, options: { retryAfterMs?: number } = {}) {
-    super(message ?? `${code} at ${stage}`);
+  /**
+   * `cause`: the underlying error when one is wrapped (a storage, network or primitive failure),
+   * for development; the code and the stage carry nothing from it.
+   */
+  constructor(code: ErrorCode, stage = "unknown", message?: string, options: { retryAfterMs?: number; cause?: unknown } = {}) {
+    super(message ?? `${code} at ${stage}`, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = "KavachError";
     this.code = code;
     this.stage = stage;

@@ -1,9 +1,9 @@
 /**
- * The named transaction boundaries of protocol section 11 (T1 to T5, T8, T9). T6, T6h and T7
- * live with the outbox and the inbox. Each function takes an open `Tx` so callers can compose
- * them; nothing here opens the network.
+ * The named transaction boundaries of protocol section 11 (T1 to T5, T8, T9, T10, T11). T6, T6h
+ * and T7 live with the outbox and the inbox. Each function takes an open `Tx` so callers can
+ * compose them; nothing here opens the network.
  */
-import { equalBytes, fromHex, toHex } from "./bytes.js";
+import { concat, equalBytes, fromHex, toHex } from "./bytes.js";
 import { applyAudienceEvent, initialRevisionState, type AudienceEvent } from "./audience.js";
 import { DocumentType, expectType, parseDocument, type AccountDevice } from "./codec.js";
 import { identityId } from "./crypto.js";
@@ -12,7 +12,7 @@ import { promote } from "./epoch.js";
 import { KavachError } from "./errors.js";
 import { openAccount, pinFromCertificate, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { big, pinToRow, preparedToRow, revisionToRow, rowToPrepared, rowToRevision, unbig } from "./rows.js";
-import type { ActivationRow, CircleRow, MetaRow, SecretStore, Store, StoreState, Tx, VaultRow } from "./store.js";
+import { RESET_TABLE_POLICY, type ActivationRow, type CircleRow, type MetaRow, type PendingResetRow, type ReplacementRow, type SecretStore, type Store, type StoreState, type TableName, type Tx, type VaultRow } from "./store.js";
 
 export const META = "meta";
 export const SELF = "self";
@@ -235,4 +235,77 @@ export function selfIdentity(tx: Pick<Tx, "get">, accountName: string, accountKe
   const iid = identityId(accountName, accountKey);
   if (meta && meta.identityId !== toHex(iid)) throw new KavachError("RECOVERY_REQUIRED", "selfIdentity");
   return iid;
+}
+
+// Pending roots (T10, T11) -----------------------------------------------------------------------
+
+/**
+ * The roots of an identity prepared but not yet active, kept as one secret under `pendingReset`
+ * or `pendingReplacement` until the host commits: account seed, device seed, recovery key,
+ * instance id, device id. One secret, so the five appear and disappear together.
+ */
+export interface PendingRoots {
+  readonly accountSeed: Uint8Array;
+  readonly deviceSeed: Uint8Array;
+  readonly recoveryKey: Uint8Array;
+  readonly instanceId: Uint8Array;
+  readonly deviceId: Uint8Array;
+}
+
+export const PENDING_ROOTS_BYTES = 32 * 3 + 16 + 16;
+
+export function packPendingRoots(r: PendingRoots): Uint8Array {
+  if (r.accountSeed.length !== 32 || r.deviceSeed.length !== 32 || r.recoveryKey.length !== 32 || r.instanceId.length !== 16 || r.deviceId.length !== 16) throw new KavachError("INVALID_KEY", "pendingRoots", "root lengths");
+  return concat(r.accountSeed, r.deviceSeed, r.recoveryKey, r.instanceId, r.deviceId);
+}
+
+/** `undefined` when the secret is absent or not the packed shape, which the caller reports as `RECOVERY_REQUIRED`. */
+export function unpackPendingRoots(bytes: Uint8Array | undefined): PendingRoots | undefined {
+  if (!bytes || bytes.length !== PENDING_ROOTS_BYTES) return undefined;
+  return { accountSeed: bytes.subarray(0, 32), deviceSeed: bytes.subarray(32, 64), recoveryKey: bytes.subarray(64, 96), instanceId: bytes.subarray(96, 112), deviceId: bytes.subarray(112, 128) };
+}
+
+// T10: account reset -----------------------------------------------------------------------------
+
+/** The exact bytes of a reset the host will be asked to commit, before anything is sent. */
+export function t10PrepareReset(tx: Tx, row: PendingResetRow): void {
+  tx.put("pendingReset", "pending", row);
+}
+
+/**
+ * The local half of a committed reset: every table of the old identity cleared under
+ * `RESET_TABLE_POLICY` (the reset trust kept), then the header, the vault and the activation of
+ * the new one. The pending row is among what is cleared.
+ */
+export function t10FinishReset(tx: Tx, input: { account: OwnAccount; device: DeviceKeys; certificate: Uint8Array; instanceId: Uint8Array; vault: VaultRow | undefined }): void {
+  for (const table of Object.keys(RESET_TABLE_POLICY) as TableName[]) {
+    if (RESET_TABLE_POLICY[table] !== "clear") continue;
+    for (const [k] of tx.list(table)) tx.delete(table, k);
+  }
+  t1Header(tx, { account: input.account, device: input.device, certificate: input.certificate, instanceId: input.instanceId, generation: 1n });
+  if (input.vault) t9Vault(tx, input.vault);
+  t1Activate(tx);
+}
+
+// T11: account replacement (amendment A1) ----------------------------------------------------------
+
+/** The replacement proposal, or its update to stale: the exact bytes a retry sends. */
+export function t11PrepareReplacement(tx: Tx, row: ReplacementRow): void {
+  tx.put("replacement", "pending", row);
+}
+
+/**
+ * The writes that make a verified replacement this device's identity, after the caller has pinned
+ * the previous state, recorded the chain and applied the succession in the same transaction: the
+ * header at the succession's generation, the vault, the own-activation audience event, the
+ * activation, a bootstrap from scratch, and the proposal gone.
+ */
+export function t11ActivateReplacement(tx: Tx, input: { account: OwnAccount; device: DeviceKeys; certificate: Uint8Array; instanceId: Uint8Array; generation: bigint; vault: VaultRow | undefined }): void {
+  t1Header(tx, { account: input.account, device: input.device, certificate: input.certificate, instanceId: input.instanceId, generation: input.generation });
+  if (input.vault) t9Vault(tx, input.vault);
+  t3ApplyChange(tx, { kind: "ownActivation" });
+  t1Activate(tx);
+  const meta = tx.get("meta", META);
+  if (meta) tx.put("meta", META, { ...meta, bootstrap: { complete: false } });
+  tx.delete("replacement", "pending");
 }
