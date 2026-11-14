@@ -2,6 +2,15 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
+## 0.7.2
+
+Protocol revision 11, no wire change. Hot-path reads, from a review of the code.
+
+- **An inbound record is parsed and hashed once.** The inbox parses the wire to route it and hands the parsed document to the opener (`openParsedRecord`, internal), which verifies the signature over the parsed body under the stream's certificate key before decrypting, as before; the body hash is the parse's. Three parses and four hashes per record become one of each. `openRecordWire` is the same function over a fresh parse, so the negative vectors reject identically on both paths.
+- **`getState()` is one store read** instead of six, the circles scanned once for the summaries and for `waitingFor`, and the reader-epoch check asks for one row rather than loading them all.
+- **The chain follower scans one account's successions** by key prefix, not every account's.
+- **No identifier in a `securityError` detail.** The refused-epoch detail named the first bytes of a stream id; it no longer does, since apps log details.
+
 ## 0.7.1
 
 Protocol revision 11, no wire change. What an architecture review of the code turned up: four defects and four small improvements, no refactor of the client.

@@ -4,12 +4,11 @@
  */
 import { equalBytes, fromHex, toHex } from "./bytes.js";
 import { DocumentType, expectType, parseDocument, type EncryptedRecord, type RecordKind } from "./codec.js";
-import { bodyHash } from "./crypto.js";
 import { openEpoch, type AuthorView, type SelfView } from "./epoch.js";
 import { KavachError, isKavachError } from "./errors.js";
 import { authorPrefix, indexHistory, padTime, timelinePrefix, unindexHistory } from "./historyIndex.js";
 import { historyKinds, kindOf, type RetentionPolicy } from "./policy.js";
-import { openRecordWire } from "./record.js";
+import { openParsedRecord } from "./record.js";
 import { big, unbig } from "./rows.js";
 import { clampEventTime, slotKey, takeSlot } from "./slots.js";
 import type { HistoryRow, KeyRange, Store, SubscriptionRow, Tx } from "./store.js";
@@ -116,14 +115,14 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   if (!isAuthorized(tx, author.identityId, self.identityId)) return { result: "invalid", reason: "NOT_AUTHORIZED" };
   let opened;
   try {
-    opened = openRecordWire(wire, author.view, (s, e) => epochKeyFor(tx, s, e));
+    opened = openParsedRecord(parsed, author.view, (s, e) => epochKeyFor(tx, s, e));
   } catch (e) {
     if (isKavachError(e, "KEY_PENDING")) return { result: "keyPending", streamId: parsed.streamId, epoch: parsed.epoch };
     if (e instanceof KavachError) return { result: "invalid", reason: e.code };
     throw e;
   }
   const id = toHex(opened.recordId);
-  const hash = toHex(bodyHash(opened.record.body));
+  const hash = toHex(opened.record.bodyHash);
   const cert = [...author.view.certificates.values()].find((c) => equalBytes(c.streamId, parsed.streamId));
   const generation = author.generation;
   const kind = opened.kind;
@@ -313,7 +312,7 @@ async function processPage(deps: InboxDeps, streamId: Uint8Array, authorIdentity
           // The served manifest or wrap did not verify. The record may still be honest, so it is
           // held as keyPending (the prefix stops here, scenario 21) and the code is named; the
           // relay's expiry resolves a manifest that never verifies.
-          deps.events?.securityError?.(e.code, `epoch ${r.epoch} of stream ${toHex(r.streamId).slice(0, 8)} refused`);
+          deps.events?.securityError?.(e.code, `epoch ${r.epoch} of an author's stream refused`); // no identifier in a detail an app may log
         } else throw e;
       }
       if (fetched) r = await deps.store.transaction((tx) => storeRecord(tx, deps, item.wire, now));

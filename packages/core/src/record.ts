@@ -5,18 +5,18 @@
 import { equalBytes, toHex } from "./bytes.js";
 import {
   DocumentType,
+  LABEL_BY_TYPE,
   buildRecordWire,
   decodeEnvelope,
   expectType,
   openRecord as openRecordBody,
   parseDocument,
-  verifyDocument,
   type EncryptedRecord,
   type HeaderClass,
   type Parsed,
   type RecordKind
 } from "./codec.js";
-import { NONCE_BYTES, randomBytes, recordId } from "./crypto.js";
+import { NONCE_BYTES, randomBytes, recordId, verify } from "./crypto.js";
 import type { AuthorView } from "./epoch.js";
 import { MAX_COUNTER } from "./epoch.js";
 import { KavachError } from "./errors.js";
@@ -77,11 +77,26 @@ export function openRecordWire(
   author: AuthorView,
   epochKeyFor: (streamId: Uint8Array, epoch: number) => Uint8Array | undefined
 ): OpenedRecord {
+  return openParsedRecord(expectType<EncryptedRecord>(parseDocument(wire), DocumentType.EncryptedRecord, "openRecord"), author, epochKeyFor);
+}
+
+/**
+ * The same opening from a record already parsed (the inbox parses once to route it): the stream's
+ * certificate, the signature over the parsed body under that certificate's key, then the key and
+ * the envelope. Verification before decryption, as in `verifyDocument`; the parse is not repeated
+ * and the body hash is the one the parse computed. Internal to the package.
+ */
+export function openParsedRecord(
+  record: Parsed<EncryptedRecord>,
+  author: AuthorView,
+  epochKeyFor: (streamId: Uint8Array, epoch: number) => Uint8Array | undefined
+): OpenedRecord {
   const stage = "openRecord";
-  const parsed = expectType<EncryptedRecord>(parseDocument(wire), DocumentType.EncryptedRecord, stage);
-  const cert = [...author.certificates.values()].find((c) => equalBytes(c.streamId, parsed.streamId));
+  const cert = [...author.certificates.values()].find((c) => equalBytes(c.streamId, record.streamId));
   if (!cert) throw new KavachError("NOT_AUTHORIZED", stage, "record stream belongs to no known device of the author");
-  const record = expectType<EncryptedRecord>(verifyDocument(wire, cert.signingKey), DocumentType.EncryptedRecord, stage);
+  const label = LABEL_BY_TYPE[record.type];
+  if (!label) throw new KavachError("UNSUPPORTED_TYPE", stage);
+  verify(cert.signingKey, label, record.body, record.signature, stage);
   const key = epochKeyFor(record.streamId, record.epoch);
   if (!key) throw new KavachError("KEY_PENDING", stage, `no key for epoch ${record.epoch}`);
   const envelope = decodeEnvelope(openRecordBody(record, key));

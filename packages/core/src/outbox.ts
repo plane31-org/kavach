@@ -387,5 +387,10 @@ export function outboxCounts(tx: Pick<Tx, "list">, now: bigint): OutboxCounts {
 
 /** Rows still waiting, for state reporting. */
 export async function outboxCount(store: Store): Promise<number> {
-  return store.read((tx) => tx.list("outbox").filter(([, r]) => r.status === "queued" || r.status === "inflight").length);
+  return store.read((tx) => outboxCountIn(tx));
+}
+
+/** The records still to send, inside a read the caller holds. */
+export function outboxCountIn(tx: Pick<Tx, "list">): number {
+  return tx.list("outbox").filter(([, r]) => r.status === "queued" || r.status === "inflight").length;
 }

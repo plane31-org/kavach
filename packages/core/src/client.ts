@@ -13,7 +13,7 @@ import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { ensureHistoryIndex } from "./historyIndex.js";
 import { ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
-import { drain, enqueue, outboxCount, outboxCounts, purgeOutbox, type EnqueueOptions, type OutboxCounts } from "./outbox.js";
+import { drain, enqueue, outboxCountIn, outboxCounts, purgeOutbox, type EnqueueOptions, type OutboxCounts } from "./outbox.js";
 export type { EnqueueOptions } from "./outbox.js";
 
 /** The durable record a hand-over produced; `duplicate` when an idempotency key matched an earlier one. */
@@ -24,7 +24,7 @@ export interface EnqueueResult {
 import { acceptsSuccession, allowsContinuity, kindOf, validatePolicy, type ReplacementModel, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
-import type { BootstrapRetryRow, CircleRow, MetaRow, PendingResetRow, ReplacementRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
+import type { BootstrapRetryRow, CircleRow, MetaRow, PendingResetRow, ReplacementRow, RevisionRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
 import { META, REVISION, STREAM, VAULT, openStore, packPendingRoots, type PendingRoots, t1Activate, t1Header, t1Secrets, t10FinishReset, t10PrepareReset, t11ActivateReplacement, t11PrepareReplacement, t2PrepareActivation, t3ApplyChange, t3Circle, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault, unpackPendingRoots } from "./transactions.js";
 import { applySuccession, authenticateSuccession, pinnedState, recordChainIn, rootIdentityIn, rootState, sameTransition, transitionOf, validateTransition, verifyChain, type SuccessionEffect, type VerifiedLink } from "./succession.js";
 import type { CircleListing, Directory, Relay, ResolvedAccount, SuccessionLink, Transport } from "./transport.js";
@@ -595,17 +595,20 @@ class ClientImpl implements Client {
   // State -----------------------------------------------------------------------------------------
 
   async getState(): Promise<ClientState> {
-    const meta = await this.store.read((tx) => tx.get("meta", META));
     const base = { identityId: this.selfPin?.accountId, keyIdentityId: this.selfPin?.identityId, certificateHash: this.selfPin?.certificateHash, generation: this.selfPin?.generation, outbox: 0, waitingFor: [] as Uint8Array[], circles: [] as CircleSummary[] };
-    if (!meta || (!this.account && meta.state !== "RETIRED")) {
-      const proposal = await this.store.read((tx) => tx.get("replacement", "pending"));
-      return { status: proposal && !proposal.stale ? "replacementPrepared" : "fresh", paused: undefined, ...base };
-    }
-    const circles = await this.listCircles();
-    const outbox = await outboxCount(this.store);
-    const waitingFor = await this.waitingFor();
-    const revision = await this.store.read((tx) => tx.get("revision", REVISION));
-    const quarantined = await this.store.read((tx) => tx.count("quarantine") > 0);
+    // One read for the whole state: the store queue is taken once and the circles are scanned once,
+    // for the summaries and for who is still waited on.
+    type Snapshot =
+      | { readonly opened: false; readonly proposal: ReplacementRow | undefined }
+      | { readonly opened: true; readonly meta: MetaRow; readonly circles: CircleSummary[]; readonly outbox: number; readonly waitingFor: Uint8Array[]; readonly revision: RevisionRow | undefined; readonly quarantined: boolean };
+    const snap = await this.store.read((tx): Snapshot => {
+      const meta = tx.get("meta", META);
+      if (!meta || (!this.account && meta.state !== "RETIRED")) return { opened: false, proposal: tx.get("replacement", "pending") };
+      const rows = tx.list("circles").map(([, r]) => r);
+      return { opened: true, meta, circles: this.circleSummaries(rows), outbox: outboxCountIn(tx), waitingFor: this.waitingForIn(tx, rows), revision: tx.get("revision", REVISION), quarantined: tx.count("quarantine") > 0 };
+    });
+    if (!snap.opened) return { status: snap.proposal && !snap.proposal.stale ? "replacementPrepared" : "fresh", paused: undefined, ...base };
+    const { meta, circles, outbox, waitingFor, revision, quarantined } = snap;
     let status: ClientStatus = "ready";
     if (meta.state === "INITIALIZING") status = "accountRecoveryRequired";
     else if (meta.state === "ACTIVATION_PENDING") status = "activationPending";
@@ -615,21 +618,20 @@ class ClientImpl implements Client {
     return { status, paused: revision?.paused, ...base, outbox, waitingFor, circles };
   }
 
-  private async waitingFor(): Promise<Uint8Array[]> {
+  /** The authors of the circles this device is a member of whose current epoch has no key for it yet. */
+  private waitingForIn(tx: Pick<Tx, "get" | "range">, circles: readonly CircleRow[]): Uint8Array[] {
     if (!this.selfPin) return [];
     const selfHex = toHex(this.selfPin.accountId);
-    return this.store.read((tx) => {
-      const authors = new Set<string>();
-      for (const [, c] of tx.list("circles")) if (c.status === "member") for (const m of c.members) if (m !== selfHex) authors.add(m);
-      const out: Uint8Array[] = [];
-      for (const a of authors) {
-        const pin = tx.get("pins", a);
-        if (!pin) continue;
-        const hasKey = tx.list("readerEpochs", pin.streamId + ":").length > 0;
-        if (!hasKey) out.push(fromHex(a));
-      }
-      return out;
-    });
+    const authors = new Set<string>();
+    for (const c of circles) if (c.status === "member") for (const m of c.members) if (m !== selfHex) authors.add(m);
+    const out: Uint8Array[] = [];
+    for (const a of authors) {
+      const pin = tx.get("pins", a);
+      if (!pin) continue;
+      const hasKey = tx.range("readerEpochs", { prefix: pin.streamId + ":", limit: 1 }).length > 0; // existence, not the rows
+      if (!hasKey) out.push(fromHex(a));
+    }
+    return out;
   }
 
   async inspect(): Promise<Inspection> {
@@ -1598,7 +1600,7 @@ class ClientImpl implements Client {
       let pin = current;
       for (const link of verified) {
         // A link behind the pinned key that is already on record: the pin moved past it earlier.
-        if (link.doc.previousGeneration < pin.generation && tx.list("successions").some(([, s]) => s.accountId === accountHex && unbig(s.previousGeneration) === link.doc.previousGeneration)) continue;
+        if (link.doc.previousGeneration < pin.generation && tx.list("successions", accountHex + ":").some(([, s]) => unbig(s.previousGeneration) === link.doc.previousGeneration)) continue;
         const e = applySuccession(tx, { wire: link.wire, newCertificate: link.certificate, policy: this.policy, trust: this.trust, now: this.now() });
         effects.push(e);
         pin = e.pin;
@@ -1847,14 +1849,16 @@ class ClientImpl implements Client {
   // Circles ---------------------------------------------------------------------------------------
 
   private async listCircles(): Promise<CircleSummary[]> {
+    return this.store.read((tx) => this.circleSummaries(tx.list("circles").map(([, r]) => r)));
+  }
+
+  private circleSummaries(rows: readonly CircleRow[]): CircleSummary[] {
     const self = this.selfPin?.accountId;
     const now = this.now();
-    return this.store.read((tx) =>
-      tx.list("circles").map(([, r]) => {
-        const c = rowToCircle(r);
-        return { circleId: c.circleId, ownerIdentityId: c.ownerIdentityId, revision: c.revision, members: c.members, enabled: c.enabled, status: c.status, snapshotAgeMs: c.verifiedAt ? now - c.verifiedAt : 0n, owned: !!self && equalBytes(c.ownerIdentityId, self) };
-      })
-    );
+    return rows.map((r) => {
+      const c = rowToCircle(r);
+      return { circleId: c.circleId, ownerIdentityId: c.ownerIdentityId, revision: c.revision, members: c.members, enabled: c.enabled, status: c.status, snapshotAgeMs: c.verifiedAt ? now - c.verifiedAt : 0n, owned: !!self && equalBytes(c.ownerIdentityId, self) };
+    });
   }
 
   /**
