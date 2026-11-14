@@ -102,7 +102,8 @@ describe("receiving through sync", () => {
         openRecordWire(w, view, () => Uint8Array.from(Buffer.from(key, "hex")));
         return "OK";
       } catch (e) {
-        return e instanceof KavachError ? e.code : "?";
+        if (e instanceof KavachError) return e.code;
+        throw e; // anything else is a crash, not a refusal
       }
     };
     const inbox = async (w: Uint8Array): Promise<string> => {
@@ -110,20 +111,21 @@ describe("receiving through sync", () => {
         const r = await receive(bob.inbox, w);
         return r.result === "invalid" ? r.reason : r.result;
       } catch (e) {
-        return e instanceof KavachError ? e.code : "?";
+        if (e instanceof KavachError) return e.code;
+        throw e;
       }
     };
-    const damaged: Record<string, Uint8Array> = {
-      trailingByte: Uint8Array.from([...good, 0]),
-      signatureBit: Uint8Array.from(good.map((b, i) => (i === good.length - 1 ? b ^ 1 : b))),
-      ciphertextBit: Uint8Array.from(good.map((b, i) => (i === 100 ? b ^ 1 : b))),
-      reservedFlag: Uint8Array.from(good.map((b, i) => (i === 50 ? b | 0x10 : b))),
-      epochZero: Uint8Array.from(good.map((b, i) => (i >= 34 && i < 38 ? 0 : b)))
+    // Structural damage is MALFORMED at the parse; damage under the signature is BAD_SIGNATURE at the verify, before any decryption.
+    const damaged: Record<string, { wire: Uint8Array; code: string }> = {
+      trailingByte: { wire: Uint8Array.from([...good, 0]), code: "MALFORMED" },
+      reservedFlag: { wire: Uint8Array.from(good.map((b, i) => (i === 50 ? b | 0x10 : b))), code: "MALFORMED" },
+      epochZero: { wire: Uint8Array.from(good.map((b, i) => (i >= 34 && i < 38 ? 0 : b))), code: "MALFORMED" },
+      signatureBit: { wire: Uint8Array.from(good.map((b, i) => (i === good.length - 1 ? b ^ 1 : b))), code: "BAD_SIGNATURE" },
+      ciphertextBit: { wire: Uint8Array.from(good.map((b, i) => (i === 100 ? b ^ 1 : b))), code: "BAD_SIGNATURE" }
     };
-    for (const [name, w] of Object.entries(damaged)) {
-      const expected = opener(w);
-      expect(expected, name).not.toBe("OK");
-      expect(await inbox(w), name).toBe(expected);
+    for (const [name, { wire: w, code }] of Object.entries(damaged)) {
+      expect(opener(w), name).toBe(code);
+      expect(await inbox(w), name).toBe(code);
     }
     expect(await inbox(good)).toBe("updated");
   });
