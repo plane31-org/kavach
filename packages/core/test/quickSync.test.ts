@@ -5,11 +5,12 @@
  */
 import { beforeAll, describe, expect, it } from "vitest";
 import { toHex } from "../src/bytes.js";
-import { ready } from "../src/crypto.js";
+import { buildResetKeyList } from "../src/codec.js";
+import { C, H, ready, signingKeypairFromSeed } from "../src/crypto.js";
 import { KavachError } from "../src/errors.js";
 import { testPolicy } from "../src/testing/clock.js";
 import type { RetentionPolicy } from "../src/policy.js";
-import { DAY, thrown, world, type Dev, type World } from "./clientWorld.js";
+import { DAY, management, thrown, world, type Dev, type World } from "./clientWorld.js";
 import { enqueueLocation } from "./location.js";
 
 beforeAll(() => ready());
@@ -269,6 +270,36 @@ describe("revision 12: the AUDIENCE_STALE fence", () => {
     const good = await quick(b);
     expect([good.promotedBecause, good.outbox.resealed, good.outbox.accepted, good.outbox.cancelled]).toEqual(["audienceStale", 2, 2, 0]);
     expect((await quick(b)).mode).toBe("quick");
+  });
+
+  it("an owner reset this device rejects leaves the circle as it was and the fence in place: nothing is resealed to it or cancelled", async () => {
+    const w = world(policy, { fullSyncEveryMs: EVERY });
+    const { a, members, circleId, ids } = await circle(w, ["bob", "carol"]);
+    const b = members[0] as Dev;
+    // The management key drops the operational key, which the host goes on signing receipts with.
+    const other = signingKeypairFromSeed(H(C("other-op")));
+    w.host.resetKeyList = buildResetKeyList({ version: 2n, issuedAt: w.clock.now(), expiresAt: w.clock.now() + 30n * DAY, keys: [{ keyId: new Uint8Array(16).fill(8), publicKey: other.publicKey }] }, management.secretKey);
+    w.clock.advance(25n * 3_600_000n);
+    await b.client.sync();
+    expect(await b.store.read((tx) => tx.get("resetList", "list")?.version)).toBe("2");
+    // A held record: Carol was removed and Bob, on quick syncs, still sealed to her.
+    await a.client.circles.remove(circleId, ids.get("carol") ?? new Uint8Array());
+    await w.sync(a);
+    w.host.audienceFence = true;
+    await b.client.enqueue(1, Uint8Array.of(11));
+    expect((await quick(b)).outbox.held).toBe(1);
+    // Alice resets; the host tombstones her circle; Bob refuses the receipt.
+    await a.client.resetAccount({ confirmed: true });
+    const n = b.events.length;
+    const r = await quick(b);
+    expect([r.mode, r.promotedBecause]).toEqual(["full", "audienceStale"]);
+    expect(r.errors.map((e) => e.code)).toContain("RESET_KEY_REVOKED");
+    expect((await b.client.circles.list())[0]?.status).toBe("member");
+    expect([r.outbox.resealed, r.outbox.cancelled]).toEqual([0, 0]);
+    expect((await b.client.inspect()).outbox.held).toBe(1);
+    expect(b.events.slice(n).some((e) => e.kind === "cancelled")).toBe(false);
+    expect((await quick(b)).promotedBecause).toBe("audienceStale"); // still owed a resolved membership
+    expect((await b.client.inspect()).outbox.held).toBe(1);
   });
 
   it("8: a circle the host answers it has none of is retired; a failed request keeps the cached state", async () => {

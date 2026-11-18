@@ -1421,14 +1421,17 @@ class ClientImpl implements Client {
   }
 
   /**
-   * The metadata pass. `membershipVerified` is true only for a full pass in which every circle's
-   * snapshot verified (or was absent) and every leave this device owed as owner was applied: the
-   * membership the next epoch is sealed to is then the host's. A failed certificate check of one
-   * contact does not count against it; that contact's key stays as pinned.
+   * The metadata pass. `membershipVerified` is true only for a full pass that resolved every
+   * circle this device shares to: its snapshot verified, or the host's absence retired it, and every
+   * leave this device owed as owner was applied. It is false while a circle's owner is unpinned,
+   * while a snapshot fails verification, and while an absent circle's retirement is deferred
+   * because its owner's key change is unresolved (a refused or not yet verifiable reset receipt).
+   * A failed certificate check of one contact does not count against it; that key stays as pinned.
    */
   private async syncMetadata(report: SyncReport, maintain = true, quick = false): Promise<{ membershipVerified: boolean }> {
-    const errorsBefore = report.errors.length;
-    const verified = (): { membershipVerified: boolean } => ({ membershipVerified: !quick && !report.errors.slice(errorsBefore).some((e) => e.operation === "circleSnapshot" || e.operation === "removeLeaver") });
+    // Set wherever the pass leaves a circle's membership as the host may no longer have it: the
+    // decision is recorded where the work fails or is deferred, never read back from diagnostics.
+    let membershipResolved = true;
     const { pin } = this.requireAccount("sync");
     // Own account: has this device been superseded? A quick sync leaves it to the relay's fence,
     // which refuses a superseded device's appends and reads, and to the next full sync.
@@ -1501,6 +1504,7 @@ class ClientImpl implements Client {
       const ownerPin = equalBytes(c.ownerIdentityId, pin.accountId) ? pin : await this.pinFor(c.ownerIdentityId);
       if (!ownerPin) {
         memberIds.set(toHex(c.ownerIdentityId), c.ownerIdentityId);
+        if (c.status === "member") membershipResolved = false; // its snapshot cannot be verified yet
         continue;
       }
       const wire = await this.transport.directory.getCircle(c.circleId);
@@ -1556,7 +1560,10 @@ class ClientImpl implements Client {
           if (isKavachError(e, "EQUIVOCATION")) {
             await this.store.transaction((tx) => t3Circle(tx, circleToRow({ ...c, status: "quarantined" })));
             this.emit({ kind: "securityError", code: "EQUIVOCATION", detail: "two snapshots at one revision" });
-          } else report.errors.push(syncError("circleSnapshot", e));
+          } else {
+            report.errors.push(syncError("circleSnapshot", e));
+            membershipResolved = false;
+          }
           for (const m of c.members) memberIds.set(toHex(m), m);
         }
       } else for (const m of c.members) memberIds.set(toHex(m), m);
@@ -1571,6 +1578,7 @@ class ClientImpl implements Client {
             await this.changeMembership(c.circleId, { remove: resolvedAccountId(acct) });
           } catch (e) {
             report.errors.push(syncError("removeLeaver", e));
+            membershipResolved = false;
           }
         }
       }
@@ -1586,8 +1594,8 @@ class ClientImpl implements Client {
       }
       checkMemberResolution(byIdentity);
     }
-    await this.retireAbsentCircles(goneCandidates, report);
-    return verified();
+    if ((await this.retireAbsentCircles(goneCandidates, report)) > 0) membershipResolved = false;
+    return { membershipVerified: !quick && membershipResolved };
   }
 
   /**
@@ -1597,19 +1605,27 @@ class ClientImpl implements Client {
    * applied but this device cannot verify yet (or refused) leaves the circle as it was, so a host
    * cannot end sharing with a receipt nobody can check. Only a verified receipt closes it.
    */
-  private async retireAbsentCircles(candidates: readonly CircleState[], report: SyncReport): Promise<void> {
+  private async retireAbsentCircles(candidates: readonly CircleState[], report: SyncReport): Promise<number> {
+    let deferred = 0;
     for (const c of candidates) {
-      const gone = await this.store.transaction((tx) => {
+      const gone = await this.store.transaction((tx): "deferred" | ReturnType<typeof t3Circle> | undefined => {
         const row = tx.get("circles", toHex(c.circleId));
-        if (!row || row.status !== "member") return undefined;
+        if (!row || row.status !== "member") return undefined; // moved meanwhile: nothing left to decide
         const owner = tx.get("pins", row.ownerIdentityId);
-        if (!owner || tx.get("quarantine", owner.accountName) || this.deferredKeyChanges.has(owner.accountName)) return undefined;
+        if (!owner || tx.get("quarantine", owner.accountName) || this.deferredKeyChanges.has(owner.accountName)) return "deferred";
         return t3Circle(tx, { ...row, status: "gone" }, row.enabled ? { kind: "gone", circleId: c.circleId } : undefined);
       });
+      if (gone === "deferred") {
+        // Still shared to, while the host says it is gone: the membership is unresolved, and the
+        // caller keeps any AUDIENCE_STALE fence until it is.
+        deferred++;
+        continue;
+      }
       if (!gone) continue;
       if (gone.changed) report.metadata.rotations++;
       this.emit({ kind: "circleChanged", circleId: c.circleId, revision: c.revision, status: "gone" });
     }
+    return deferred;
   }
 
   /**
