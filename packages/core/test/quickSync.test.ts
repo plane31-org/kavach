@@ -154,6 +154,30 @@ describe("revision 12: quick sync", () => {
     expect(await thrown(() => quick(a))).toBe("UNSUPPORTED_OPERATION");
   });
 
+  it("a full request during a quick sync gets a full sync of its own, after it; full requests made meanwhile share it", async () => {
+    const w = world(policy, { fullSyncEveryMs: EVERY });
+    const { members } = await circle(w, ["bob"]);
+    const b = members[0] as Dev;
+    const n = b.t.calls.length;
+    const running = b.client.sync({ mode: "quick" });
+    const alsoQuick = b.client.sync({ mode: "quick" });
+    const full = b.client.sync();
+    const fullToo = b.client.sync({ mode: "full" });
+    const [q, q2, f, f2] = await Promise.all([running, alsoQuick, full, fullToo]);
+    expect([q.mode, f.mode]).toEqual(["quick", "full"]);
+    expect(q2).toBe(q); // a quick request shares the quick sync
+    expect(f2).toBe(f); // full requests share the one full sync
+    expect(f).not.toBe(q);
+    const calls = since(b, n);
+    expect(calls.indexOf("getCircle")).toBeGreaterThan(calls.indexOf("syncState")); // the full one ran after the quick one
+    expect(calls.filter((c) => c === "syncState").length).toBe(1);
+    expect(calls.filter((c) => c === "listSubscriptions").length).toBe(1);
+    // A quick request during a full sync shares the full one.
+    const fullRun = b.client.sync();
+    const quickDuring = b.client.sync({ mode: "quick" });
+    expect(await quickDuring).toBe(await fullRun);
+  });
+
   it("5: a full sync never calls the change check", async () => {
     const w = world(policy, { fullSyncEveryMs: EVERY });
     const { a, members } = await circle(w, ["bob"]);
@@ -225,6 +249,26 @@ describe("revision 12: the AUDIENCE_STALE fence", () => {
     const third = await w.sync(b);
     expect([third.outbox.held, third.outbox.cancelled]).toEqual([0, 0]);
     expect((await b.client.inspect()).outbox.held).toBe(0);
+  });
+
+  it("a full sync whose snapshot fails verification keeps the fence and the held records; they are resealed only once the membership verifies", async () => {
+    const { b } = await staleBob();
+    await b.client.enqueue(0, Uint8Array.of(10));
+    await b.client.enqueue(1, Uint8Array.of(11));
+    expect((await quick(b)).outbox.held).toBe(2);
+    b.t.knobs.tamper.add("snapshot");
+    const bad = await quick(b);
+    expect([bad.mode, bad.promotedBecause]).toEqual(["full", "audienceStale"]);
+    expect(bad.errors.map((e) => `${e.operation}:${e.code}`)).toContain("circleSnapshot:BAD_SIGNATURE");
+    expect([bad.outbox.resealed, bad.outbox.cancelled, bad.outbox.accepted]).toEqual([0, 0, 0]);
+    expect((await b.client.inspect()).outbox.held).toBe(2);
+    expect(await thrown(() => b.client.enqueue(0, Uint8Array.of(12)))).toBe("ROTATION_REQUIRED");
+    const still = await quick(b);
+    expect(still.promotedBecause).toBe("audienceStale"); // the fence is still owed a full sync
+    b.t.knobs.tamper.delete("snapshot");
+    const good = await quick(b);
+    expect([good.promotedBecause, good.outbox.resealed, good.outbox.accepted, good.outbox.cancelled]).toEqual(["audienceStale", 2, 2, 0]);
+    expect((await quick(b)).mode).toBe("quick");
   });
 
   it("8: a circle the host answers it has none of is retired; a failed request keeps the cached state", async () => {

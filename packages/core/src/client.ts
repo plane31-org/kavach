@@ -457,6 +457,10 @@ class ClientImpl implements Client {
   private selfPin: AccountPin | undefined;
   private trust: ResetTrust;
   private syncing: Promise<SyncReport> | undefined;
+  /** The mode of the running sync, once known: a quick request that ran full counts as full. */
+  private syncingMode: SyncMode = "full";
+  /** A full sync requested while a quick one ran: it starts when that one ends; later full requests share it. */
+  private fullAfter: Promise<SyncReport> | undefined;
   private closed = false;
   /** Every public operation in flight, so `close()` can wait for them. */
   private readonly running = new Set<Promise<unknown>>();
@@ -1068,8 +1072,21 @@ class ClientImpl implements Client {
       if (this.options.fullSyncEveryMs === undefined) throw new KavachError("MALFORMED", "sync", "a quick sync needs fullSyncEveryMs in open()");
       if (typeof this.transport.relay.syncState !== "function") throw new KavachError("UNSUPPORTED_OPERATION", "sync", "the transport has no syncState");
     }
-    if (this.syncing) return this.syncing;
+    if (this.syncing) {
+      // A request shares the running sync when that sync covers it: anything shares a full one, and
+      // a quick request shares a quick one. A full request during a quick sync gets its own full
+      // sync after it, never the quick result; further full requests share that one.
+      if ((options.mode ?? "full") === "quick" || this.syncingMode === "full") return this.syncing;
+      this.fullAfter ??= this.syncing
+        .catch(() => undefined)
+        .then(() => {
+          this.fullAfter = undefined;
+          return this.sync(options);
+        });
+      return this.fullAfter;
+    }
     if (this.closed) throw new KavachError("CLOSED", "sync", "the client is closed");
+    this.syncingMode = options.mode ?? "full";
     this.syncing = this.track("sync", () => this.runSync(options)).finally(() => {
       this.syncing = undefined;
     });
@@ -1264,6 +1281,7 @@ class ClientImpl implements Client {
     phase("resume");
     const { mode, promotedBecause } = await this.syncMode(options.mode ?? "full");
     report.mode = mode;
+    this.syncingMode = mode;
     if (promotedBecause) report.promotedBecause = promotedBecause;
     if (maintain) await this.ensureBackup();
     phase("maintenance");
@@ -1276,8 +1294,11 @@ class ClientImpl implements Client {
     }
     phase("bootstrap");
     try {
-      await this.syncMetadata(report, maintain, mode === "quick");
-      if (mode === "full") await this.markFullSync();
+      const { membershipVerified } = await this.syncMetadata(report, maintain, mode === "quick");
+      // Only a full pass that verified every circle's membership answers AUDIENCE_STALE and restarts
+      // the quick-sync bound: after a snapshot that failed verification the membership is still the
+      // old one, so the fence and the held records stay, and the next sync runs full again.
+      if (mode === "full" && membershipVerified) await this.markFullSync();
     } catch (e) {
       report.errors.push(syncError("metadata", e));
     }
@@ -1399,7 +1420,15 @@ class ClientImpl implements Client {
     });
   }
 
-  private async syncMetadata(report: SyncReport, maintain = true, quick = false): Promise<void> {
+  /**
+   * The metadata pass. `membershipVerified` is true only for a full pass in which every circle's
+   * snapshot verified (or was absent) and every leave this device owed as owner was applied: the
+   * membership the next epoch is sealed to is then the host's. A failed certificate check of one
+   * contact does not count against it; that contact's key stays as pinned.
+   */
+  private async syncMetadata(report: SyncReport, maintain = true, quick = false): Promise<{ membershipVerified: boolean }> {
+    const errorsBefore = report.errors.length;
+    const verified = (): { membershipVerified: boolean } => ({ membershipVerified: !quick && !report.errors.slice(errorsBefore).some((e) => e.operation === "circleSnapshot" || e.operation === "removeLeaver") });
     const { pin } = this.requireAccount("sync");
     // Own account: has this device been superseded? A quick sync leaves it to the relay's fence,
     // which refuses a superseded device's appends and reads, and to the next full sync.
@@ -1415,11 +1444,11 @@ class ClientImpl implements Client {
           // The key itself is retired, not only the device: nothing of it stays here.
           await this.secrets.delete("accountSeed");
           this.account = undefined;
-          return;
+          return { membershipVerified: false };
         }
       } else if (!equalBytes(theirs.bodyHash, pin.certificateHash) && theirs.generation > pin.generation) {
         await this.retire();
-        return;
+        return { membershipVerified: false };
       }
     }
     // Reset-key list when due: always when stale (verification needs it), periodically unless maintenance is skipped.
@@ -1453,7 +1482,7 @@ class ClientImpl implements Client {
       report.errors.push(syncError("vault", e));
     }
     // A quick sync stops here: membership, requests and certificates wait for the next full sync.
-    if (quick) return;
+    if (quick) return { membershipVerified: false };
     this.deferredKeyChanges = new Set();
     // Circles: owners we have not pinned yet, then snapshots, then members' certificates.
     const circles = await this.store.read((tx) => tx.list("circles").map(([, c]) => rowToCircle(c)));
@@ -1558,6 +1587,7 @@ class ClientImpl implements Client {
       checkMemberResolution(byIdentity);
     }
     await this.retireAbsentCircles(goneCandidates, report);
+    return verified();
   }
 
   /**
