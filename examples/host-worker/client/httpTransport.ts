@@ -16,8 +16,8 @@ export interface HttpTransportOptions {
 type Json = Record<string, unknown>;
 
 export function httpTransport(o: HttpTransportOptions): Transport {
-  const call = async <T>(method: string, path: string, payload?: unknown): Promise<T> => {
-    const headers: Record<string, string> = { "content-type": "application/json" };
+  const call = async <T>(method: string, path: string, payload?: unknown, extra: Record<string, string> = {}): Promise<T> => {
+    const headers: Record<string, string> = { "content-type": "application/json", ...extra };
     const c = o.caller();
     if (c) headers["authorization"] = `Bearer ${c.accountName}:${toHex(c.certificateHash)}`;
     if (o.now) headers["x-test-now"] = o.now().toString();
@@ -160,10 +160,13 @@ export function httpTransport(o: HttpTransportOptions): Transport {
       const r = await call<Json>("PUT", `/v1/streams/${toHex(i.streamId)}/epochs`, { expectedEpoch: i.expectedEpoch, manifest: toHex(i.manifest), wraps: Object.fromEntries([...i.wraps].map(([k, v]) => [k, toHex(v)])) });
       return { ...outcome(r), ...(typeof r["currentEpoch"] === "number" ? { currentEpoch: r["currentEpoch"] } : {}), ...(typeof r["currentManifest"] === "string" ? { currentManifest: fromHex(r["currentManifest"]) } : {}) };
     },
-    appendRecord: (recordId, wire): Promise<AppendOutcome> => {
+    appendRecord: (recordId, wire, options): Promise<AppendOutcome> => {
       // Callable from inside T6h: the request starts synchronously, the promise is awaited later.
+      // The client's revision travels as a header, so a host answers AUDIENCE_STALE only to
+      // clients that read it (revision 12).
       const streamId = toHex(wire.subarray(2, 34));
-      return call<Json>("POST", `/v1/streams/${streamId}/records`, { recordId: toHex(recordId), wire: toHex(wire) }).then((r) => ({ status: r["status"] as AppendOutcome["status"] }));
+      const extra: Record<string, string> = options ? { "kavach-revision": String(options.revision) } : {};
+      return call<Json>("POST", `/v1/streams/${streamId}/records`, { recordId: toHex(recordId), wire: toHex(wire) }, extra).then((r) => ({ status: r["status"] as AppendOutcome["status"] }));
     },
     readRecords: async (streamId, afterSeq, limit): Promise<ReadRecordsResult> => {
       const r = await call<Json>("GET", `/v1/streams/${toHex(streamId)}/records?after=${afterSeq}&limit=${limit}`);
@@ -179,7 +182,15 @@ export function httpTransport(o: HttpTransportOptions): Transport {
       const r = await call<Json>("POST", `/v1/streams/${toHex(streamId)}/ack`, { cursor });
       return { status: r["status"] as "COMMITTED" | "CURSOR_OUT_OF_RANGE" | "RETRYABLE" | "UNAUTHORIZED", ...(typeof r["committedCursor"] === "string" ? { committedCursor: BigInt(r["committedCursor"]) } : {}) };
     },
-    listSubscriptions: async () => ((await call<Json[]>("GET", "/v1/subscriptions")) ?? []).map((s) => ({ streamId: fromHex(String(s["streamId"])), authorIdentityId: fromHex(String(s["authorIdentityId"])) }))
+    listSubscriptions: async () => ((await call<Json[]>("GET", "/v1/subscriptions")) ?? []).map((s) => ({ streamId: fromHex(String(s["streamId"])), authorIdentityId: fromHex(String(s["authorIdentityId"])) })),
+    syncState: async () => {
+      const r = await call<Json | null>("GET", "/v1/sync-state");
+      // A host without the change check answers 404: a deployment mismatch, never a fallback.
+      if (r === null) throw new KavachError("UNSUPPORTED_OPERATION", "transport", "GET /v1/sync-state: 404");
+      return {
+        subscriptions: (r["subscriptions"] as Json[]).map((s) => ({ streamId: fromHex(String(s["streamId"])), authorIdentityId: fromHex(String(s["authorIdentityId"])), head: BigInt(String(s["head"])), pending: s["pending"] === true }))
+      };
+    }
   };
 
   return { directory, relay };

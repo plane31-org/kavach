@@ -2,7 +2,7 @@
 
 The Kavach v1 protocol in pure TypeScript: end-to-end encrypted, relayed, durable records between a person's devices and the devices of the people they share with, for circles of up to 100 accounts, through a server that stores only what it cannot open and deletes each record once every reader has it. The package is product-agnostic: a product declares its record kinds and keeps its payload codecs in its own profile. The specification is `spec/Kavach-v1.md` in the repository; `spec/Profile-template.md` lists what a product decides.
 
-Status: protocol revision 11, package 0.x. The primitives are audited libraries; the composition is not yet independently reviewed, and nothing here is production-ready. The API may change between 0.x minor versions; the protocol revision is tracked separately in the specification.
+Status: protocol revision 12, package 0.x. The primitives are audited libraries; the composition is not yet independently reviewed, and nothing here is production-ready. The API may change between 0.x minor versions; the protocol revision is tracked separately in the specification.
 
 ```
 pnpm add @plane31/blind-relay
@@ -25,6 +25,10 @@ Randomness comes from the Web Crypto global. A runtime without one (Hermes) inst
 
 **Short background windows.** `sync({ catchUp: { maxRecords, maxMs }, skipMaintenance: true })` reads within a budget and leaves the retention purge, the periodic reset-key-list re-check and the recovery-key re-save to the next foreground sync (`report.maintenance` says which). `syncUntilDrained({ maxRounds, maxMs, skipMaintenance })` runs rounds within a soft time bound and says why it stopped. `report.timings` gives wall-clock milliseconds per phase and the bytes moved, so a budget overrun can be attributed. Opening the encrypted store in a fresh background context is the platform's cost, not the SDK's; measure it separately.
 
+**Quick syncs (revision 12).** For a routine wake-up, `sync({ mode: "quick" })` skips the membership and key metadata and reads only the streams the host's change check (`relay.syncState`) shows something new for; on a typical phone that is two or three requests instead of eight. It needs `fullSyncEveryMs` in `open()` (no default) and a transport with `syncState`. It runs full by itself, and says so in `report.promotedBecause`, when unfinished work needs the metadata, after the host refused records as `AUDIENCE_STALE`, before the first full sync, and once the last full sync is older than `fullSyncEveryMs`. Choose that period knowing what it delays: a removal and a contact's new key are learned at the next full sync. Keep `sync()` (full) for the foreground.
+
+**When the host fences a stale audience.** A host may refuse an append whose epoch still addresses someone who left (`AUDIENCE_STALE`). Nothing is lost: the records are held (`report.outbox.held`, the `audienceStale` event), the next sync runs full and rotates, and each record is sealed once more under the new epoch with a new id. The `resealed` event names the old and the new id; an app that kept record ids follows it. A record refused a second time is cancelled with reason `AUDIENCE_STALE`. The outbox keeps payloads until acceptance to make this possible.
+
 **Header classes 4 to 7 (revision 11).** The class is three header bits the relay may see, 0 to 7, with no meaning in the protocol: the product's host decides which values wake readers and how it stores each. A reader or host before revision 11 rejects a class above 3 as malformed, and the SDK cannot know when the field has moved, so the order is: the host first, then every reader on a revision 11 SDK with no kind above 3, then senders declaring the new values.
 
 **Introducing a record kind.** Ship the readers first where you can, but a reader that meets a kind its policy does not declare is not in trouble: the record authenticated and opened, so it is an authorized author's and the author's app is newer. The reader skips it, counts it (`report.inbox.unknownKind`) and emits `unknownKind` with the author, which is the moment to suggest an update. No `securityError` is raised; those are for records that fail authentication or equivocate. An enqueue of a kind the sender did not declare is still `MALFORMED`.
@@ -46,6 +50,7 @@ Randomness comes from the Web Crypto global. A runtime without one (Hermes) inst
 | `ROTATION_REQUIRED`, `QUEUE_FULL` | The outbox cannot take this record now | Sync, then enqueue again |
 | `EQUIVOCATION`, `ROLLBACK`, `BAD_SIGNATURE`, `ACCOUNT_KEY_CHANGED` | The host or a peer served something that does not verify | Show the security notice the profile defines; do not retry blindly |
 | `RECOVERY_REQUIRED` | The local store and the secret store no longer match | Erase the account from the device and set it up again |
+| `UNSUPPORTED_OPERATION` | The host lacks an operation the client needs (a quick sync against a host without `sync-state`) | A deployment mismatch: ship the host first, or sync full; never retry |
 
 Waiting on another person is not an error: `ClientState.waitingFor` lists authors whose current epoch has not reached this device yet, and the `waiting` event fires as it happens.
 

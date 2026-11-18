@@ -37,7 +37,7 @@ export interface World {
   sync(d: Dev): Promise<SyncReport>;
 }
 
-export function world(defaultPolicy: RetentionPolicy = testPolicy): World {
+export function world(defaultPolicy: RetentionPolicy = testPolicy, openExtra: { fullSyncEveryMs?: number } = {}): World {
   const host = new FakeHost();
   const clock = new TestClock();
   host.now = clock.now;
@@ -46,7 +46,7 @@ export function world(defaultPolicy: RetentionPolicy = testPolicy): World {
   const device = async (name: string, provider = new MemoryPlatformProvider(name + "@platform"), store = new MemoryStore(), secrets = new MemorySecretStore(), policy = defaultPolicy): Promise<Dev> => {
     const t = new MaliciousTransport(hostTransport(host, name));
     const events: ClientEvent[] = [];
-    const client = await open({ accountName: name, retentionPolicy: policy, recoveryProvider: provider, resetTrust, secretStore: secrets, store, transport: t, now: clock.now });
+    const client = await open({ accountName: name, retentionPolicy: policy, recoveryProvider: provider, resetTrust, secretStore: secrets, store, transport: t, now: clock.now, ...openExtra });
     client.subscribe((e) => events.push(e));
     return { client, store, secrets, events, t, provider };
   };

@@ -190,4 +190,15 @@ describe("relay: deletion, expiry, cursors", () => {
     const r = await hostJson<{ error?: string }>(`/v1/streams/${sid}/records`, { method: "POST", headers: { authorization: oldBearer }, body: JSON.stringify({ recordId: "11".repeat(32), wire: exact }) });
     expect(r.error).toBe("SUPERSEDED_DEVICE");
   });
+
+  it("revision 12: a quick sync asks the change check and reads only the stream with something new", async () => {
+    const { a, b } = await circleOfTwo();
+    await b.client.sync(); // one full sync, so quick is allowed
+    const idle = await b.client.sync({ mode: "quick" });
+    expect([idle.mode, idle.inbox.skipped, idle.inbox.streams, idle.errors]).toEqual(["quick", 1, 0, []]);
+    await enqueueLocation(a.client, locationFromDegrees(1, 2, 5, clock.now()));
+    await a.client.sync();
+    const fresh = await b.client.sync({ mode: "quick" });
+    expect([fresh.mode, fresh.inbox.skipped, fresh.inbox.stored, fresh.errors]).toEqual(["quick", 0, 1, []]);
+  });
 });

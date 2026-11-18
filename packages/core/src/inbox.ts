@@ -214,6 +214,21 @@ export interface StreamSyncSummary {
   failure?: unknown;
 }
 
+/**
+ * A quick sync's change check (revision 12): whether a stream is worth a read. It is when the host
+ * has something past what this device examined (`head` beyond the scan position), holds something
+ * `head` does not count (`pending`), when a record of it is unresolved here (it waits for its
+ * epoch key, which a read retries), or when an acknowledgement is owed (the eligible prefix is
+ * past the cursor the host confirmed). A stream never read before has scan position zero.
+ */
+export function streamNeedsRead(tx: Pick<Tx, "get" | "range">, s: { readonly streamId: Uint8Array; readonly authorIdentityId: Uint8Array; readonly head: bigint; readonly pending: boolean }): boolean {
+  if (s.pending) return true;
+  const sub = subscription(tx, s.streamId, s.authorIdentityId);
+  if (s.head > unbig(sub.scanPos)) return true;
+  if (tx.range("unresolved", { prefix: toHex(s.streamId) + ":", limit: 1 }).length > 0) return true;
+  return unbig(sub.ackPrefix) > unbig(sub.committedCursor);
+}
+
 function subscription(tx: Pick<Tx, "get">, streamId: Uint8Array, authorIdentityId: Uint8Array): SubscriptionRow {
   return (
     tx.get("subscriptions", toHex(streamId)) ?? {

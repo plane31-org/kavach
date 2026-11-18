@@ -53,6 +53,8 @@ export type ErrorCode =
   | "RECOVERY_REQUIRED"
   | "STORAGE_FAILURE"
   | "RATE_LIMITED"
+  /** The host or the transport does not offer an operation the client needs (a quick sync against a host without the change check): a deployment mismatch, not retryable. */
+  | "UNSUPPORTED_OPERATION"
   /** The host could not be reached or did not answer in time; the same call may succeed later. A transport raises it, never a plain error. */
   | "NETWORK";
 

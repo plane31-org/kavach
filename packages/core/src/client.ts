@@ -12,7 +12,7 @@ import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { ensureHistoryIndex } from "./historyIndex.js";
-import { ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, purgeHistory, receive as receiveRecord, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
+import { ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, purgeHistory, receive as receiveRecord, streamNeedsRead, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
 import { drain, enqueue, outboxCountIn, outboxCounts, purgeOutbox, type EnqueueOptions, type OutboxCounts } from "./outbox.js";
 export type { EnqueueOptions } from "./outbox.js";
 
@@ -129,6 +129,10 @@ export type ClientEvent =
   | { kind: "securityError"; code: string; detail: string }
   /** An authenticated record of a kind this build does not declare was skipped: the author runs a newer app. Suggest an update; not a security event. */
   | { kind: "unknownKind"; recordKind: RecordKind; authorIdentityId: Uint8Array }
+  /** Revision 12: the host refused records as AUDIENCE_STALE. They are held, not cancelled; the next sync runs full, rotates and reseals them. */
+  | { kind: "audienceStale"; held: number }
+  /** Revision 12: a held record was sealed again under a new epoch, with a new record id. An app that kept the old id follows it here. */
+  | { kind: "resealed"; recordId: Uint8Array; newRecordId: Uint8Array }
   | { kind: "stateChanged"; state: ClientState };
 
 export interface OpenOptions {
@@ -143,6 +147,12 @@ export interface OpenOptions {
   readonly now?: () => bigint;
   /** Called when a subscriber throws. Listeners are isolated from the protocol and from each other either way. */
   readonly onListenerError?: (error: unknown, event: ClientEvent) => void;
+  /**
+   * Revision 12: the longest a device may go on quick syncs alone. A quick sync runs full when the
+   * last full one is older than this, since quick syncs see membership and key changes only at the
+   * next full sync. No default: `sync({ mode: "quick" })` is refused without it.
+   */
+  readonly fullSyncEveryMs?: number;
 }
 
 export interface Client {
@@ -237,6 +247,8 @@ export type ReplaceDeviceResult =
 export interface DrainOptions {
   readonly catchUp?: SyncOptions["catchUp"];
   readonly skipMaintenance?: boolean;
+  /** Every round's mode; see `SyncOptions.mode`. A quick round can still run full. */
+  readonly mode?: SyncMode;
   /** Rounds at most. Default 10. */
   readonly maxRounds?: number;
   /** A soft bound in milliseconds across every round: no round starts past it and each round's reading budget is the time left, but a transport call already in flight ends on its own timeout. Default 30,000. */
@@ -292,16 +304,48 @@ export interface SyncOptions {
    * recovery-key re-save. For a short background window; the report says `maintenance: "skipped"`.
    */
   readonly skipMaintenance?: boolean;
+  /**
+   * Revision 12. `full` (the default) is the sync as before. `quick` skips the membership and key
+   * metadata (`resolveAccounts`, `resolveIdentities`, `getCircle`, `readRequests`) and asks the
+   * host's change check (`syncState`) which streams have anything new, reading only those; it
+   * still publishes this device's pending snapshots and vault, refreshes a stale reset-key list and
+   * does the maintenance unless skipped. A quick sync runs full when it must (`promotedBecause`).
+   * It needs `fullSyncEveryMs` in `open()` and a transport with `syncState`.
+   */
+  readonly mode?: SyncMode;
 }
+
+export type SyncMode = "quick" | "full";
+
+/** Why a quick sync ran full: work only a full sync does, or the bound on quick syncs. */
+export type SyncPromotion =
+  /** A restore or replacement is completing its activation. */
+  | "activation"
+  /** An account reset is pending. */
+  | "reset"
+  /** Account recovery is still adopting circles. */
+  | "bootstrap"
+  /** A contact's succession chain is verified only partly. */
+  | "chain"
+  /** The host refused records as AUDIENCE_STALE: membership must be learned before they are resealed. */
+  | "audienceStale"
+  /** This device has not completed a full sync yet. */
+  | "noFullSync"
+  /** The last full sync is older than `fullSyncEveryMs`. */
+  | "fullSyncEveryMs";
 
 export const DEFAULT_CATCH_UP = { maxRecords: 500, maxMs: 5_000 } as const;
 
 export interface SyncReport {
+  /** Which sync ran. A quick request that ran full says `full`, with `promotedBecause`. */
+  mode: SyncMode;
+  promotedBecause?: SyncPromotion;
   metadata: { certificates: number; snapshots: number; rotations: number; quarantined: number; resets: number; successions: number };
   epoch: "unchanged" | "prepared" | "paused" | "pending";
-  outbox: { sent: number; accepted: number; cancelled: number; unknown: number; retry: number };
-  /** `hasMore`: a stream still has records on the relay that this sync's budget did not reach; sync again soon. `unknownKind`: authenticated records of undeclared kinds, skipped. */
-  inbox: { streams: number; stored: number; keyPending: number; invalid: number; unknownKind: number; acked: number; hasMore: boolean };
+  /** `held`: refused as AUDIENCE_STALE and kept for the next epoch. `resealed`: held records sealed again under a new epoch. */
+  outbox: { sent: number; accepted: number; cancelled: number; unknown: number; retry: number; held: number; resealed: number };
+  /** `hasMore`: a stream still has records on the relay that this sync's budget did not reach; sync again soon. `unknownKind`: authenticated records of undeclared kinds, skipped. `skipped`: streams a quick sync did not read, since the change check showed nothing new. */
+  inbox: { streams: number; stored: number; keyPending: number; invalid: number; unknownKind: number; skipped: number; acked: number; hasMore: boolean };
   purged: number;
   /** Whether this sync did its housekeeping (purge, list re-check, key re-save) or left it to a later one. */
   maintenance: "done" | "skipped";
@@ -418,6 +462,8 @@ class ClientImpl implements Client {
   private readonly running = new Set<Promise<unknown>>();
   /** The current sync's reading budget: records, and the links of a succession chain, count against it. */
   private syncBudget: ReadBudget | undefined;
+  /** Accounts whose reset receipt this metadata pass had to defer (no fresh key list or clock): their circles are not retired as absent. */
+  private deferredKeyChanges = new Set<string>();
   private backupChecked = false;
   readonly circles: Client["circles"];
 
@@ -569,7 +615,9 @@ class ClientImpl implements Client {
         accepted: (recordId: Uint8Array) => this.emit({ kind: "accepted", recordId }),
         cancelled: (recordId: Uint8Array, reason: string) => this.emit({ kind: "cancelled", recordId, reason }),
         refresh: (reason: string) => this.emit({ kind: "refresh", reason }),
-        securityError: (code: string, detail: string) => this.emit({ kind: "securityError", code, detail })
+        securityError: (code: string, detail: string) => this.emit({ kind: "securityError", code, detail }),
+        audienceStale: (held: number) => this.emit({ kind: "audienceStale", held }),
+        resealed: (recordId: Uint8Array, newRecordId: Uint8Array) => this.emit({ kind: "resealed", recordId, newRecordId })
       }
     };
   }
@@ -947,6 +995,10 @@ class ClientImpl implements Client {
       const revisionRow = await this.store.read((tx) => tx.get("revision", REVISION));
       if (!stream) throw new KavachError("RECOVERY_REQUIRED", "epoch");
       if (stream.activeEpoch !== undefined && revisionRow?.paused !== "rotation") return attempt === 0 ? "unchanged" : "prepared";
+      // After AUDIENCE_STALE the local membership is known to be behind the host's: no epoch is
+      // prepared from it until a full sync has learned the change (revision 12), or the held
+      // records would be resealed to the same stale audience.
+      if ((await this.store.read((tx) => tx.get("meta", META)))?.fullSyncDue) return "paused";
       let audience: ResolvedAudience;
       try {
         audience = await this.currentAudience();
@@ -1012,6 +1064,10 @@ class ClientImpl implements Client {
   // Sync ------------------------------------------------------------------------------------------
 
   async sync(options: SyncOptions = {}): Promise<SyncReport> {
+    if (options.mode === "quick") {
+      if (this.options.fullSyncEveryMs === undefined) throw new KavachError("MALFORMED", "sync", "a quick sync needs fullSyncEveryMs in open()");
+      if (typeof this.transport.relay.syncState !== "function") throw new KavachError("UNSUPPORTED_OPERATION", "sync", "the transport has no syncState");
+    }
     if (this.syncing) return this.syncing;
     if (this.closed) throw new KavachError("CLOSED", "sync", "the client is closed");
     this.syncing = this.track("sync", () => this.runSync(options)).finally(() => {
@@ -1025,10 +1081,11 @@ class ClientImpl implements Client {
     const maxMs = Math.max(0, Math.floor(options.maxMs ?? 30_000));
     const deadline = this.now() + BigInt(maxMs);
     const merged: SyncReport = {
+      mode: "quick",
       metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 },
       epoch: "unchanged",
-      outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 },
-      inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, acked: 0, hasMore: false },
+      outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0 },
+      inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, skipped: 0, acked: 0, hasMore: false },
       purged: 0,
       maintenance: options.skipMaintenance ? "skipped" : "done",
       timings: emptyTimings(),
@@ -1057,7 +1114,7 @@ class ClientImpl implements Client {
         break;
       }
       const roundMs = Math.max(0, Math.min(remainingMs, options.catchUp?.maxMs ?? DEFAULT_CATCH_UP.maxMs));
-      const r = await this.sync({ catchUp: { maxMs: roundMs, ...(options.catchUp?.maxRecords !== undefined ? { maxRecords: options.catchUp.maxRecords } : {}) }, ...(options.skipMaintenance ? { skipMaintenance: true } : {}) });
+      const r = await this.sync({ catchUp: { maxMs: roundMs, ...(options.catchUp?.maxRecords !== undefined ? { maxRecords: options.catchUp.maxRecords } : {}) }, ...(options.skipMaintenance ? { skipMaintenance: true } : {}), ...(options.mode ? { mode: options.mode } : {}) });
       rounds++;
       last = r;
       // The round's work counts whether or not it was the last: what it accepted, stored and failed
@@ -1069,7 +1126,11 @@ class ClientImpl implements Client {
       merged.inbox.keyPending += r.inbox.keyPending;
       merged.inbox.invalid += r.inbox.invalid;
       merged.inbox.unknownKind += r.inbox.unknownKind;
+      merged.inbox.skipped += r.inbox.skipped;
       merged.inbox.acked += r.inbox.acked;
+      // The drain is quick only if every round was; the first promotion is the one reported.
+      if (r.mode === "full") merged.mode = "full";
+      if (r.promotedBecause && !merged.promotedBecause) merged.promotedBecause = r.promotedBecause;
       merged.purged += r.purged;
       for (const k of Object.keys(merged.timings) as (keyof SyncTimings)[]) merged.timings[k] += r.timings[k];
       merged.epoch = r.epoch;
@@ -1087,7 +1148,8 @@ class ClientImpl implements Client {
       }
       const bootstrapIncomplete = (await this.inspect()).bootstrap?.complete === false;
       const currentChains = await chains();
-      const more = r.inbox.hasMore || bootstrapIncomplete || currentChains.size > 0;
+      // Records held this round are resealed by the next one, which runs full.
+      const more = r.inbox.hasMore || bootstrapIncomplete || currentChains.size > 0 || r.outbox.held > 0;
       const status = (await this.getState()).status;
       if (status === "replacementPrepared" || status === "accountRecoveryRequired") {
         stop = "authentication";
@@ -1128,10 +1190,11 @@ class ClientImpl implements Client {
   private async runSync(options: SyncOptions): Promise<SyncReport> {
     const started = wall();
     const report: SyncReport = {
+      mode: options.mode ?? "full",
       metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 },
       epoch: "unchanged",
-      outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 },
-      inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, acked: 0, hasMore: false },
+      outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0 },
+      inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, skipped: 0, acked: 0, hasMore: false },
       purged: 0,
       maintenance: options.skipMaintenance ? "skipped" : "done",
       timings: emptyTimings(),
@@ -1199,6 +1262,9 @@ class ClientImpl implements Client {
       }
     } else if (meta.state !== "ACTIVE") return report;
     phase("resume");
+    const { mode, promotedBecause } = await this.syncMode(options.mode ?? "full");
+    report.mode = mode;
+    if (promotedBecause) report.promotedBecause = promotedBecause;
     if (maintain) await this.ensureBackup();
     phase("maintenance");
     if (meta.bootstrap && !meta.bootstrap.complete) {
@@ -1210,7 +1276,8 @@ class ClientImpl implements Client {
     }
     phase("bootstrap");
     try {
-      await this.syncMetadata(report, maintain);
+      await this.syncMetadata(report, maintain, mode === "quick");
+      if (mode === "full") await this.markFullSync();
     } catch (e) {
       report.errors.push(syncError("metadata", e));
     }
@@ -1232,7 +1299,7 @@ class ClientImpl implements Client {
     if (this.closed) return report;
     try {
       const drained = await drain(this.outboxDeps());
-      report.outbox = { sent: drained.sent, accepted: drained.accepted, cancelled: drained.cancelled, unknown: drained.unknown, retry: drained.retry };
+      report.outbox = { sent: drained.sent, accepted: drained.accepted, cancelled: drained.cancelled, unknown: drained.unknown, retry: drained.retry, held: drained.held, resealed: drained.resealed };
       report.timings.bytesSent += drained.bytes;
       if (drained.blocked) report.errors.push(syncError("outbox", drained.blocked)); // the records stay queued
     } catch (e) {
@@ -1242,7 +1309,16 @@ class ClientImpl implements Client {
     if (this.closed) return report;
     let subs: Awaited<ReturnType<Relay["listSubscriptions"]>> = [];
     try {
-      subs = await this.transport.relay.listSubscriptions();
+      if (mode === "quick") {
+        // The change check in place of the subscription list: only streams with something new are
+        // read. A failure here is reported as the list's would be, so a drain ends `incomplete`
+        // rather than claiming an empty inbox; what the outbox phase did stands.
+        const syncState = this.transport.relay.syncState;
+        if (typeof syncState !== "function") throw new KavachError("UNSUPPORTED_OPERATION", "sync", "the transport has no syncState");
+        const state = await syncState.call(this.transport.relay);
+        subs = await this.store.read((tx) => state.subscriptions.filter((s) => streamNeedsRead(tx, s)));
+        report.inbox.skipped = state.subscriptions.length - subs.length;
+      } else subs = await this.transport.relay.listSubscriptions();
     } catch (e) {
       report.errors.push(syncError("listSubscriptions", e));
     }
@@ -1281,10 +1357,53 @@ class ClientImpl implements Client {
     return report;
   }
 
-  private async syncMetadata(report: SyncReport, maintain = true): Promise<void> {
+  /**
+   * The mode this sync runs in. A quick request runs full when unfinished work needs the metadata
+   * a quick sync skips, when the host refused records as AUDIENCE_STALE, before the first full
+   * sync, and once the last full sync is older than `fullSyncEveryMs`.
+   */
+  private async syncMode(requested: SyncMode): Promise<{ mode: SyncMode; promotedBecause?: SyncPromotion }> {
+    if (requested === "full") return { mode: "full" };
+    const s = await this.store.read((tx) => ({ meta: tx.get("meta", META), reset: tx.get("pendingReset", "pending") !== undefined, chains: tx.range("chainProgress", {}).some(([, p]) => !p.complete) }));
+    const every = BigInt(Math.max(0, Math.floor(this.options.fullSyncEveryMs ?? 0)));
+    const meta = s.meta;
+    const reason: SyncPromotion | undefined = !meta
+      ? undefined
+      : meta.state === "ACTIVATION_PENDING"
+        ? "activation"
+        : s.reset
+          ? "reset"
+          : meta.bootstrap && !meta.bootstrap.complete
+            ? "bootstrap"
+            : s.chains
+              ? "chain"
+              : meta.fullSyncDue
+                ? "audienceStale"
+                : meta.lastFullSyncAt === undefined
+                  ? "noFullSync"
+                  : this.now() - unbig(meta.lastFullSyncAt) >= every
+                    ? "fullSyncEveryMs"
+                    : undefined;
+    return reason ? { mode: "full", promotedBecause: reason } : { mode: "quick" };
+  }
+
+  /** A full metadata pass finished: the quick-sync bound restarts, and a pending AUDIENCE_STALE is answered. */
+  private async markFullSync(): Promise<void> {
+    const now = this.now();
+    await this.store.transaction((tx) => {
+      const meta = tx.get("meta", META);
+      if (!meta) return;
+      const { fullSyncDue: _due, ...rest } = meta;
+      void _due;
+      tx.put("meta", META, { ...rest, lastFullSyncAt: big(now) });
+    });
+  }
+
+  private async syncMetadata(report: SyncReport, maintain = true, quick = false): Promise<void> {
     const { pin } = this.requireAccount("sync");
-    // Own account: has this device been superseded?
-    const [me] = await this.transport.directory.resolveAccounts([this.accountName]);
+    // Own account: has this device been superseded? A quick sync leaves it to the relay's fence,
+    // which refuses a superseded device's appends and reads, and to the next full sync.
+    const [me] = quick ? [] : await this.transport.directory.resolveAccounts([this.accountName]);
     if (me) {
       const theirs = expectType<AccountDevice>(verifyDocument(me.certificate), DocumentType.AccountDevice, "sync");
       if (!equalBytes(theirs.accountKey, pin.accountKey)) {
@@ -1333,6 +1452,9 @@ class ClientImpl implements Client {
     } catch (e) {
       report.errors.push(syncError("vault", e));
     }
+    // A quick sync stops here: membership, requests and certificates wait for the next full sync.
+    if (quick) return;
+    this.deferredKeyChanges = new Set();
     // Circles: owners we have not pinned yet, then snapshots, then members' certificates.
     const circles = await this.store.read((tx) => tx.list("circles").map(([, c]) => rowToCircle(c)));
     const unknownOwners: Uint8Array[] = [];
@@ -1344,6 +1466,7 @@ class ClientImpl implements Client {
       for (const r of await this.transport.directory.resolveIdentities(unknownOwners)) await this.acceptMemberCertificate(r, report);
     }
     const memberIds = new Map<string, Uint8Array>();
+    const goneCandidates: CircleState[] = [];
     for (const c of circles) {
       if (c.status === "closed" || c.status === "quarantined" || c.status === "left") continue;
       const ownerPin = equalBytes(c.ownerIdentityId, pin.accountId) ? pin : await this.pinFor(c.ownerIdentityId);
@@ -1352,9 +1475,33 @@ class ClientImpl implements Client {
         continue;
       }
       const wire = await this.transport.directory.getCircle(c.circleId);
+      const ownedByMe = equalBytes(c.ownerIdentityId, pin.accountId);
+      if (!wire && !ownedByMe && c.status === "member") {
+        // The host answered that it has no such circle. Decided after the certificates below: its
+        // members' keys are still checked, so a key change or a reset receipt is seen first.
+        goneCandidates.push(c);
+        for (const m of c.members) memberIds.set(toHex(m), m);
+        continue;
+      }
       if (wire) {
         try {
           const r = await this.acceptSnapshotFrom(c, wire, ownerPin, now, report);
+          if (r.outcome === "DUPLICATE" && c.status === "gone") {
+            // The host serves the circle again with the snapshot this device holds: it comes back
+            // as the snapshot says. A newer snapshot takes the ACCEPTED path below instead.
+            const self = pin.accountId;
+            const back = await this.store.transaction((tx) => {
+              const row = tx.get("circles", toHex(c.circleId));
+              if (!row || row.status !== "gone") return undefined;
+              const status = c.members.some((m) => equalBytes(m, self)) ? ("member" as const) : ("left" as const);
+              const ch = t3Circle(tx, { ...row, status }, status === "member" && row.enabled ? { kind: "returned", circleId: c.circleId } : undefined);
+              return { status, rotated: ch.changed };
+            });
+            if (back) {
+              if (back.rotated) report.metadata.rotations++;
+              this.emit({ kind: "circleChanged", circleId: c.circleId, revision: c.revision, status: back.status });
+            }
+          }
           if (r.outcome === "ACCEPTED") {
             // The row may have moved since it was read: a sharing preference, a leave or a close
             // made meanwhile wins over the fetched snapshot, and a newer snapshot already stored
@@ -1409,6 +1556,29 @@ class ClientImpl implements Client {
         await this.acceptMemberCertificate(r, report);
       }
       checkMemberResolution(byIdentity);
+    }
+    await this.retireAbsentCircles(goneCandidates, report);
+  }
+
+  /**
+   * Circles the host answered it does not have (revision 12): sharing to them stops (the audience
+   * loses them and the epoch rotates if that changed it), the rows stay, and a signed snapshot
+   * brings them back. Not while the owner's key change is unresolved here: a reset the host
+   * applied but this device cannot verify yet (or refused) leaves the circle as it was, so a host
+   * cannot end sharing with a receipt nobody can check. Only a verified receipt closes it.
+   */
+  private async retireAbsentCircles(candidates: readonly CircleState[], report: SyncReport): Promise<void> {
+    for (const c of candidates) {
+      const gone = await this.store.transaction((tx) => {
+        const row = tx.get("circles", toHex(c.circleId));
+        if (!row || row.status !== "member") return undefined;
+        const owner = tx.get("pins", row.ownerIdentityId);
+        if (!owner || tx.get("quarantine", owner.accountName) || this.deferredKeyChanges.has(owner.accountName)) return undefined;
+        return t3Circle(tx, { ...row, status: "gone" }, row.enabled ? { kind: "gone", circleId: c.circleId } : undefined);
+      });
+      if (!gone) continue;
+      if (gone.changed) report.metadata.rotations++;
+      this.emit({ kind: "circleChanged", circleId: c.circleId, revision: c.revision, status: "gone" });
     }
   }
 
@@ -1738,6 +1908,7 @@ class ClientImpl implements Client {
         report.errors.push(syncError("resetReceipt", e));
         if (isKavachError(e, "RESET_KEYS_REQUIRED") || isKavachError(e, "RESET_CLOCK_UNTRUSTED")) {
           // Deferred: sharing continues under the pinned key; the receipt is tried again later.
+          this.deferredKeyChanges.add(current.accountName);
           return;
         }
       }
@@ -2000,7 +2171,7 @@ class ClientImpl implements Client {
   private async approve(circleId: Uint8Array, accountName: string): Promise<{ revision: bigint }> {
     const [resolved] = await this.transport.directory.resolveAccounts([accountName]);
     if (!resolved) throw new KavachError("METADATA_REQUIRED", "approve", "unknown account");
-    const report: SyncReport = { metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, acked: 0, hasMore: false }, purged: 0, maintenance: "done", timings: emptyTimings(), errors: [] };
+    const report: SyncReport = { mode: "full", metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, skipped: 0, acked: 0, hasMore: false }, purged: 0, maintenance: "done", timings: emptyTimings(), errors: [] };
     await this.acceptMemberCertificate(resolved, report);
     const requester = resolvedAccountId(resolved);
     const pinned = await this.pinFor(requester);

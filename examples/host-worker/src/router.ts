@@ -96,6 +96,20 @@ async function route(request: Request, env: Env): Promise<Response> {
     return json(await dir.authorizeReplacement(seg[1], b));
   }
   if (seg[0] === "subscriptions" && m === "GET") return json(await dir.subscriptions(requireCaller(request)));
+  if (seg[0] === "sync-state" && m === "GET") {
+    // Revision 12: every subscription with its stream's head, for a client's quick sync. Fenced like
+    // the relay's other calls: a superseded device is refused. This host keeps nothing outside the
+    // sequence, so `pending` is always false.
+    const caller = requireCaller(request);
+    await dir.currentDevice(caller);
+    const subscriptions = [];
+    for (const s of await dir.subscriptions(caller)) {
+      const stub = env.STREAMS.get(env.STREAMS.idFromName(s.streamId));
+      const head = (await (await stub.fetch("https://stream/head", { method: "POST", body: "{}" })).json()) as { tail: number };
+      subscriptions.push({ streamId: s.streamId, authorIdentityId: s.authorIdentityId, head: String(head.tail), pending: false });
+    }
+    return json({ subscriptions });
+  }
 
   // Relay ------------------------------------------------------------------------------------------
   if (seg[0] === "streams" && seg[1]) {

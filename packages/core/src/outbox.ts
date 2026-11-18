@@ -5,12 +5,13 @@ import { fromHex, toHex } from "./bytes.js";
 import { rotationReason, MAX_COUNTER } from "./epoch.js";
 import { bodyHash } from "./crypto.js";
 import { KavachError } from "./errors.js";
-import { indexHistory } from "./historyIndex.js";
+import { indexHistory, unindexHistory } from "./historyIndex.js";
 import { kindOf, type RetentionPolicy } from "./policy.js";
-import { clampEventTime, takeSlot } from "./slots.js";
+import { PROTOCOL_REVISION } from "./revision.js";
+import { clampEventTime, slotKey, takeSlot } from "./slots.js";
 import { sealRecord } from "./record.js";
 import { big, unbig } from "./rows.js";
-import type { HistoryRow, OutboxRow, Store, Tx } from "./store.js";
+import type { EpochRow, HistoryRow, OutboxRow, Store, Tx } from "./store.js";
 import { META, REVISION, STREAM, currentRevision, t3ApplyChange } from "./transactions.js";
 import type { AppendOutcome, Relay } from "./transport.js";
 import { recordWireBytes, type RecordKind } from "./codec.js";
@@ -22,6 +23,10 @@ export interface OutboxEvents {
   /** A record of a kind with a newest slot was cancelled or is in doubt: the app may resend its current state of that kind. */
   refresh?(reason: string): void;
   securityError?(code: string, detail: string): void;
+  /** The host refused records as AUDIENCE_STALE: they are held, and the next sync runs full. */
+  audienceStale?(held: number): void;
+  /** A held record was sealed again under a new epoch: it has a new id, and the old one is gone. */
+  resealed?(oldRecordId: Uint8Array, newRecordId: Uint8Array): void;
 }
 
 export interface OutboxDeps {
@@ -115,12 +120,12 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
     let count = 0;
     let bytes = 0;
     for (const [key, row] of tx.list("outbox")) {
-      if (declared.queue === "latestWins" && row.kind === kind && row.status === "queued") {
+      if (declared.queue === "latestWins" && row.kind === kind && (row.status === "queued" || row.status === "held")) {
         tx.put("outbox", key, terminal(row, "cancelled", "superseded"));
         superseded.push(fromHex(row.recordId));
         continue;
       }
-      if (row.status === "queued" || row.status === "inflight") {
+      if (row.status === "queued" || row.status === "inflight" || row.status === "held") {
         count++;
         bytes += row.wire.length / 2;
       }
@@ -150,7 +155,10 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
       desiredRevision: big(currentRevision(tx)),
       status: "queued",
       attempts: 0,
-      reason: undefined
+      reason: undefined,
+      // Kept until acceptance, so a record the host refuses as AUDIENCE_STALE is resealed, not lost.
+      payload: toHex(payload),
+      ...(eventTime === undefined ? {} : { eventTime: big(eventTime) })
     });
     if (key !== undefined) tx.put("enqueueKeys", key, { recordId: id, epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now) });
     // The sender's own row, under the rules a reader applies (section 10): history when the kind
@@ -199,6 +207,10 @@ export interface DrainSummary {
   cancelled: number;
   unknown: number;
   retry: number;
+  /** Records the host refused as AUDIENCE_STALE in this drain, now held for the next epoch. */
+  held: number;
+  /** Held records sealed again under a new epoch in this drain. */
+  resealed: number;
   /** Record bytes handed to the relay by this drain. */
   bytes: number;
   /** The error that ended the drain early, when a send failed before or without an answer (NETWORK, RATE_LIMITED); its record stays queued. */
@@ -215,7 +227,7 @@ type HandoffStep = { kind: "none" } | { kind: "skipped" } | { kind: "sent"; key:
  * revalidates first.
  */
 export async function drain(deps: OutboxDeps, maxRecords = 1000): Promise<DrainSummary> {
-  const summary: DrainSummary = { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, bytes: 0 };
+  const summary: DrainSummary = { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0, bytes: 0 };
   for (let i = 0; i < maxRecords; i++) {
     const step = await handoffNext(deps, summary);
     if (step.kind === "none") break;
@@ -229,10 +241,11 @@ export async function drain(deps: OutboxDeps, maxRecords = 1000): Promise<DrainS
       outcome = undefined; // no answer: the identical bytes are retried, the relay answers from its checkpoint
       if (e instanceof KavachError) summary.blocked ??= e; // and the reason reaches the report
     }
-    const final = await recordOutcome(deps, step.key, outcome);
+    const final = await recordOutcome(deps, step.key, outcome, summary);
     if (final === "accepted") summary.accepted++;
     else if (final === "cancelled") summary.cancelled++;
     else if (final === "unknown") summary.unknown++;
+    else if (final === "held") break; // the epoch is refused: nothing more goes out until the next one
     else {
       summary.retry++;
       break; // a retryable failure ends this drain; the next sync re-enters T6h
@@ -244,9 +257,71 @@ export async function drain(deps: OutboxDeps, maxRecords = 1000): Promise<DrainS
 /** Dead rows cancelled per handoff transaction; a larger backlog is finished over the next handoffs. */
 const CANCEL_BATCH = 500;
 
-/** A row that will not be sent again keeps its summary and sheds the ciphertext. */
-function terminal(row: OutboxRow, status: "cancelled" | "unknown", reason: string): OutboxRow {
-  return { ...row, wire: "", status, reason };
+/** A row that will not be sent again keeps its summary and sheds the ciphertext and the payload. */
+export function terminal(row: OutboxRow, status: "cancelled" | "unknown", reason: string): OutboxRow {
+  const { payload: _payload, eventTime: _eventTime, heldEpoch: _heldEpoch, ...rest } = row;
+  void _payload;
+  void _eventTime;
+  void _heldEpoch;
+  return { ...rest, wire: "", status, reason };
+}
+
+/** The active epoch a held record may be resealed under: active, unpaused, newer than the refused one, with a counter left. */
+function resealEpoch(tx: Pick<Tx, "get">): EpochRow | undefined {
+  const revision = tx.get("revision", REVISION);
+  if (revision?.paused === "metadata" || revision?.paused === "limit" || revision?.paused === "rotation") return undefined;
+  const stream = tx.get("stream", STREAM);
+  if (!stream || stream.activeEpoch === undefined) return undefined;
+  const epoch = tx.get("epochs", String(stream.activeEpoch));
+  return epoch && epoch.status === "active" && epoch.nextCounter <= MAX_COUNTER ? epoch : undefined;
+}
+
+/**
+ * Seal a held record again under `epoch`, with the next counter: a new record with a new id. The
+ * row, the sender's own history row and slot, and an idempotency key that named the old id all
+ * move to the new one, in this transaction. The epoch row's counter advances; the caller passes
+ * the returned epoch row to the next reseal.
+ */
+function resealIn(tx: Tx, deps: OutboxDeps, key: string, row: OutboxRow, epoch: EpochRow, now: bigint): { epoch: EpochRow; oldId: string; newId: string } | undefined {
+  const declared = kindOf(deps.policy, row.kind);
+  if (!declared || row.payload === undefined) return undefined;
+  const a = deps.author();
+  const eventTime = row.eventTime === undefined ? undefined : unbig(row.eventTime);
+  const sealed = sealRecord({
+    streamId: a.streamId,
+    epoch: epoch.epoch,
+    nextCounter: epoch.nextCounter,
+    kind: row.kind,
+    eventTime,
+    headerClass: declared.headerClass,
+    payload: fromHex(row.payload),
+    sentAt: now,
+    epochKey: fromHex(epoch.epochKey),
+    signingSecretKey: a.signingSecretKey
+  });
+  const oldId = row.recordId;
+  const newId = toHex(sealed.recordId);
+  const { heldEpoch: _held, ...rest } = row;
+  void _held;
+  tx.delete("outbox", key);
+  tx.put("outbox", newId, { ...rest, recordId: newId, wire: toHex(sealed.wire), epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), desiredRevision: big(currentRevision(tx)), status: "queued", attempts: 0, reason: undefined, resealed: true });
+  const next: EpochRow = { ...epoch, nextCounter: epoch.nextCounter + 1, lastSentAt: big(now) };
+  tx.put("epochs", String(epoch.epoch), next);
+  const history = tx.get("history", oldId);
+  if (history) {
+    unindexHistory(tx, history);
+    tx.delete("history", oldId);
+    const moved: HistoryRow = { ...history, recordId: newId, epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now) };
+    tx.put("history", newId, moved);
+    indexHistory(tx, moved);
+  }
+  const slot = slotKey(toHex(a.identityId), row.kind);
+  const own = tx.get("newest", slot);
+  if (own?.recordId === oldId) {
+    tx.put("newest", slot, { ...own, recordId: newId, epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), eventTime: big(clampEventTime(eventTime, now)), bodyHash: toHex(bodyHash(sealed.wire.subarray(0, sealed.wire.length - 64))) });
+  }
+  for (const [k, e] of tx.list("enqueueKeys")) if (e.recordId === oldId) tx.put("enqueueKeys", k, { ...e, recordId: newId, epoch: epoch.epoch, counter: sealed.counter });
+  return { epoch: next, oldId, newId };
 }
 
 async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<HandoffStep> {
@@ -264,6 +339,23 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
     const live: [string, OutboxRow][] = [];
     let cancelled = 0;
     let refresh = false;
+    // Held records first: past their window they are cancelled, under a newer usable epoch they
+    // are sealed again once, in their original order, and then go out like any queued record.
+    let target = resealEpoch(tx);
+    for (const [key, row] of [...tx.list("outbox")].filter(([, r]) => r.status === "held").sort(([, a], [, b]) => a.epoch - b.epoch || a.counter - b.counter)) {
+      if (unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now) {
+        tx.put("outbox", key, terminal(row, "cancelled", "expired"));
+        cancelled++;
+        after.push(() => deps.events?.cancelled?.(fromHex(row.recordId), "expired"));
+        continue;
+      }
+      if (!target || target.epoch <= (row.heldEpoch ?? row.epoch) || target.nextCounter > MAX_COUNTER) continue;
+      const moved = resealIn(tx, deps, key, row, target, now);
+      if (!moved) continue;
+      target = moved.epoch;
+      summary.resealed++;
+      after.push(() => deps.events?.resealed?.(fromHex(moved.oldId), fromHex(moved.newId)));
+    }
     for (const [key, row] of [...tx.list("outbox")].sort(([, a], [, b]) => a.epoch - b.epoch || a.counter - b.counter)) {
       if (row.status !== "queued" && row.status !== "inflight") continue;
       const reason = cancelled >= CANCEL_BATCH ? undefined : unbig(row.desiredRevision) !== revision ? "rotation" : unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now ? "expired" : undefined;
@@ -287,7 +379,7 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
     tx.put("outbox", key, marked);
     let outcome: Promise<AppendOutcome>;
     try {
-      outcome = tx.handoff(() => deps.relay.appendRecord(fromHex(row.recordId), fromHex(row.wire)));
+      outcome = tx.handoff(() => deps.relay.appendRecord(fromHex(row.recordId), fromHex(row.wire), { revision: PROTOCOL_REVISION }));
     } catch {
       // A synchronous transport failure: roll the in-flight mark back and stop this drain.
       tx.put("outbox", key, { ...row, attempts: row.attempts + 1 });
@@ -300,9 +392,9 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
   return step;
 }
 
-type Final = "accepted" | "cancelled" | "unknown" | "retry";
+type Final = "accepted" | "cancelled" | "unknown" | "retry" | "held";
 
-export async function recordOutcome(deps: OutboxDeps, key: string, outcome: AppendOutcome | undefined): Promise<Final> {
+export async function recordOutcome(deps: OutboxDeps, key: string, outcome: AppendOutcome | undefined, summary?: DrainSummary): Promise<Final> {
   const after: (() => void)[] = [];
   const final = await deps.store.transaction((tx): Final => {
     const row = tx.get("outbox", key);
@@ -332,6 +424,38 @@ export async function recordOutcome(deps: OutboxDeps, key: string, outcome: Appe
         cancel("EQUIVOCATION");
         after.push(() => deps.events?.securityError?.("EQUIVOCATION", "the relay holds a different record under this id"));
         return "cancelled";
+      case "AUDIENCE_STALE": {
+        // The epoch is current, its recipients are not: every row sealed under it shares the refused
+        // audience, the answered one and those queued behind it. Each is held for the next epoch,
+        // once; a row already resealed (or from before payloads were kept) is cancelled. The epoch
+        // is retired (T3) after the rows are held, so the rotation cancels none of them, and the
+        // next sync runs full to learn the membership the host acted on.
+        let fate: Final = "held";
+        let held = 0;
+        let refreshNeeded = false;
+        const rows = tx.list("outbox").filter(([k, r]) => k === key || (r.epoch === row.epoch && r.status === "queued"));
+        for (const [k, r] of rows) {
+          const current = k === key ? row : r;
+          const rid = fromHex(current.recordId);
+          if (current.resealed || current.payload === undefined) {
+            tx.put("outbox", k, terminal(current, "cancelled", "AUDIENCE_STALE"));
+            after.push(() => deps.events?.cancelled?.(rid, "AUDIENCE_STALE"));
+            if (kindOf(deps.policy, current.kind)?.newest) refreshNeeded = true;
+            if (k === key) fate = "cancelled";
+            else if (summary) summary.cancelled++;
+          } else {
+            tx.put("outbox", k, { ...current, status: "held", heldEpoch: current.epoch });
+            held++;
+          }
+        }
+        t3ApplyChange(tx, { kind: "audienceStale" });
+        const meta = tx.get("meta", META);
+        if (meta) tx.put("meta", META, { ...meta, fullSyncDue: true });
+        if (summary) summary.held += held;
+        if (refreshNeeded) after.push(() => deps.events?.refresh?.("AUDIENCE_STALE"));
+        after.push(() => deps.events?.audienceStale?.(held));
+        return fate;
+      }
       case "EPOCH_FENCED":
       case "SUPERSEDED_DEVICE":
       case "UNAUTHORIZED":
@@ -364,6 +488,8 @@ export async function purgeOutbox(store: Store, policy: RetentionPolicy, now: bi
 export interface OutboxCounts {
   readonly queued: number;
   readonly inflight: number;
+  /** Refused as AUDIENCE_STALE, waiting for the next epoch. */
+  readonly held: number;
   readonly cancelled: number;
   readonly unknown: number;
   /** Age of the oldest row still to send, when there is one. */
@@ -372,12 +498,12 @@ export interface OutboxCounts {
 
 /** Rows by state, for diagnostics. */
 export function outboxCounts(tx: Pick<Tx, "list">, now: bigint): OutboxCounts {
-  const counts = { queued: 0, inflight: 0, cancelled: 0, unknown: 0 };
+  const counts = { queued: 0, inflight: 0, held: 0, cancelled: 0, unknown: 0 };
   let oldest: bigint | undefined;
   for (const [, r] of tx.list("outbox")) {
     if (r.status === "accepted") continue;
     counts[r.status]++;
-    if (r.status === "queued" || r.status === "inflight") {
+    if (r.status === "queued" || r.status === "inflight" || r.status === "held") {
       const sentAt = unbig(r.sentAt);
       if (oldest === undefined || sentAt < oldest) oldest = sentAt;
     }
@@ -392,5 +518,5 @@ export async function outboxCount(store: Store): Promise<number> {
 
 /** The records still to send, inside a read the caller holds. */
 export function outboxCountIn(tx: Pick<Tx, "list">): number {
-  return tx.list("outbox").filter(([, r]) => r.status === "queued" || r.status === "inflight").length;
+  return tx.list("outbox").filter(([, r]) => r.status === "queued" || r.status === "inflight" || r.status === "held").length;
 }

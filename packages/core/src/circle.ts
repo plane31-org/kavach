@@ -9,7 +9,12 @@ import { DocumentType, buildCircleSnapshot, expectType, verifyDocument, type Cir
 import { randomBytes } from "./crypto.js";
 import { KavachError } from "./errors.js";
 
-export type CircleStatus = "requested" | "member" | "left" | "quarantined" | "closed";
+/**
+ * `gone` (revision 12): a full sync asked the host for the circle and the host answered that it
+ * has none. Sharing stops, the row stays, and a later signed snapshot at the same or a higher
+ * revision brings the circle back; only an owner's signed close is final.
+ */
+export type CircleStatus = "requested" | "member" | "left" | "quarantined" | "closed" | "gone";
 
 /** What the SDK persists per circle it has pinned. */
 export interface CircleState {
@@ -62,7 +67,7 @@ export function acceptSnapshot(state: CircleState, wire: Uint8Array, ownerAccoun
   let status: CircleStatus = state.status;
   if (state.status === "quarantined") status = "quarantined";
   else if (listed) status = "member";
-  else if (state.status === "member") status = "left";
+  else if (state.status === "member" || state.status === "gone") status = "left";
   return {
     outcome: "ACCEPTED",
     snapshot: doc,

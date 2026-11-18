@@ -181,7 +181,7 @@ describe("feedback findings", () => {
     expect(i.vault).toEqual({ revision: BigInt(vault?.revision ?? "0"), pending: false, dirty: false });
     expect(JSON.stringify(i, (_, v) => (typeof v === "bigint" ? v.toString() : v))).not.toContain(toHex((await a.secrets.get("accountSeed")) ?? new Uint8Array(1)));
     await w.sync(a);
-    expect((await a.client.inspect()).outbox).toEqual({ queued: 0, inflight: 0, cancelled: 0, unknown: 0, oldestPendingAgeMs: undefined });
+    expect((await a.client.inspect()).outbox).toEqual({ queued: 0, inflight: 0, held: 0, cancelled: 0, unknown: 0, oldestPendingAgeMs: undefined });
   });
 
   it("9: an expired backlog does not delay a fresh location: one sync cancels the old rows and delivers the new one", async () => {

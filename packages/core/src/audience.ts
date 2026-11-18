@@ -70,7 +70,12 @@ export type AudienceEvent =
   | { readonly kind: "disable"; readonly circleId: Uint8Array }
   | { readonly kind: "counterExhausted" }
   | { readonly kind: "hygiene" }
-  | { readonly kind: "clockReversal" };
+  | { readonly kind: "clockReversal" }
+  /** Revision 12: the host no longer serves a circle this device shared to, or serves it again. */
+  | { readonly kind: "gone"; readonly circleId: Uint8Array }
+  | { readonly kind: "returned"; readonly circleId: Uint8Array }
+  /** Revision 12: the host refused an append as AUDIENCE_STALE; the epoch is not used again. */
+  | { readonly kind: "audienceStale" };
 
 export interface RevisionState {
   readonly desiredRevision: bigint;

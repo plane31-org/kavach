@@ -52,7 +52,8 @@ export async function device(name: string, provider = new Platform()): Promise<D
     secretStore: secrets,
     store,
     transport,
-    now: clock.now
+    now: clock.now,
+    fullSyncEveryMs: 86_400_000
   });
   client.subscribe((e) => {
     events.push(e);

@@ -41,6 +41,10 @@ export interface MetaRow {
   state: StoreState;
   /** Set by account recovery: discovery of this account's circles through the host, page by page, until complete; failed circles wait in `retry`. */
   bootstrap?: { cursor?: string; complete: boolean; retry?: BootstrapRetryRow[]; pagesDone?: boolean };
+  /** When the last full sync finished its metadata pass; a quick sync older than `fullSyncEveryMs` since this runs full. Absent until the first. */
+  lastFullSyncAt?: string;
+  /** Set when the host refused a record as `AUDIENCE_STALE`: the next sync runs full, whatever was asked. */
+  fullSyncDue?: boolean;
 }
 
 export interface SelfRow {
@@ -94,7 +98,7 @@ export interface CircleRow {
   snapshot: string | undefined;
   members: string[];
   enabled: boolean;
-  status: "requested" | "member" | "left" | "quarantined" | "closed";
+  status: "requested" | "member" | "left" | "quarantined" | "closed" | "gone";
   verifiedAt: string;
   /** An owner's successor snapshot awaiting host confirmation (T8). */
   pending?: { snapshot: string; revision: string; close?: boolean } | undefined;
@@ -139,7 +143,8 @@ export interface StreamRow {
   pendingEpoch: number | undefined;
 }
 
-export type OutboxStatus = "queued" | "inflight" | "accepted" | "cancelled" | "unknown";
+/** `held` (revision 12): refused as `AUDIENCE_STALE`, kept with its payload until a new epoch, then resealed once. */
+export type OutboxStatus = "queued" | "inflight" | "held" | "accepted" | "cancelled" | "unknown";
 
 export interface OutboxRow {
   recordId: string;
@@ -152,6 +157,17 @@ export interface OutboxRow {
   status: OutboxStatus;
   attempts: number;
   reason: string | undefined;
+  /**
+   * The payload (hex) and event time, kept until the record is accepted or given up, so a record
+   * refused as `AUDIENCE_STALE` can be resealed under the next epoch. Shed with the ciphertext
+   * when the row becomes terminal. Absent on rows from before 0.8.0, which cannot be resealed.
+   */
+  payload?: string;
+  eventTime?: string;
+  /** Set on a held row: the epoch whose audience the host refused. */
+  heldEpoch?: number;
+  /** Set once the row has been resealed: a second `AUDIENCE_STALE` cancels it. */
+  resealed?: boolean;
 }
 
 export interface HistoryRow {

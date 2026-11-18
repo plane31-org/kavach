@@ -175,6 +175,21 @@ describe("openKavach", () => {
     await erin.close();
   });
 
+  it("forwards fullSyncEveryMs, without which a quick sync is refused", async () => {
+    const w = world();
+    const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));
+    const keys = new Map<string, string>();
+    const common = { transport: w.transport("alice"), recoveryProvider: new NoProvider(), retentionPolicy: testPolicy, resetTrust: w.resetTrust, database: cipherLike(dir, keys), context: "foreground" as const, now: w.clock.now };
+    const plain = await openKavach({ ...common, accountName: "alice", secrets: new MemorySecretStore() });
+    await expect(plain.client.sync({ mode: "quick" })).rejects.toMatchObject({ code: "MALFORMED" });
+    await plain.close();
+    const bounded = await openKavach({ ...common, accountName: "bob", transport: w.transport("bob"), secrets: new MemorySecretStore(), fullSyncEveryMs: 86_400_000 });
+    await bounded.client.initializeAccount();
+    expect((await bounded.client.sync({ mode: "quick" })).promotedBecause).toBe("noFullSync");
+    expect((await bounded.client.sync({ mode: "quick" })).mode).toBe("quick");
+    await bounded.close();
+  });
+
   it("takes no recovery provider on a recovery-only profile, and requires one where identity continuity is enabled", async () => {
     const w = world();
     const dir = mkdtempSync(join(tmpdir(), "kavach-setup-"));

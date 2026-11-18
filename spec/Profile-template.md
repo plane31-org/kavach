@@ -28,9 +28,11 @@ The global windows with their values and reasons: `deliveryWindowMs`, `appendRet
 
 The secret store and its accessibility class; the encrypted transactional store and its cross-process writer lock, with who provisions the storage key; the secure random source (Web Crypto, or what the runtime lacks and how it is installed); the recovery provider per platform and its five statuses; the trusted clock for the reset-key rules; the transport, with a `send` that can be initiated inside a transaction; the sync schedule (foreground, push, background, and the repeat while `hasMore`), and which process runs background work.
 
+The sync schedule's modes (revision 12): when the product syncs quickly and when fully, and its `fullSyncEveryMs` with the reason for the period, since a removal and a contact's key change wait for the next full sync on a device that syncs quickly.
+
 ## 5. Server
 
-How the host implements the directory and relay contract (protocol section 13): storage, atomicity of cursor advance and deletion, the expiry alarm, the append checkpoint, subscription creation, authentication and the device binding, the reset authority and the signing of the key list, and what the host never stores.
+How the host implements the directory and relay contract (protocol section 13), including, when the product uses quick syncs, the change check `syncState` (what `pending` means for this host) and whether it applies the audience fence (`AUDIENCE_STALE`) and how it reads the client's revision from an append, answering older clients as before: storage, atomicity of cursor advance and deletion, the expiry alarm, the append checkpoint, subscription creation, authentication and the device binding, the reset authority and the signing of the key list, and what the host never stores.
 
 ## 6. Product behaviour the protocol depends on
 

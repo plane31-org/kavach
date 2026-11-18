@@ -47,6 +47,19 @@ describe("httpTransport failures", () => {
     expect(await caught(() => limited({}).directory.resolveAccounts(["alice"]))).toEqual({ code: "RATE_LIMITED", retryable: true, retryAfterMs: undefined });
   });
 
+  it("revision 12: a host without the change check is UNSUPPORTED_OPERATION, not retryable; an append names the client's revision", async () => {
+    const missing = transportWith(async () => new Response("not found", { status: 404 }));
+    expect(await caught(() => missing.relay.syncState?.() ?? Promise.resolve())).toEqual({ code: "UNSUPPORTED_OPERATION", retryable: false, retryAfterMs: undefined });
+    const sent: (string | null)[] = [];
+    const t = transportWith(async (_url, init) => {
+      sent.push(new Headers(init?.headers).get("kavach-revision"));
+      return new Response(JSON.stringify({ status: "ACCEPTED" }), { headers: { "content-type": "application/json" } });
+    });
+    await t.relay.appendRecord(new Uint8Array(16), new Uint8Array(200), { revision: 12 });
+    await t.relay.appendRecord(new Uint8Array(16), new Uint8Array(200));
+    expect(sent).toEqual(["12", null]);
+  });
+
   it("a body that fails while streaming is NETWORK; a body that is not JSON is a plain error", async () => {
     const broken = new ReadableStream<Uint8Array>({
       start(controller) {

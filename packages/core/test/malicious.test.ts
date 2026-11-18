@@ -161,8 +161,10 @@ describe("withholding, duplication and reordering", () => {
     expect([...(stream?.subscriptions.values() ?? [])][0]?.cursor).toBe(cursorBefore);
     b.t.knobs.withhold.delete("records");
     expect((await w.sync(b)).inbox.stored).toBe(1);
-    // Removal withheld.
-    b.t.knobs.withhold.add("snapshots");
+    // Removal withheld: the host keeps serving the snapshot from before it (an absent answer is a
+    // different case, which retires the circle; see the revision 12 tests).
+    const lastSeen = await b.store.read((tx) => tx.get("circles", toHex(circleId))?.snapshot ?? "");
+    b.t.knobs.replay.snapshots.set(toHex(circleId), fromHex(lastSeen));
     const bobId = (await b.client.inspect()).identityId ?? new Uint8Array();
     await a.client.circles.remove(circleId, bobId);
     await w.sync(a);
@@ -177,7 +179,7 @@ describe("withholding, duplication and reordering", () => {
     const pin = toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array());
     await w.sync(b);
     expect(toHex((await latest(b.client, aliceId))?.recordId ?? new Uint8Array())).toBe(pin);
-    b.t.knobs.withhold.delete("snapshots");
+    b.t.knobs.replay.snapshots.delete(toHex(circleId));
     await w.sync(b);
     expect((await b.client.circles.list())[0]?.status).toBe("left");
   });

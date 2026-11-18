@@ -43,6 +43,8 @@ export interface KavachSetupOptions {
   readonly now?: () => bigint;
   /** Forwarded to `open()`: called when a subscriber throws, which is otherwise silent. */
   readonly onListenerError?: (error: unknown, event: ClientEvent) => void;
+  /** Forwarded to `open()`: the longest a device may go on quick syncs alone; required for `sync({ mode: "quick" })`. */
+  readonly fullSyncEveryMs?: number;
   /**
    * The secure random source for Hermes, which has no `crypto.getRandomValues`: pass
    * `expo-crypto`'s `getRandomValues`. Installed on the global once when none exists, left alone
@@ -217,7 +219,8 @@ export async function openKavach(options: KavachSetupOptions): Promise<KavachSet
     store,
     transport: options.transport,
     ...(options.now ? { now: options.now } : {}),
-    ...(options.onListenerError ? { onListenerError: options.onListenerError } : {})
+    ...(options.onListenerError ? { onListenerError: options.onListenerError } : {}),
+    ...(options.fullSyncEveryMs !== undefined ? { fullSyncEveryMs: options.fullSyncEveryMs } : {})
   });
   let closed: Promise<void> | undefined;
   const close = (): Promise<void> => {

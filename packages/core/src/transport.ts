@@ -134,7 +134,34 @@ export interface EpochBundle {
   readonly wrap: Uint8Array | undefined;
 }
 
-export type AppendStatus = "ACCEPTED" | "ALREADY_ACCEPTED" | "EQUIVOCATION" | "STALE_APPEND" | "RETRYABLE" | "UNAUTHORIZED" | "SUPERSEDED_DEVICE" | "EPOCH_FENCED";
+/**
+ * `EPOCH_FENCED`: the record's epoch is not the stream's current one. `AUDIENCE_STALE` (revision
+ * 12): the epoch is current but addresses an account that no longer shares a circle with the
+ * author; the client holds the record, learns the membership, rotates and reseals it once. A host
+ * sends `AUDIENCE_STALE` only to a client whose append carries revision 12 or later.
+ */
+export type AppendStatus = "ACCEPTED" | "ALREADY_ACCEPTED" | "EQUIVOCATION" | "STALE_APPEND" | "RETRYABLE" | "UNAUTHORIZED" | "SUPERSEDED_DEVICE" | "EPOCH_FENCED" | "AUDIENCE_STALE";
+
+/** What the client says about itself with each append; the transport carries it (a header, say). */
+export interface AppendOptions {
+  /** The protocol revision of the sending client (`PROTOCOL_REVISION`). */
+  readonly revision: number;
+}
+
+/**
+ * The host's change check for a quick sync (revision 12): every stream this reader is subscribed
+ * to with its head, so the client reads only the streams with something new.
+ */
+export interface SyncState {
+  readonly subscriptions: readonly {
+    readonly streamId: Uint8Array;
+    readonly authorIdentityId: Uint8Array;
+    /** The highest delivery sequence on the stream, as `readRecords` reports it in `tail`. */
+    readonly head: bigint;
+    /** The host holds something for this reader that `head` does not count (a record it serves outside the sequence, say). */
+    readonly pending: boolean;
+  }[];
+}
 
 export interface AppendOutcome {
   readonly status: AppendStatus;
@@ -159,12 +186,18 @@ export interface Relay {
     manifest: Uint8Array;
     wraps: ReadonlyMap<string, Uint8Array>;
   }): Promise<MutationOutcome & { currentEpoch?: number | undefined; currentManifest?: Uint8Array | undefined }>;
-  /** MUST be callable from inside T6h without awaiting: it queues the bytes synchronously and returns a promise. */
-  appendRecord(recordId: Uint8Array, wire: Uint8Array): Promise<AppendOutcome>;
+  /** MUST be callable from inside T6h without awaiting: it queues the bytes synchronously and returns a promise. `options` names the client's revision, which the transport passes to the host. */
+  appendRecord(recordId: Uint8Array, wire: Uint8Array, options?: AppendOptions): Promise<AppendOutcome>;
   readRecords(streamId: Uint8Array, afterSeq: bigint, limit: number): Promise<ReadRecordsResult>;
   ackThrough(streamId: Uint8Array, cursor: bigint): Promise<{ status: "COMMITTED" | "CURSOR_OUT_OF_RANGE" | "RETRYABLE" | "UNAUTHORIZED"; committedCursor?: bigint }>;
   /** The streams this reader is subscribed to (the host creates subscriptions). */
   listSubscriptions(): Promise<readonly { streamId: Uint8Array; authorIdentityId: Uint8Array }[]>;
+  /**
+   * Revision 12, used by `sync({ mode: "quick" })` in place of `listSubscriptions`: the
+   * subscriptions with each stream's head. A host that does not offer it is a deployment mismatch:
+   * the transport raises `UNSUPPORTED_OPERATION` (an HTTP 404, say), and the SDK does not fall back.
+   */
+  syncState?(): Promise<SyncState>;
 }
 
 export interface Transport {

@@ -48,6 +48,8 @@ When the database file survives but its key is gone (the secret store was cleare
 
 **Syncing until done and replacing a phone.** `client.syncUntilDrained({ catchUp, maxRounds, maxMs })` repeats `sync` while the relay still holds records or bootstrap has circles left, within bounds, and returns the merged report with `rounds`, `stoppedBecause` and `remaining`; use it in the foreground and in a background wake instead of your own loop. On a new phone with no secret from the old one, `client.replaceDevice({ authorize })` runs account recovery end to end under the protocol's retry rules; `authorize` posts the proposal to your backend after a fresh sign-in and returns the token, or `"reauthenticate"` when the user must sign in first. It returns `activated`, `pending` (call again), `conflict` (sign in again; the next call prepares anew) or `reauthenticate`.
 
+**Quick syncs in the background.** Pass `fullSyncEveryMs` to `openKavach` and call `client.sync({ mode: "quick", skipMaintenance: true })` (or `syncUntilDrained({ mode: "quick" })`) from a background task: only the streams with something new are read, and the sync runs full by itself when it must. The transport needs `syncState`, and the host must be deployed first. The core README's "Using it well" says what quick syncs delay.
+
 ### Advanced: the adapters one by one
 
 `openKavach` is these steps; an app with a different arrangement (a shared database, its own key management) uses the adapters directly:

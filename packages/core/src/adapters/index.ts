@@ -97,6 +97,7 @@ export {
 
 // Transport ----------------------------------------------------------------------------------------
 export type {
+  AppendOptions,
   AppendOutcome,
   AppendStatus,
   CircleListing,
@@ -112,6 +113,7 @@ export type {
   ResolvedAccount,
   SuccessionLink,
   SuccessionPage,
+  SyncState,
   Transport
 } from "../transport.js";
 

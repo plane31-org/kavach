@@ -100,7 +100,7 @@ export class FaultyStore implements Store {
 
 // The malicious transport ----------------------------------------------------------------------------
 
-export type MutationName = "registerAccount" | "activateDevice" | "publishVault" | "publishOwnedCircle" | "requestJoin" | "requestLeave" | "resetAccount" | "succeedAccount" | "setSharingPreference" | "publishEpoch" | "appendRecord" | "ackThrough";
+export type MutationName = "registerAccount" | "activateDevice" | "publishVault" | "publishOwnedCircle" | "requestJoin" | "requestLeave" | "resetAccount" | "succeedAccount" | "setSharingPreference" | "publishEpoch" | "appendRecord" | "ackThrough" | "syncState" | "getCircle";
 
 export type ServedKind = "certificate" | "snapshot" | "vault" | "manifest" | "wrap" | "record" | "keyList" | "receipt" | "succession";
 
@@ -244,6 +244,11 @@ export class MaliciousTransport implements Transport {
       publishVault: (input) => this.mutate("publishVault", () => d().publishVault(input)),
       getCircle: async (circleId) => {
         this.calls.push("getCircle");
+        const fail = k.failWith.get("getCircle");
+        if (fail) {
+          k.failWith.delete("getCircle");
+          throw fail;
+        }
         if (k.withhold.has("snapshots")) return undefined;
         const key = toHex(circleId);
         return this.serve("snapshot", k.fork.snapshots.get(key) ?? k.replay.snapshots.get(key) ?? (await d().getCircle(circleId)));
@@ -300,7 +305,7 @@ export class MaliciousTransport implements Transport {
         return { manifest, wrap: this.serve("wrap", b.wrap) };
       },
       publishEpoch: (input) => this.mutate("publishEpoch", () => r().publishEpoch(input)),
-      appendRecord: (recordId, wire) => {
+      appendRecord: (recordId, wire, options) => {
         // Must stay synchronous up to the inner call (T6h).
         this.calls.push("appendRecord");
         const fail = k.failWith.get("appendRecord");
@@ -308,7 +313,7 @@ export class MaliciousTransport implements Transport {
           k.failWith.delete("appendRecord");
           return Promise.reject(fail);
         }
-        const p = r().appendRecord(recordId, wire);
+        const p = r().appendRecord(recordId, wire, options);
         if (!k.loseResponseOf.has("appendRecord")) return p;
         k.loseResponseOf.delete("appendRecord");
         this.losses.push("appendRecord");
@@ -350,7 +355,22 @@ export class MaliciousTransport implements Transport {
         this.calls.push("listSubscriptions");
         if (k.withhold.has("subscriptions")) throw new KavachError("NETWORK", "transport", "network unreachable");
         return r().listSubscriptions();
-      }
+      },
+      ...(typeof this.inner.relay.syncState === "function"
+        ? {
+            syncState: async () => {
+              this.calls.push("syncState");
+              const fail = k.failWith.get("syncState");
+              if (fail) {
+                k.failWith.delete("syncState");
+                throw fail;
+              }
+              const inner = r().syncState;
+              if (!inner) throw new KavachError("UNSUPPORTED_OPERATION", "transport", "no syncState");
+              return inner.call(r());
+            }
+          }
+        : {})
     };
   }
 }

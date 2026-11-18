@@ -121,13 +121,45 @@ export class FakeHost {
   /** Test switches. */
   failAppends = false;
   dropAppendResponses = false;
-  withholdSnapshots = false;
+  /**
+   * A host withholding membership updates: while on, every circle is served as it stood when the
+   * switch went on, the stale snapshot a removed member is kept in by (scenario 13). A host that
+   * answers it has no circle at all is a different case, which a client treats as gone.
+   */
+  get withholdSnapshots(): boolean {
+    return this.frozenSnapshots !== undefined;
+  }
+  set withholdSnapshots(on: boolean) {
+    this.frozenSnapshots = on ? new Map([...this.circles].filter(([, c]) => !c.closed).map(([k, c]) => [k, c.snapshot])) : undefined;
+  }
+  private frozenSnapshots: Map<string, Uint8Array> | undefined;
   withholdEpochs = false;
   appendCalls = 0;
+  /**
+   * Revision 12 host rule, off unless a test turns it on: refuse as AUDIENCE_STALE an append whose
+   * current epoch addresses an account that shares no live circle with the author any more. Only a
+   * client that sends revision 12 or later gets the status; an older one is answered as before.
+   */
+  audienceFence = false;
+  /** Streams (hex) for which `syncState` reports `pending`: something held outside the sequence. */
+  readonly pendingStreams = new Set<string>();
+  syncStateCalls = 0;
   /** Every append the relay answered, in order: what the author's stream has been asked to accept. */
   readonly appendLog: { streamId: string; recordId: string; hash: string; status: AppendOutcome["status"]; epoch: number; counter: number }[] = [];
 
   // Helpers ---------------------------------------------------------------------------------------
+
+  /** The accounts that share a live circle with this one, by the snapshots the host holds: the audience fence's view. */
+  sharedWith(accountId: string): Set<string> {
+    const out = new Set<string>();
+    for (const c of this.circles.values()) {
+      if (c.closed) continue;
+      const members = expectType<CircleSnapshot>(parseDocument(c.snapshot), DocumentType.CircleSnapshot).members.map((m) => toHex(m));
+      if (!members.includes(accountId)) continue;
+      for (const m of members) out.add(m);
+    }
+    return out;
+  }
 
   accountByIdentity(iid: string): Account | undefined {
     return [...this.accounts.values()].find((a) => a.identityId === iid);
@@ -334,7 +366,8 @@ export class FakeHost {
         return { status: "COMMITTED" };
       },
       async getCircle(circleId) {
-        if (host.withholdSnapshots) return undefined;
+        const frozen = host.frozenSnapshots;
+        if (frozen) return frozen.get(toHex(circleId));
         const c = host.circles.get(toHex(circleId));
         return c && !c.closed ? c.snapshot : undefined;
       },
@@ -559,7 +592,7 @@ export class FakeHost {
         host.purgeEpochs(s);
         return { status: "COMMITTED" as const };
       },
-      appendRecord(recordId, wire): Promise<AppendOutcome> {
+      appendRecord(recordId, wire, options): Promise<AppendOutcome> {
         host.appendCalls++;
         if (host.failAppends) throw new Error("transport down");
         const run = (): AppendOutcome => {
@@ -581,6 +614,10 @@ export class FakeHost {
           if (rec.epoch !== s.currentEpoch) return rec.epoch < s.currentEpoch ? { status: "EPOCH_FENCED" } : { status: "UNAUTHORIZED" };
           const epoch = s.epochs.get(rec.epoch);
           if (!epoch) return { status: "UNAUTHORIZED" };
+          if (host.audienceFence && (options?.revision ?? 0) >= 12) {
+            const shared = host.sharedWith(a.accountId);
+            if (epoch.rows.some((r) => r.identityId !== a.accountId && !shared.has(r.identityId))) return { status: "AUDIENCE_STALE" };
+          }
           const seq = ++s.tail;
           const acceptedAt = host.now() > s.lastAcceptedAt ? host.now() : s.lastAcceptedAt;
           s.lastAcceptedAt = acceptedAt;
@@ -647,6 +684,15 @@ export class FakeHost {
         const out: { streamId: Uint8Array; authorIdentityId: Uint8Array }[] = [];
         for (const [sid, s] of host.streams) if (s.subscriptions.has(callerCert)) out.push({ streamId: fromHex(sid), authorIdentityId: fromHex(s.authorIdentityId) });
         return out;
+      },
+      async syncState() {
+        host.syncStateCalls++;
+        if (!host.isCurrentDevice(accountName, callerCert)) throw new Error("SUPERSEDED_DEVICE");
+        const subscriptions: { streamId: Uint8Array; authorIdentityId: Uint8Array; head: bigint; pending: boolean }[] = [];
+        for (const [sid, s] of host.streams) {
+          if (s.subscriptions.has(callerCert)) subscriptions.push({ streamId: fromHex(sid), authorIdentityId: fromHex(s.authorIdentityId), head: s.tail, pending: host.pendingStreams.has(sid) });
+        }
+        return { subscriptions };
       }
     };
 

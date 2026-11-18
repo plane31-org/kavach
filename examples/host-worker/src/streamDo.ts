@@ -84,6 +84,10 @@ export class StreamDO extends DurableObject<Env> {
           }
           return reply({ ok: true });
         }
+        case "/head": {
+          // The change check (revision 12): the highest delivery sequence, as reads report it in `tail`.
+          return reply({ tail: this.num("tail") });
+        }
         case "/currentEpoch": {
           const e = this.num("currentEpoch");
           return reply(e === 0 ? null : { epoch: e, manifestHash: this.get("currentManifestHash") });
