@@ -141,7 +141,7 @@ export class StreamDO extends DurableObject<Env> {
     const manifest = fromHex(b.manifest);
     const doc = expectType<EpochManifest>(parseDocument(manifest), DocumentType.EpochManifest);
     if (toHex(doc.streamId) !== this.get("streamId")) return { status: "UNAUTHORIZED" };
-    if (members && doc.audience.some(r => !members.has(toHex(r.identityId)))) return { status: "UNAUTHORIZED" };
+    const fenced = !!members && doc.audience.some(r => !members.has(toHex(r.identityId)));
     const current = this.num("currentEpoch");
     const currentRow = this.sql.exec("SELECT manifest FROM epochs WHERE epoch = ?", current).toArray()[0] as { manifest: string } | undefined;
     if (doc.epoch === current && currentRow?.manifest === b.manifest) return { status: "ALREADY_COMMITTED" };
@@ -150,10 +150,13 @@ export class StreamDO extends DurableObject<Env> {
     const tail = this.num("tail");
     const created: { certificateHash: string; identityId: string }[] = [];
     this.ctx.storage.transactionSync(() => {
-      this.sql.exec("INSERT INTO epochs (epoch, manifest, wraps, rows) VALUES (?, ?, ?, ?)", doc.epoch, b.manifest, JSON.stringify(b.wraps), JSON.stringify(rows));
+      this.sql.exec("INSERT INTO epochs (epoch, manifest, wraps, rows) VALUES (?, ?, ?, ?)", doc.epoch, b.manifest, JSON.stringify(fenced ? {} : b.wraps), JSON.stringify(rows));
       this.set("currentEpoch", doc.epoch);
+      // Consume the exact prepared slot even if membership moved while publication was offline.
+      // No wraps or subscriptions escape, and this epoch stays fenced even after a rejoin.
+      if (fenced) this.set("fencedEpoch", doc.epoch);
       this.set("currentManifestHash", toHex(doc.bodyHash));
-      for (const r of rows) {
+      for (const r of fenced ? [] : rows) {
         if (r.identityId === b.callerIdentityId) continue;
         const exists = this.sql.exec("SELECT 1 FROM subs WHERE cert = ?", r.certificateHash).toArray().length > 0;
         if (!exists) {
@@ -199,6 +202,7 @@ export class StreamDO extends DurableObject<Env> {
     }
     const current = this.num("currentEpoch");
     if (rec.epoch !== current) return rec.epoch < current ? { status: "EPOCH_FENCED" } : { status: "UNAUTHORIZED" };
+    if (this.num("fencedEpoch") === rec.epoch) return { status: "AUDIENCE_STALE" };
     const epoch = this.sql.exec("SELECT rows FROM epochs WHERE epoch = ?", rec.epoch).toArray()[0] as { rows: string } | undefined;
     if (!epoch) return { status: "UNAUTHORIZED" };
     const rows = JSON.parse(epoch.rows) as { identityId: string; certificateHash: string }[];

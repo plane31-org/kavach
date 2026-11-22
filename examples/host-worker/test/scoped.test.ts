@@ -29,3 +29,29 @@ describe("scoped HTTP streams",()=>{
     expect(notices.filter(n=>n.kind==="visible").map(n=>n.to_account)).toEqual(["bob"]);
   });
 });
+
+it.each([false, true])("resolves interrupted scoped publication over HTTP (committed: %s)", async (committed) => {
+  const a = await device("alice", undefined, policy), b = await device("bob", undefined, policy);
+  for (const d of [a, b]) await d.client.initializeAccount();
+  const aid = (await a.client.inspect()).identityId ?? new Uint8Array();
+  const { circleId } = await a.client.circles.create();
+  await b.client.circles.requestJoin(circleId, aid);
+  await a.client.sync();
+  await a.client.circles.approve(circleId, "bob");
+  await a.client.sync(); await b.client.sync();
+  const publish = a.transport.relay.publishEpoch;
+  a.transport.relay.publishEpoch = async (request) => {
+    if (committed) await publish(request);
+    return { status: "RETRYABLE" };
+  };
+  const queued = await a.client.enqueue(3, Uint8Array.of(82), { circleId });
+  a.transport.relay.publishEpoch = publish;
+  await a.client.circles.remove(circleId, (await b.client.inspect()).identityId ?? new Uint8Array());
+  const report = await a.client.syncUntilDrained();
+  expect(report.errors).toEqual([]);
+  expect((await a.client.delivery(queued.localId))?.status).toBe("accepted");
+  const row = await a.store.read(tx => tx.get("outbox", toHex(queued.localId)));
+  expect(row?.epoch).toBe(2);
+  const notices = await hostJson<{kind: string; to_account: string}[]>("/v1/debug/notifications");
+  expect(notices.filter(n => n.kind === "visible")).toEqual([]);
+});

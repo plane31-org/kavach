@@ -159,3 +159,64 @@ it("serializes concurrent scoped enqueues and resumes their counters after reope
   const report=await reopened.client.syncUntilDrained();
   expect(report.errors).toEqual([]); expect(report.outbox.accepted).toBe(3);
 });
+
+it.each([false, true])("resolves a pending scoped epoch after removal (host committed: %s)", async (committed) => {
+  const { a, b, family } = await setup();
+  const publish = a.t.relay.publishEpoch;
+  a.t.relay.publishEpoch = async (request) => {
+    if (committed) await publish(request);
+    return { status: "RETRYABLE" };
+  };
+  const queued = await a.client.enqueue(3, Uint8Array.of(80), { circleId: family });
+  a.t.relay.publishEpoch = publish;
+  await a.client.circles.remove(family, (await b.client.inspect()).identityId ?? new Uint8Array());
+  const report = await a.client.syncUntilDrained();
+  expect(report.errors).toEqual([]);
+  expect((await a.client.delivery(queued.localId))?.status).toBe("accepted");
+  const binding = await a.store.read(tx => tx.list("scopedStreams").find(([, s]) => s.circleId === toHex(family))?.[1]);
+  if (!binding) throw new Error("missing scope");
+  expect(await a.store.read(tx => tx.get("stream", binding.streamId)?.highestCommittedEpoch)).toBe(2);
+  expect(await a.store.read(tx => tx.get("epochs", `${binding.streamId}:1`)?.status)).toBe("obsolete");
+});
+
+it("forgets scoped reader keys on removal while retaining history and sending state", async () => {
+  const { w, a, b, family } = await setup();
+  await b.client.enqueue(3, Uint8Array.of(81), { circleId: family });
+  await w.sync(b);
+  await w.sync(a);
+  const before = await a.store.read(tx => tx.list("readerEpochs"));
+  expect(before.length).toBeGreaterThan(0);
+  await a.client.circles.remove(family, (await b.client.inspect()).identityId ?? new Uint8Array());
+  const remaining = await a.store.read(tx => new Set(tx.list("readerEpochs").map(([key]) => key)));
+  for (const [key] of before) expect(remaining.has(key)).toBe(false);
+  expect(await payloads(a, family)).toEqual([81]);
+  expect(await b.store.read(tx => tx.list("stream").length)).toBe(2);
+});
+
+it("consumes stale publications without wraps and keeps them fenced after rejoin", async () => {
+  const { w, a, b, aid, family } = await setup();
+  const publish = a.t.relay.publishEpoch;
+  let pending: Parameters<typeof publish>[0] | undefined;
+  a.t.relay.publishEpoch = async request => { pending = request; return { status: "RETRYABLE" }; };
+  await a.client.enqueue(3, Uint8Array.of(83), { circleId: family });
+  a.t.relay.publishEpoch = publish;
+  if (!pending) throw new Error("missing pending publication");
+  const request = pending;
+  await a.client.circles.remove(family, (await b.client.inspect()).identityId ?? new Uint8Array());
+  expect((await publish(request)).status).toBe("COMMITTED");
+  expect((await publish(request)).status).toBe("ALREADY_COMMITTED");
+  const stream = w.host.streams.get(toHex(request.streamId));
+  expect(stream?.epochs.get(1)?.wraps.size).toBe(0);
+  expect(stream?.subscriptions.size).toBe(0);
+  await w.sync(b);
+  await b.client.circles.requestJoin(family, aid);
+  await a.client.circles.approve(family, "bob");
+  const epoch = await a.store.read(tx => tx.get("epochs", `${toHex(request.streamId)}:1`));
+  const seed = await a.secrets.get("deviceSeed");
+  if (!epoch || !seed) throw new Error("missing sending keys");
+  const { deviceSigningKeypair } = await import("../src/crypto.js");
+  const { sealRecord } = await import("../src/record.js");
+  const record = sealRecord({ streamId: request.streamId, epoch: 1, nextCounter: 0, kind: 3, headerClass: 1, payload: Uint8Array.of(84), sentAt: w.clock.now(), epochKey: hex(epoch.epochKey), signingSecretKey: deviceSigningKeypair(seed).secretKey });
+  expect((await a.t.relay.appendRecord(record.recordId, record.wire)).status).toBe("AUDIENCE_STALE");
+  expect(stream?.tail).toBe(0n);
+});

@@ -74,7 +74,7 @@ interface StreamState {
   accountName: string;
   currentEpoch: number;
   currentManifestHash: string | undefined;
-  epochs: Map<number, { manifest: Uint8Array; wraps: Map<string, Uint8Array>; rows: { identityId: string; certificateHash: string }[] }>;
+  epochs: Map<number, { fenced?: boolean; manifest: Uint8Array; wraps: Map<string, Uint8Array>; rows: { identityId: string; certificateHash: string }[] }>;
   records: Map<bigint, StoredRecord>;
   tail: bigint;
   expiredThrough: bigint;
@@ -593,9 +593,11 @@ export class FakeHost {
         if (!s || s.authorIdentityId !== a.accountId) return { status: "UNAUTHORIZED" as const };
         if (!current()) return { status: "UNAUTHORIZED" as const };
         const doc = expectType<EpochManifest>(parseDocument(manifest), DocumentType.EpochManifest);
+        let fenced = false;
         if (s.circleId) {
           const members = host.circleMembers(s.circleId);
-          if (s.certificateHash !== a.certificateHash || !members.has(a.accountId) || doc.audience.some(r => !members.has(toHex(r.identityId))) || !equalBytes(doc.streamId, streamId)) return { status: "UNAUTHORIZED" as const };
+          if (s.certificateHash !== a.certificateHash || !members.has(a.accountId) || !equalBytes(doc.streamId, streamId)) return { status: "UNAUTHORIZED" as const };
+          fenced = doc.audience.some(r => !members.has(toHex(r.identityId)));
         }
         const cur = s.epochs.get(s.currentEpoch);
         if (doc.epoch === s.currentEpoch && cur && equalBytes(cur.manifest, manifest)) return { status: "ALREADY_COMMITTED" as const };
@@ -603,10 +605,10 @@ export class FakeHost {
           return { status: "CONFLICT" as const, currentEpoch: s.currentEpoch, currentManifest: cur?.manifest };
         }
         const rows = doc.audience.map((r) => ({ identityId: toHex(r.identityId), certificateHash: toHex(r.certificateHash) }));
-        s.epochs.set(doc.epoch, { manifest, wraps: new Map(wraps), rows });
+        s.epochs.set(doc.epoch, { manifest, wraps: new Map(fenced ? [] : wraps), rows, fenced });
         s.currentEpoch = doc.epoch;
         s.currentManifestHash = toHex(doc.bodyHash);
-        for (const r of rows) {
+        for (const r of fenced ? [] : rows) {
           if (r.identityId === a.accountId) continue;
           if (!s.subscriptions.has(r.certificateHash)) s.subscriptions.set(r.certificateHash, { identityId: r.identityId, cursor: s.tail, startSeq: s.tail });
         }
@@ -635,6 +637,7 @@ export class FakeHost {
           if (rec.epoch !== s.currentEpoch) return rec.epoch < s.currentEpoch ? { status: "EPOCH_FENCED" } : { status: "UNAUTHORIZED" };
           const epoch = s.epochs.get(rec.epoch);
           if (!epoch) return { status: "UNAUTHORIZED" };
+          if (epoch.fenced) return { status: "AUDIENCE_STALE" };
           if (s.circleId || (host.audienceFence && (options?.revision ?? 0) >= 12)) {
             const shared = s.circleId ? host.circleMembers(s.circleId) : host.sharedWith(a.accountId);
             if (epoch.rows.some((r) => r.identityId !== a.accountId && !shared.has(r.identityId))) return { status: "AUDIENCE_STALE" };

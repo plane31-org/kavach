@@ -2,6 +2,8 @@
 
 ## Unreleased — protocol revision 14
 
+- Resolve interrupted scoped publications across removals without reusing epoch numbers or distributing stale wraps; clear scoped reader keys when forgetting an author.
+
 - Add optional circle-scoped kinds and deterministic per-device/per-circle streams, reusing epochs, catch-up, cursors and delivery tracking.
 - Isolate latest-wins queues and newest slots by circle; expose circle ids on history/events and index circle history. Queue limits and idempotency remain account-wide.
 - Add idempotent scoped registration to the HTTP adapter, fake host and reference worker, with circle-specific publication and append checks.

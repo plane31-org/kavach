@@ -23,6 +23,7 @@ export class Platform implements RecoveryProvider {
 
 export interface Device {
   client: Client;
+  transport: ReturnType<typeof httpTransport>;
   store: MemoryStore;
   events: ClientEvent[];
   provider: Platform;
@@ -66,6 +67,7 @@ export async function device(name: string, provider = new Platform(), retentionP
   certHash = (await client.getState()).certificateHash;
   return {
     client,
+    transport,
     store,
     events,
     provider,

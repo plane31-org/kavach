@@ -633,8 +633,11 @@ export async function forgetAuthor(store: Store, authorIdentityId: Uint8Array): 
 /** The same, inside a caller's transaction. */
 export function forgetAuthorIn(tx: Tx, authorIdentityId: Uint8Array): void {
   for (const [k] of tx.list("newest", toHex(authorIdentityId) + ":")) tx.delete("newest", k);
-  for (const [, c] of tx.list("certificates")) {
-    if (c.identityId !== toHex(authorIdentityId)) continue;
-    for (const [k] of tx.list("readerEpochs", c.streamId + ":")) tx.delete("readerEpochs", k);
+  const certificates = tx.list("certificates").filter(([, c]) => c.identityId === toHex(authorIdentityId)).map(([, c]) => c);
+  const hashes = new Set(certificates.map(c => c.certificateHash));
+  const streams = new Set(certificates.map(c => c.streamId));
+  for (const [id, binding] of tx.list("scopedStreams")) if (hashes.has(binding.certificateHash)) streams.add(id);
+  for (const stream of streams) {
+    for (const [k] of tx.list("readerEpochs", stream + ":")) tx.delete("readerEpochs", k);
   }
 }
