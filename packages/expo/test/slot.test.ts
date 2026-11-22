@@ -2,7 +2,7 @@
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { toHex } from "@plane31/blind-relay";
 import { MemorySecretStore, ready, type SecretStore } from "@plane31/blind-relay/adapters";
 import { FakeHost, TestClock, testPolicy, testResetKeyList, testResetKeys } from "@plane31/blind-relay/testing";
@@ -219,12 +219,16 @@ describe("kavachSlot", () => {
     await slot.close();
   });
 
-  it("a second open of a database already open in this runtime is refused; after a close, or in another context, it is fine", async () => {
+  it("a second open of a database already open in this runtime is refused, whatever its context; another runtime, or the same one after a close, may open it", async () => {
     const { options } = runtimes();
     const fg = options("foreground");
     const first = await openKavach(fg);
     await expect(openKavach(fg)).rejects.toMatchObject({ code: "MALFORMED" });
-    const other = await openKavach({ ...fg, context: "background" }); // another runtime, as a test models it
+    await expect(openKavach({ ...fg, context: "background" })).rejects.toMatchObject({ code: "MALFORMED" }); // the same runtime: still one handle
+    // Another runtime has its own module instance, and so its own record of what is open.
+    vi.resetModules();
+    const elsewhere = (await import("../src/setup.js")) as typeof import("../src/setup.js");
+    const other = await elsewhere.openKavach({ ...fg, context: "background" });
     await other.close();
     await first.close();
     const again = await openKavach(fg);

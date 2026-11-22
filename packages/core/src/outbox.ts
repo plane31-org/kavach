@@ -203,6 +203,9 @@ export function recipientsOf(row: EpochRow | undefined): Set<string> {
 export function servesHeld(tx: Pick<Tx, "get">, target: EpochRow, row: OutboxRow): boolean {
   const from = row.heldEpoch ?? row.epoch;
   if (target.epoch <= from) return false;
+  // A catch-up epoch carries the records of the epoch it was made for and no others: a record held
+  // from a later, larger epoch would otherwise reach fewer people than it was sealed for.
+  if (target.catchUpFor !== undefined && target.catchUpFor !== from) return false;
   const before = recipientsOf(tx.get("epochs", String(from)));
   for (const id of recipientsOf(target)) if (!before.has(id)) return false;
   return true;
@@ -610,6 +613,7 @@ export async function recordOutcome(deps: OutboxDeps, key: string, outcome: Appe
           // The epoch is no longer the stream's current one: the host did not take the record, so it
           // is held and sealed again under an epoch that may carry it (revision 13).
           tx.put("outbox", key, { ...row, status: "held", heldEpoch: row.epoch });
+          if (summary) summary.held++; // held work the drain goes on for
           return "held";
         }
         // From before payloads were kept: it cannot be sealed again.

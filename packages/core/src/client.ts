@@ -1108,6 +1108,31 @@ class ClientImpl implements Client {
     });
   }
 
+  /**
+   * The held epoch whose records need a catch-up epoch under the current audience, if any; the
+   * audience unresolved (metadata missing, the limit) answers none, and the caller pauses as before.
+   */
+  private async heldNeedCatchUp(): Promise<number | undefined> {
+    const held = await this.store.read((tx) => tx.list("outbox").some(([, r]) => r.status === "held" && r.payload !== undefined));
+    if (!held) return undefined;
+    if ((await this.store.read((tx) => tx.get("meta", META)))?.fullSyncDue) return undefined;
+    try {
+      return (await this.catchUpTarget(await this.currentAudience()))?.forEpoch;
+    } catch (e) {
+      if (isKavachError(e, "METADATA_REQUIRED") || isKavachError(e, "RECIPIENT_LIMIT")) return undefined;
+      throw e;
+    }
+  }
+
+  /** Whether the outbox waits on epoch work: an active catch-up epoch, or held records that need one. */
+  private async epochWorkPending(): Promise<boolean> {
+    const catchUp = await this.store.read((tx) => {
+      const st = tx.get("stream", STREAM);
+      return st?.activeEpoch === undefined ? false : tx.get("epochs", String(st.activeEpoch))?.catchUpFor !== undefined;
+    });
+    return catchUp || (await this.heldNeedCatchUp()) !== undefined;
+  }
+
   /** Prepare, publish and promote epochs until one is active under the current revision. */
   private async ensureEpoch(): Promise<SyncReport["epoch"]> {
     const { device, pin } = this.requireAccount("epoch");
@@ -1116,8 +1141,11 @@ class ClientImpl implements Client {
       const revisionRow = await this.store.read((tx) => tx.get("revision", REVISION));
       if (!stream) throw new KavachError("RECOVERY_REQUIRED", "epoch");
       if (stream.activeEpoch !== undefined && revisionRow?.paused !== "rotation") {
-        // An active epoch whose counter is spent is retired (T3) and replaced, not kept: nothing
-        // can be sealed under it, and records waiting for an epoch would wait forever.
+        // The one place that decides whether the active epoch may stay. It is retired (T3) and
+        // replaced when its counter is spent, when it is a catch-up epoch whose records are out, or
+        // when held records need a catch-up epoch it is not (revision 13): a record fenced after a
+        // joiner's epoch went live, say, which that epoch must never carry.
+        const needs = await this.heldNeedCatchUp();
         const spent = await this.store.transaction((tx) => {
           const st = tx.get("stream", STREAM);
           const active = st?.activeEpoch === undefined ? undefined : tx.get("epochs", String(st.activeEpoch));
@@ -1128,6 +1156,10 @@ class ClientImpl implements Client {
           }
           // A catch-up epoch whose records are out is retired: the next one addresses everyone.
           if (active.catchUpFor !== undefined && !catchUpBusy(tx, active)) {
+            t3ApplyChange(tx, { kind: "catchUp" });
+            return true;
+          }
+          if (needs !== undefined && active.catchUpFor !== needs) {
             t3ApplyChange(tx, { kind: "catchUp" });
             return true;
           }
@@ -1501,11 +1533,7 @@ class ClientImpl implements Client {
           report.errors.push(syncError("outbox", drained.blocked)); // the records stay queued
           break;
         }
-        const catchUp = await this.store.read((tx) => {
-          const st = tx.get("stream", STREAM);
-          return st?.activeEpoch === undefined ? false : tx.get("epochs", String(st.activeEpoch))?.catchUpFor !== undefined;
-        });
-        if (!catchUp || this.closed) break;
+        if (this.closed || !(await this.epochWorkPending())) break;
         report.epoch = await this.ensureEpoch();
       }
     } catch (e) {

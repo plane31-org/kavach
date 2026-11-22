@@ -155,5 +155,37 @@ describe("revision 13: queued records across an audience change", () => {
     expect(report.outbox.acceptedLocalIds.map(toHex)).toContain(toHex(late ?? new Uint8Array()));
     expect((await b.client.delivery(late ?? new Uint8Array()))?.status).toBe("accepted");
   });
+
+  it("a record whose send failed before a join, then fenced, goes out under a catch-up epoch: never held for good, never to the joiner", async () => {
+    const w = world();
+    const { a, members, circleId, ids } = await circle(w, ["bob"]);
+    const b = members.get("bob") as Dev;
+    const q = await b.client.enqueue(1, Uint8Array.of(60));
+    w.host.failAppends = true; // the send fails: the record stays queued, handed off once
+    await w.sync(b);
+    w.host.failAppends = false;
+    const c = await w.device("carol");
+    await c.client.initializeAccount();
+    await c.client.circles.requestJoin(circleId, ids.get("alice") ?? new Uint8Array());
+    await w.sync(a);
+    await a.client.circles.approve(circleId, "carol");
+    await w.sync(a);
+    await w.sync(c);
+    // Bob's sync: the epoch with Carol goes live, the retried bytes are fenced and held, and the
+    // same sync makes a catch-up epoch to Alice and Bob for them.
+    const r = await b.client.syncUntilDrained();
+    expect(r.stoppedBecause).toBe("drained");
+    expect((await b.client.delivery(q.localId))?.status).toBe("accepted");
+    expect(w.host.appendLog.some((l) => l.status === "EPOCH_FENCED")).toBe(true);
+    expect((await epochsOf(b)).some((e) => e.catchUp && e.recipients === 2)).toBe(true);
+    await w.sync(a);
+    expect(await fromBob(a, ids)).toEqual(expect.arrayContaining([60]));
+    await w.sync(c);
+    expect(await fromBob(c, ids)).toEqual([]);
+    await b.client.enqueue(1, Uint8Array.of(61));
+    await w.sync(b);
+    await w.sync(c);
+    expect(await fromBob(c, ids)).toEqual([61]);
+  });
 });
 

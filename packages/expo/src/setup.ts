@@ -225,8 +225,8 @@ export async function readEraseMarker(secretStore: SecretStore): Promise<{ value
 }
 
 /**
- * The databases open in this runtime, per database module (or driver factory) and context, so a
- * second open of a file already open here is refused: two handles on one file in one runtime run
+ * The databases open in this runtime, per database module (or driver factory), so a second open
+ * of a file already open here is refused, whatever context asks: two handles on one file in one runtime run
  * their syncs side by side and deliver every event twice. Separate runtimes have separate maps.
  */
 const openHere = new WeakMap<object, Set<string>>();
@@ -238,7 +238,7 @@ export async function openKavach(options: KavachSetupOptions): Promise<KavachSet
   const fileName = databaseFileName(options.accountName, namespace);
   const opened = openHere.get(options.database) ?? new Set<string>();
   openHere.set(options.database, opened);
-  const handle = `${options.context}:${fileName}`;
+  const handle = fileName; // any context: one runtime, one handle per file
   if (opened.has(handle)) throw new KavachError("MALFORMED", "openKavach", "this account's database is already open in this runtime: share the one KavachSetup, or one kavachSlot per account");
   opened.add(handle);
   try {
