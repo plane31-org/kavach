@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import { toHex } from "@plane31/blind-relay";
-import { MemorySecretStore, ready } from "@plane31/blind-relay/adapters";
+import { MemorySecretStore, ready, type SecretStore } from "@plane31/blind-relay/adapters";
 import { FakeHost, TestClock, testPolicy, testResetKeyList, testResetKeys } from "@plane31/blind-relay/testing";
 import { nodeSqliteDriver } from "../src/sqliteStore.js";
-import { databaseFileName } from "../src/setup.js";
+import { databaseFileName, markErased } from "../src/setup.js";
 import { kavachSlot } from "../src/slot.js";
 import { openNodeDatabase } from "./sqlite.js";
 
@@ -41,11 +41,26 @@ const deleteFiles = (dir: string) => (fileName: string) => {
   for (const suffix of ["", "-wal", "-shm"]) rmSync(join(dir, fileName + suffix), { force: true });
 };
 
+/** A secret store whose erase-marker reads can be held at a gate, to reach the window between a slot's checks. */
+class GatedSecrets extends MemorySecretStore implements SecretStore {
+  gate: Promise<void> | undefined;
+  /** Holds every deletion: an erasure waits here after closing the slot and before deleting anything. */
+  deleteGate: Promise<void> | undefined;
+  override async get(name: Parameters<SecretStore["get"]>[0]): Promise<Uint8Array | undefined> {
+    if (name === "eraseGeneration" && this.gate) await this.gate;
+    return super.get(name);
+  }
+  override async delete(name: Parameters<SecretStore["delete"]>[0]): Promise<void> {
+    if (this.deleteGate) await this.deleteGate;
+    return super.delete(name);
+  }
+}
+
 /** Two runtimes over one account: the same files and the same secret store, each with its own slot. */
 function runtimes() {
   const w = world();
   const dir = mkdtempSync(join(tmpdir(), "kavach-slot-"));
-  const secrets = new MemorySecretStore();
+  const secrets = new GatedSecrets();
   let opens = 0;
   const options = (context: "foreground" | "background") => ({
     accountName: "alice",
@@ -127,4 +142,56 @@ describe("kavachSlot", () => {
     await foreground.close();
     await background.close();
   });
+
+  it("a use that arrives while this slot erases waits for the erasure and opens the fresh store, never the erased account", async () => {
+    const { options, dir, secrets } = runtimes();
+    const slot = kavachSlot(options("foreground"));
+    await slot.use((s) => s.client.initializeAccount());
+    // The erasure is held after it closed the slot and before it deletes anything: the window in
+    // which a use could otherwise reopen the old database, secrets still in place.
+    let release: () => void = () => undefined;
+    secrets.deleteGate = new Promise<void>((r) => (release = r));
+    const erasing = slot.erase(deleteFiles(dir));
+    const during = slot.use(async (s) => (await s.client.getState()).status);
+    await new Promise((r) => setTimeout(r, 10));
+    secrets.deleteGate = undefined;
+    release();
+    await erasing;
+    expect(await during).toBe("fresh");
+    expect(await slot.use(async (s) => (await s.client.getState()).status)).toBe("fresh");
+    await slot.close();
+  });
+
+  it("another runtime's erasure under way: a slot opens nothing and lets go of its handle until it has finished", async () => {
+    const { options, secrets } = runtimes();
+    const background = kavachSlot(options("background"));
+    const foreground = kavachSlot(options("foreground"));
+    await foreground.use((s) => s.client.initializeAccount());
+    expect(await background.use(async (s) => (await s.client.getState()).status)).toBe("ready");
+    await markErased(secrets, "erasing"); // the other runtime has begun
+    await expect(background.use((s) => s.client.getState())).rejects.toMatchObject({ code: "LOCKED", retryable: true });
+    expect(background.leases).toBe(0);
+    await markErased(secrets, "erased"); // and finished (the files stay in this test: the point is the marker)
+    expect(await background.use(async (s) => (await s.client.getState()).status)).toBe("ready");
+    await foreground.close();
+    await background.close();
+  });
+
+  it("a handle released while a use reads the marker is never handed to that use", async () => {
+    const { options, secrets, opens } = runtimes();
+    const slot = kavachSlot(options("foreground"));
+    await slot.use(() => undefined);
+    let open: () => void = () => undefined;
+    secrets.gate = new Promise<void>((r) => (open = r));
+    const pending = slot.use(async (s) => (await s.client.getState()).status);
+    await new Promise((r) => setTimeout(r, 5)); // the use is now waiting on its marker read
+    const released = slot.releaseIdle();
+    secrets.gate = undefined;
+    open();
+    await released;
+    expect(await pending).toBe("fresh"); // it reopened instead of failing with CLOSED
+    expect(opens()).toBe(2);
+    await slot.close();
+  });
 });
+

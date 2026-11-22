@@ -8,7 +8,7 @@ import { resolveAudience, type ResolvedAudience } from "./audience.js";
 import { acceptSnapshot, checkMemberResolution, createCircleSnapshot, newCircleId, pinCircle, successorSnapshot, type CircleState } from "./circle.js";
 import { DocumentType, buildCircleSnapshot, expectType, parseDocument, parseVaultHeader, verifyDocument, type AccountDevice, type AccountSuccession, type RecordKind } from "./codec.js";
 import { randomBytes, ready, type BoxKeypair } from "./crypto.js";
-import { prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
+import { MAX_COUNTER, prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { ensureHistoryIndex } from "./historyIndex.js";
@@ -1090,7 +1090,19 @@ class ClientImpl implements Client {
       const stream = await this.store.read((tx) => tx.get("stream", STREAM));
       const revisionRow = await this.store.read((tx) => tx.get("revision", REVISION));
       if (!stream) throw new KavachError("RECOVERY_REQUIRED", "epoch");
-      if (stream.activeEpoch !== undefined && revisionRow?.paused !== "rotation") return attempt === 0 ? "unchanged" : "prepared";
+      if (stream.activeEpoch !== undefined && revisionRow?.paused !== "rotation") {
+        // An active epoch whose counter is spent is retired (T3) and replaced, not kept: nothing
+        // can be sealed under it, and records waiting for an epoch would wait forever.
+        const spent = await this.store.transaction((tx) => {
+          const st = tx.get("stream", STREAM);
+          const active = st?.activeEpoch === undefined ? undefined : tx.get("epochs", String(st.activeEpoch));
+          if (!active || active.status !== "active" || active.nextCounter <= MAX_COUNTER) return false;
+          t3ApplyChange(tx, { kind: "counterExhausted" });
+          return true;
+        });
+        if (!spent) return attempt === 0 ? "unchanged" : "prepared";
+        continue;
+      }
       // After AUDIENCE_STALE the local membership is known to be behind the host's: no epoch is
       // prepared from it until a full sync has learned the change (revision 12), or the held
       // records would be resealed to the same stale audience.

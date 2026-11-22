@@ -7,6 +7,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { toHex } from "../src/bytes.js";
 import { open, type ClientEvent } from "../src/client.js";
 import { ready } from "../src/crypto.js";
+import { MAX_COUNTER } from "../src/epoch.js";
 import { KavachError } from "../src/errors.js";
 import { MemorySecretStore, MemoryStore } from "../src/store.js";
 import { MemoryPlatformProvider } from "../src/testing/providers.js";
@@ -57,6 +58,36 @@ describe("0.9.0: local ids and delivery", () => {
     const cancelled = a.events.find((e) => e.kind === "cancelled");
     expect(cancelled?.kind === "cancelled" && toHex(cancelled.localId)).toBe(toHex(older.localId));
     expect(await a.client.delivery(new Uint8Array(16))).toBeUndefined();
+  });
+});
+
+describe("0.9.0: a spent counter", () => {
+  it("retires the epoch: enqueue rotates and seals at once, and a record left unsealed is sealed by the next sync", async () => {
+    const w = world();
+    const { a } = await pair(w);
+    const spend = () =>
+      a.store.transaction((tx) => {
+        const st = tx.get("stream", "stream");
+        const e = st?.activeEpoch === undefined ? undefined : tx.get("epochs", String(st.activeEpoch));
+        if (e) tx.put("epochs", String(e.epoch), { ...e, nextCounter: MAX_COUNTER + 1 });
+        return e?.epoch ?? 0;
+      });
+    const spent = await spend();
+    const online = await a.client.enqueue(1, Uint8Array.of(1));
+    expect(online.recordId).toBeDefined();
+    expect(await a.store.read((tx) => tx.get("outbox", toHex(online.localId))?.epoch)).toBe(spent + 1);
+    // Offline when the counter runs out: the record waits, and the next sync retires, rotates and seals.
+    const again = await spend();
+    const relay = a.t.relay as { publishEpoch: unknown };
+    const publish = relay.publishEpoch;
+    relay.publishEpoch = () => Promise.reject(new KavachError("NETWORK", "transport", "unreachable"));
+    const offline = await a.client.enqueue(1, Uint8Array.of(2));
+    expect(offline.recordId).toBeUndefined();
+    relay.publishEpoch = publish;
+    const r = await w.sync(a);
+    expect(r.errors).toEqual([]);
+    expect((await a.client.delivery(offline.localId))?.status).toBe("accepted");
+    expect(await a.store.read((tx) => tx.get("outbox", toHex(offline.localId))?.epoch)).toBe(again + 1);
   });
 });
 

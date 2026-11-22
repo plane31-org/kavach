@@ -205,9 +205,23 @@ export function accountSecretStore(secrets: KavachSetupOptions["secrets"], accou
     : secrets;
 }
 
-/** Replace the account's erase marker: every slot that opened under the old one lets its handle go at its next use. */
-export async function markErased(secretStore: SecretStore): Promise<void> {
-  await secretStore.set("eraseGeneration", randomBytes(16));
+/**
+ * The account's erase marker, in two phases: `erasing` before anything is deleted, then a new
+ * `erased` value once the deletion finished. A slot that sees `erasing` opens nothing (`LOCKED`,
+ * retryable) and lets go of what it holds; one that sees a value other than the one it opened
+ * under lets go and opens afresh. An erasure interrupted halfway leaves `erasing` until it is run
+ * again, which finishes it.
+ */
+export async function markErased(secretStore: SecretStore, phase: "erasing" | "erased"): Promise<void> {
+  const value = randomBytes(17);
+  value[0] = phase === "erasing" ? 1 : 0;
+  await secretStore.set("eraseGeneration", value);
+}
+
+/** The account's erase marker as a slot reads it: its value, and whether an erasure is under way. */
+export async function readEraseMarker(secretStore: SecretStore): Promise<{ value: string; erasing: boolean }> {
+  const bytes = await secretStore.get("eraseGeneration");
+  return { value: bytes ? Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("") : "", erasing: bytes?.[0] === 1 };
 }
 
 export async function openKavach(options: KavachSetupOptions): Promise<KavachSetup> {
@@ -261,17 +275,18 @@ export async function eraseKavach(options: KavachEraseOptions): Promise<void> {
   const remove = typeof database === "function" ? options.deleteDatabase : database.deleteDatabaseSync ? (name: string) => database.deleteDatabaseSync?.(name) : undefined;
   if (!remove) throw new KavachError("MALFORMED", "eraseKavach", "no way to delete the database: pass expo-sqlite, or deleteDatabase with a driver factory");
   // The marker before anything is deleted: a runtime that has this account open (the foreground
-  // while a background task erases, or the other way round) sees it at its next use and lets go.
-  await markErased(secretStore);
+  // while a background task erases, or the other way round) sees it at its next use, lets go, and
+  // opens nothing until the erasure has finished.
+  await markErased(secretStore, "erasing");
   for (const name of SECRET_NAMES) await secretStore.delete(name);
   try {
     remove(fileName);
   } catch (e) {
     // Only a file that is already gone is success. Anything else (permissions, a busy file) is
     // reported; the secrets are gone, the database stays unreadable, and running this again finishes.
-    if (isMissingFile(e)) return;
-    throw new KavachError("STORAGE_FAILURE", "eraseKavach", `the database could not be deleted (${e instanceof Error ? e.message : String(e)}); run eraseKavach again`);
+    if (!isMissingFile(e)) throw new KavachError("STORAGE_FAILURE", "eraseKavach", `the database could not be deleted (${e instanceof Error ? e.message : String(e)}); run eraseKavach again`);
   }
+  await markErased(secretStore, "erased");
 }
 
 function isMissingFile(e: unknown): boolean {

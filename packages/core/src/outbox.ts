@@ -123,7 +123,9 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
     const now = deps.now();
     // A usable epoch seals the record now; without one (a rotation pending or due, metadata
     // missing, an AUDIENCE_STALE fence) the record is queued unsealed and sealed at the next sync.
-    let epoch = usableEpoch(tx);
+    // The rotation reasons are read on the active epoch itself, exhausted or not, so a spent
+    // counter retires the epoch (T3) here rather than leaving it active and unusable.
+    let epoch = activeEpochIn(tx);
     let rotated = false;
     if (epoch) {
       const reason = rotationReason({ createdAt: unbig(epoch.createdAt), nextCounter: epoch.nextCounter, lastSentAt: epoch.lastSentAt === undefined ? undefined : unbig(epoch.lastSentAt) }, now, deps.policy.hygieneRotationMs);
@@ -186,6 +188,12 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
  * is due is the caller's to apply.
  */
 function usableEpoch(tx: Pick<Tx, "get">): EpochRow | undefined {
+  const epoch = activeEpochIn(tx);
+  return epoch && epoch.nextCounter <= MAX_COUNTER ? epoch : undefined;
+}
+
+/** The active epoch outside a fence or a pause, whether or not its counter is spent. */
+function activeEpochIn(tx: Pick<Tx, "get">): EpochRow | undefined {
   const meta = tx.get("meta", META);
   if (meta?.fullSyncDue) return undefined;
   const revision = tx.get("revision", REVISION);
@@ -193,7 +201,7 @@ function usableEpoch(tx: Pick<Tx, "get">): EpochRow | undefined {
   const stream = tx.get("stream", STREAM);
   if (!stream || stream.activeEpoch === undefined) return undefined;
   const epoch = tx.get("epochs", String(stream.activeEpoch));
-  return epoch && epoch.status === "active" && epoch.nextCounter <= MAX_COUNTER ? epoch : undefined;
+  return epoch && epoch.status === "active" ? epoch : undefined;
 }
 
 /**
