@@ -99,6 +99,20 @@ export interface Enqueued {
 export const MAX_IDEMPOTENCY_KEY = 128;
 
 /**
+ * Whether this device may send to a circle now: a joined, enabled circle with the author among its
+ * members. A circle that fails this is suspended; its scoped records wait and are not handed off.
+ */
+export function circleSendable(tx: Pick<Tx, "get">, circleId: string, authorAccountId: Uint8Array): boolean {
+  const c = tx.get("circles", circleId);
+  return !!c && c.status === "member" && c.enabled && c.members.includes(toHex(authorAccountId));
+}
+
+/** Whether an outbox row can be handed off now: unscoped, or its circle is not suspended. */
+export function rowSendable(tx: Pick<Tx, "get">, row: { circleId?: string }, authorAccountId: Uint8Array): boolean {
+  return row.circleId === undefined || circleSendable(tx, row.circleId, authorAccountId);
+}
+
+/**
  * T6: require a usable active epoch under the current desired revision, enforce the queue limits,
  * seal once, write the outbox row and the own history row, and advance the counter. The record
  * id is returned only after commit. A kind declared latestWins cancels a queued record of the same
@@ -118,14 +132,11 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
   const superseded: RecordRef[] = [];
   const result = await deps.store.transaction((tx): Enqueued => {
     requireReady(tx);
-    if (deps.circleId) {
-      const c = tx.get("circles", deps.circleId);
-      if (!c || c.status !== "member" || !c.enabled || !c.members.includes(toHex(deps.author().identityId))) throw new KavachError("NOT_AUTHORIZED", stage, "circle is not enabled for sharing");
-    }
     if (key !== undefined) {
       const seen = tx.get("enqueueKeys", key);
       if (seen) return { localId: fromHex(seen.localId ?? seen.recordId), recordId: seen.recordId ? fromHex(seen.recordId) : undefined, duplicate: true, own: false, rotated: false };
     }
+    if (deps.circleId && !circleSendable(tx, deps.circleId, deps.author().identityId)) throw new KavachError("NOT_AUTHORIZED", stage, "circle is not enabled for sharing");
     const revision = tx.get("revision", revisionKey(deps.scopeStream));
     if (revision?.paused === "limit") throw new KavachError("RECIPIENT_LIMIT", stage);
     const now = deps.now();
@@ -533,10 +544,7 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
     summary.cancelled += cancelled;
     // A full batch means unchecked rows remain: finish them in the next handoff before sending.
     if (cancelled >= CANCEL_BATCH) return { kind: "skipped" };
-    if (deps.circleId) {
-      const c = tx.get("circles", deps.circleId);
-      if (!c || c.status !== "member" || !c.enabled || !c.members.includes(toHex(deps.author().identityId))) return { kind: "none" };
-    }
+    if (deps.circleId && !circleSendable(tx, deps.circleId, deps.author().identityId)) return { kind: "none" };
     const next = live.find(([, r]) => r.status === "inflight") ?? live[0];
     if (!next) return { kind: "none" };
     const [key, row] = next;

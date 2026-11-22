@@ -303,7 +303,11 @@ export class FakeHost {
         if (!equalBytes(streamId, scopedStreamId(fromHex(a.identityId), cert.deviceId, circleId))) return { status: "UNAUTHORIZED" };
         const existed = host.streams.has(toHex(streamId));
         const s = host.stream(toHex(streamId), a.accountId, a.accountName);
-        s.circleId = toHex(circleId); s.certificateHash = a.certificateHash;
+        // The registration is immutable: a repeat keeps the first binding, counters and cursors.
+        if (s.circleId === undefined) {
+          s.circleId = toHex(circleId);
+          s.certificateHash = a.certificateHash;
+        }
         return { status: existed ? "ALREADY_COMMITTED" : "COMMITTED" };
       },
       async resolveAccounts(names): Promise<ResolvedAccount[]> {

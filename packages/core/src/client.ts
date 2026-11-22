@@ -13,7 +13,7 @@ import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { ensureHistoryIndex } from "./historyIndex.js";
 import { authorViewFor, ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, purgeHistory, receive as receiveRecord, streamNeedsRead, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
-import { catchUpBusy, drain, enqueue, outboxCountIn, outboxCounts, purgeOutbox, recipientsOf, refOf, sealWaiting, type DrainSummary, type EnqueueOptions, type OutboxCounts, type RecordRef } from "./outbox.js";
+import { catchUpBusy, drain, enqueue, outboxCountIn, outboxCounts, purgeOutbox, recipientsOf, refOf, rowSendable, sealWaiting, type DrainSummary, type EnqueueOptions, type OutboxCounts, type RecordRef } from "./outbox.js";
 export type { EnqueueOptions } from "./outbox.js";
 
 /**
@@ -373,7 +373,10 @@ export interface SyncReport {
   opId: string;
   promotedBecause?: SyncPromotion;
   metadata: { certificates: number; snapshots: number; rotations: number; quarantined: number; resets: number; successions: number };
+  /** The author stream's epoch step. Circle-scoped streams report theirs in `scopedEpochs`. */
   epoch: "unchanged" | "prepared" | "paused" | "pending";
+  /** Each own circle-scoped stream this sync handled, with its epoch step; absent when there is none. */
+  scopedEpochs?: { circleId: Uint8Array; epoch: "unchanged" | "prepared" | "paused" | "pending" }[];
   /** `held`: refused as AUDIENCE_STALE or fenced, and kept for the next epoch. `resealed`: held records sealed again under a new epoch. `acceptedLocalIds`: the local ids of the records the relay accepted. */
   outbox: { sent: number; accepted: number; cancelled: number; unknown: number; retry: number; held: number; resealed: number; acceptedLocalIds: Uint8Array[] };
   /** `hasMore`: a stream still has records on the relay that this sync's budget did not reach; sync again soon. `unknownKind`: authenticated records of undeclared kinds, skipped. `skipped`: streams a quick sync did not read, since the change check showed nothing new. */
@@ -1392,6 +1395,12 @@ class ClientImpl implements Client {
       merged.purged += r.purged;
       for (const k of Object.keys(merged.timings) as (keyof SyncTimings)[]) merged.timings[k] += r.timings[k];
       merged.epoch = r.epoch;
+      for (const x of r.scopedEpochs ?? []) {
+        const scoped = (merged.scopedEpochs ??= []);
+        const entry = scoped.find((y) => toHex(y.circleId) === toHex(x.circleId));
+        if (entry) entry.epoch = x.epoch;
+        else scoped.push({ ...x });
+      }
       merged.errors.push(...r.errors);
       if (r.bootstrap) merged.bootstrap = r.bootstrap;
       if (this.closed) {
@@ -1408,8 +1417,10 @@ class ClientImpl implements Client {
       const currentChains = await chains();
       // Records held this round are resealed by the next one, which runs full. Records queued while
       // the round ran (by a caller that joined this drain) go out before it reports drained, unless
-      // the round could not send at all.
-      const sendable = await this.store.read((tx) => tx.list("outbox").some(([, o]) => o.status === "queued"));
+      // the round could not send at all. A record whose circle is suspended waits without counting:
+      // no round can hand it off until sharing resumes, so it must not keep the drain running.
+      const author = this.selfPin?.accountId;
+      const sendable = author !== undefined && (await this.store.read((tx) => tx.list("outbox").some(([, o]) => o.status === "queued" && rowSendable(tx, o, author))));
       const more = r.inbox.hasMore || bootstrapIncomplete || currentChains.size > 0 || r.outbox.held > 0 || (sendable && !r.errors.some((e) => e.operation === "outbox"));
       const status = (await this.getState()).status;
       if (status === "replacementPrepared" || status === "accountRecoveryRequired") {
@@ -1560,9 +1571,21 @@ class ClientImpl implements Client {
     const after = await this.store.read((tx) => tx.get("meta", META));
     if (after?.state === "RETIRED" || this.closed) return report;
     const scopes: (Uint8Array | undefined)[] = [undefined, ...(await this.store.read(tx => tx.list("scopedStreams").filter(([, r]) => r.own && r.certificateHash === toHex(this.requireAccount("sync").pin.certificateHash)).map(([, r]) => fromHex(r.circleId))))];
+    // The author stream's step stays in `epoch`; each scoped stream's goes in `scopedEpochs`, so a
+    // later stream never overwrites an earlier one's result.
+    const setEpoch = (circleId: Uint8Array | undefined, step: SyncReport["epoch"]): void => {
+      if (!circleId) {
+        report.epoch = step;
+        return;
+      }
+      const scoped = (report.scopedEpochs ??= []);
+      const entry = scoped.find((x) => toHex(x.circleId) === toHex(circleId));
+      if (entry) entry.epoch = step;
+      else scoped.push({ circleId, epoch: step });
+    };
     for (const circleId of scopes) {
       if (this.closed) return report;
-      try { report.epoch = await this.ensureEpoch(circleId); }
+      try { setEpoch(circleId, await this.ensureEpoch(circleId)); }
       catch (e) { report.errors.push(syncError("epoch", e, circleId ? { circleId } : {})); }
     }
     phase("epoch");
@@ -1574,7 +1597,7 @@ class ClientImpl implements Client {
           addDrain(report, drained);
           if (drained.blocked) { report.errors.push(syncError("outbox", drained.blocked, circleId ? { circleId } : {})); break; }
           if (this.closed || !(await this.epochWorkPending(circleId))) break;
-          report.epoch = await this.ensureEpoch(circleId);
+          setEpoch(circleId, await this.ensureEpoch(circleId));
         }
       } catch (e) { report.errors.push(syncError("outbox", e, circleId ? { circleId } : {})); }
     }

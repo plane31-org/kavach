@@ -220,3 +220,60 @@ it("consumes stale publications without wraps and keeps them fenced after rejoin
   expect((await a.t.relay.appendRecord(record.recordId, record.wire)).status).toBe("AUDIENCE_STALE");
   expect(stream?.tail).toBe(0n);
 });
+
+describe("circle-scoped records: review fixes", () => {
+  it("a scoped record sent once, then its circle suspended, waits without keeping a drain running", async () => {
+    const { w, a, family } = await setup();
+    const stuck = await a.client.enqueue(3, Uint8Array.of(70), { circleId: family });
+    w.host.failAppends = true; // handed off once and failed: queued, attempts above zero
+    await a.client.syncUntilDrained();
+    w.host.failAppends = false;
+    expect((await a.client.delivery(stuck.localId))?.status).toBe("queued");
+    await a.client.circles.setEnabled(family, false);
+    const r = await a.client.syncUntilDrained();
+    expect(r.stoppedBecause).toBe("drained");
+    expect(r.rounds).toBeLessThan(10);
+    expect((await a.client.delivery(stuck.localId))?.status).toBe("queued"); // it waits for sharing to resume
+    await a.client.circles.setEnabled(family, true);
+    await a.client.syncUntilDrained();
+    expect((await a.client.delivery(stuck.localId))?.status).toBe("accepted");
+  });
+
+  it("the report keeps the author stream's epoch step and names each scoped stream's separately", async () => {
+    const { w, a, c, family, work } = await setup();
+    await a.client.enqueue(3, Uint8Array.of(80), { circleId: family }); // only Family has a scoped stream
+    await a.client.syncUntilDrained();
+    // A change to Work rotates the author stream; Family's scoped stream is unaffected.
+    await a.client.circles.remove(work, (await c.client.inspect()).identityId ?? new Uint8Array());
+    const r = await w.sync(a);
+    expect(r.errors).toEqual([]);
+    expect(r.epoch).toBe("prepared");
+    expect(r.scopedEpochs?.map((x) => [toHex(x.circleId), x.epoch])).toEqual([[toHex(family), "unchanged"]]);
+  });
+
+  it("an idempotency key is answered inside the outbox before the circle check", async () => {
+    const { a, family } = await setup();
+    const first = await a.client.enqueue(3, Uint8Array.of(90), { circleId: family, idempotencyKey: "once" });
+    await a.client.circles.setEnabled(family, false);
+    // The outbox's own enqueue, as a call that raced the client's earlier key lookup would reach it.
+    const { enqueue } = await import("../src/outbox.js");
+    const deps = (a.client as unknown as { outboxDeps(c: Uint8Array): Parameters<typeof enqueue>[0] }).outboxDeps(family);
+    const again = await enqueue(deps, 3, Uint8Array.of(90), { idempotencyKey: "once" });
+    expect([toHex(again.localId), again.duplicate]).toEqual([toHex(first.localId), true]);
+    await expect(a.client.enqueue(3, Uint8Array.of(91), { circleId: family })).rejects.toMatchObject({ code: "NOT_AUTHORIZED" });
+  });
+
+  it("the fake host keeps a scoped stream's first registration on a repeat", async () => {
+    const { w, a, family } = await setup();
+    await a.client.enqueue(3, Uint8Array.of(95), { circleId: family });
+    await a.client.syncUntilDrained();
+    const row = await a.store.read((tx) => tx.list("scopedStreams").map(([, r]) => r).find((r) => r.own));
+    if (!row) throw new Error("no scoped stream");
+    const hosted = w.host.streams.get(row.streamId);
+    if (!hosted) throw new Error("not registered");
+    hosted.certificateHash = "first";
+    const outcome = await a.t.directory.openScopedStream?.(family, Uint8Array.from(Buffer.from(row.streamId, "hex")), Uint8Array.from(Buffer.from(row.certificateHash, "hex")));
+    expect(outcome?.status).toBe("ALREADY_COMMITTED");
+    expect(w.host.streams.get(row.streamId)?.certificateHash).toBe("first");
+  });
+});

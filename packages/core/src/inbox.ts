@@ -50,6 +50,33 @@ export interface InboxDeps {
 
 // Views over the store --------------------------------------------------------------------------
 
+/**
+ * Derived scoped stream ids, memoized by certificate hash and circle. A certificate hash names its
+ * exact bytes, and the derivation depends only on them and the circle id, so an entry is never
+ * stale and may be shared by every store in the runtime. Bounded: the oldest entries go first.
+ */
+const DERIVED_LIMIT = 4096;
+const derivedIds = new Map<string, string>();
+const certificateParts = new Map<string, { keyIdentity: Uint8Array; deviceId: Uint8Array }>();
+
+function remember<V>(map: Map<string, V>, key: string, value: V): V {
+  if (map.size >= DERIVED_LIMIT) map.delete(map.keys().next().value as string);
+  map.set(key, value);
+  return value;
+}
+
+function derivedScopedHex(c: { certificateHash: string; wire: string }, circle: string): string {
+  const key = `${c.certificateHash}:${circle}`;
+  const hit = derivedIds.get(key);
+  if (hit !== undefined) return hit;
+  let parts = certificateParts.get(c.certificateHash);
+  if (!parts) {
+    const cert = expectType<AccountDevice>(parseDocument(fromHex(c.wire)), DocumentType.AccountDevice);
+    parts = remember(certificateParts, c.certificateHash, { keyIdentity: keyIdentityId(cert.accountName, cert.accountKey), deviceId: cert.deviceId });
+  }
+  return remember(derivedIds, key, toHex(scopedStreamId(parts.keyIdentity, parts.deviceId, fromHex(circle))));
+}
+
 /** One scan of the certificates: the author the stream belongs to, every certificate of that author, and the stream's certificate generation. */
 export function authorViewFor(tx: Pick<Tx, "get" | "list">, streamId: Uint8Array): { view: AuthorView; identityId: Uint8Array; generation: bigint; circleId?: string } | undefined {
   const streamHex = toHex(streamId);
@@ -57,21 +84,17 @@ export function authorViewFor(tx: Pick<Tx, "get" | "list">, streamId: Uint8Array
   const binding = tx.get("scopedStreams", streamHex);
   let first = binding ? rows.find(c => c.certificateHash === binding.certificateHash) : rows.find(c => c.streamId === streamHex);
   let circleId: string | undefined = first && binding ? binding.circleId : undefined;
-  const derived = (c: (typeof rows)[number], circle: string): Uint8Array => {
-    const cert = expectType<AccountDevice>(parseDocument(fromHex(c.wire)), DocumentType.AccountDevice);
-    return scopedStreamId(keyIdentityId(cert.accountName, cert.accountKey), cert.deviceId, fromHex(circle));
-  };
   if (!first) {
     // Circle ids come from locally verified snapshots, never an untrusted subscription label.
     for (const [id] of tx.list("circles")) {
-      first = rows.find(c => toHex(derived(c, id)) === streamHex);
+      first = rows.find(c => derivedScopedHex(c, id) === streamHex);
       if (first) { circleId = id; break; }
     }
   }
   if (!first) return undefined;
   const certificates = new Map(rows.filter(c => c.identityId === first.identityId).map(c => [c.certificateHash, {
     certificateHash: fromHex(c.certificateHash), signingKey: fromHex(c.signingKey),
-    streamId: circleId ? derived(c, circleId) : fromHex(c.streamId), current: c.current
+    streamId: fromHex(circleId ? derivedScopedHex(c, circleId) : c.streamId), current: c.current
   }]));
   return { view: { identityId: fromHex(first.identityId), certificates }, identityId: fromHex(first.identityId), generation: unbig(first.generation), ...(circleId ? { circleId } : {}) };
 }
