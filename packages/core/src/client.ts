@@ -4,7 +4,7 @@
  * corresponding durable transition.
  */
 import { equalBytes, fromHex, toHex } from "./bytes.js";
-import { resolveAudience, type ResolvedAudience } from "./audience.js";
+import { resolveAudience, restrictAudience, type ResolvedAudience } from "./audience.js";
 import { acceptSnapshot, checkMemberResolution, createCircleSnapshot, newCircleId, pinCircle, successorSnapshot, type CircleState } from "./circle.js";
 import { DocumentType, buildCircleSnapshot, expectType, parseDocument, parseVaultHeader, verifyDocument, type AccountDevice, type AccountSuccession, type RecordKind } from "./codec.js";
 import { randomBytes, ready, type BoxKeypair } from "./crypto.js";
@@ -13,7 +13,7 @@ import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { ensureHistoryIndex } from "./historyIndex.js";
 import { ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, purgeHistory, receive as receiveRecord, streamNeedsRead, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
-import { drain, enqueue, outboxCountIn, outboxCounts, purgeOutbox, sealWaiting, type EnqueueOptions, type OutboxCounts, type RecordRef } from "./outbox.js";
+import { catchUpBusy, drain, enqueue, outboxCountIn, outboxCounts, purgeOutbox, recipientsOf, refOf, sealWaiting, type DrainSummary, type EnqueueOptions, type OutboxCounts, type RecordRef } from "./outbox.js";
 export type { EnqueueOptions } from "./outbox.js";
 
 /**
@@ -374,8 +374,8 @@ export interface SyncReport {
   promotedBecause?: SyncPromotion;
   metadata: { certificates: number; snapshots: number; rotations: number; quarantined: number; resets: number; successions: number };
   epoch: "unchanged" | "prepared" | "paused" | "pending";
-  /** `held`: refused as AUDIENCE_STALE and kept for the next epoch. `resealed`: held records sealed again under a new epoch. */
-  outbox: { sent: number; accepted: number; cancelled: number; unknown: number; retry: number; held: number; resealed: number };
+  /** `held`: refused as AUDIENCE_STALE or fenced, and kept for the next epoch. `resealed`: held records sealed again under a new epoch. `acceptedLocalIds`: the local ids of the records the relay accepted. */
+  outbox: { sent: number; accepted: number; cancelled: number; unknown: number; retry: number; held: number; resealed: number; acceptedLocalIds: Uint8Array[] };
   /** `hasMore`: a stream still has records on the relay that this sync's budget did not reach; sync again soon. `unknownKind`: authenticated records of undeclared kinds, skipped. `skipped`: streams a quick sync did not read, since the change check showed nothing new. */
   inbox: { streams: number; stored: number; keyPending: number; invalid: number; unknownKind: number; skipped: number; acked: number; hasMore: boolean };
   purged: number;
@@ -402,6 +402,13 @@ export interface SyncTimings {
   bytesSent: number;
   /** Record bytes read from the relay. */
   bytesReceived: number;
+}
+
+/** One drain's counts into the sync's report. */
+function addDrain(report: SyncReport, d: DrainSummary): void {
+  for (const k of ["sent", "accepted", "cancelled", "unknown", "retry", "held", "resealed"] as const) report.outbox[k] += d[k];
+  report.outbox.acceptedLocalIds.push(...d.acceptedLocalIds.map(fromHex));
+  report.timings.bytesSent += d.bytes;
 }
 
 const emptyTimings = (): SyncTimings => ({ resume: 0, bootstrap: 0, metadata: 0, preferences: 0, epoch: 0, outbox: 0, inbox: 0, maintenance: 0, total: 0, bytesSent: 0, bytesReceived: 0 });
@@ -1083,6 +1090,24 @@ class ClientImpl implements Client {
     });
   }
 
+  /**
+   * Whether held records need a catch-up epoch (revision 13), and for which: the oldest held epoch
+   * whose recipients do not include everyone in the current audience. Its records go out under an
+   * epoch addressed to the current audience minus anyone added since, so a joiner never reads them.
+   */
+  private async catchUpTarget(audience: ResolvedAudience): Promise<{ audience: ResolvedAudience; forEpoch: number } | undefined> {
+    return this.store.read((tx) => {
+      const epochs = new Set<number>();
+      for (const [, r] of tx.list("outbox")) if (r.status === "held" && r.payload !== undefined) epochs.add(r.heldEpoch ?? r.epoch);
+      for (const e of [...epochs].sort((a, b) => a - b)) {
+        const before = recipientsOf(tx.get("epochs", String(e)));
+        if (audience.rows.every((r) => before.has(toHex(r.identityId)))) continue; // the next full epoch can carry them
+        return { audience: restrictAudience(audience, before), forEpoch: e };
+      }
+      return undefined;
+    });
+  }
+
   /** Prepare, publish and promote epochs until one is active under the current revision. */
   private async ensureEpoch(): Promise<SyncReport["epoch"]> {
     const { device, pin } = this.requireAccount("epoch");
@@ -1096,9 +1121,17 @@ class ClientImpl implements Client {
         const spent = await this.store.transaction((tx) => {
           const st = tx.get("stream", STREAM);
           const active = st?.activeEpoch === undefined ? undefined : tx.get("epochs", String(st.activeEpoch));
-          if (!active || active.status !== "active" || active.nextCounter <= MAX_COUNTER) return false;
-          t3ApplyChange(tx, { kind: "counterExhausted" });
-          return true;
+          if (!active || active.status !== "active") return false;
+          if (active.nextCounter > MAX_COUNTER) {
+            t3ApplyChange(tx, { kind: "counterExhausted" });
+            return true;
+          }
+          // A catch-up epoch whose records are out is retired: the next one addresses everyone.
+          if (active.catchUpFor !== undefined && !catchUpBusy(tx, active)) {
+            t3ApplyChange(tx, { kind: "catchUp" });
+            return true;
+          }
+          return false;
         });
         if (!spent) return attempt === 0 ? "unchanged" : "prepared";
         continue;
@@ -1122,17 +1155,31 @@ class ClientImpl implements Client {
         throw e;
       }
       let prepared: PreparedEpoch;
+      // The audience the epoch is for: the whole current one, or for a catch-up epoch the current
+      // one minus anyone the held records' epoch did not address (revision 13).
+      let target = audience;
+      let catchUpFor: number | undefined;
       if (stream.pendingEpoch !== undefined) {
         const row = await this.store.read((tx) => tx.get("epochs", String(stream.pendingEpoch)));
         if (!row) throw new KavachError("STORAGE_FAILURE", "epoch", "pending epoch row missing");
         prepared = rowToPrepared(row);
+        if (row.catchUpFor !== undefined) {
+          catchUpFor = row.catchUpFor;
+          const forEpoch = row.catchUpFor;
+          target = restrictAudience(audience, await this.store.read((tx) => recipientsOf(tx.get("epochs", String(forEpoch)))));
+        }
       } else {
+        const catchUp = await this.catchUpTarget(audience);
+        if (catchUp) {
+          target = catchUp.audience;
+          catchUpFor = catchUp.forEpoch;
+        }
         const revision = revisionRow ? unbig(revisionRow.desiredRevision) : 1n;
         const fresh = prepareEpoch({
           author: { identityId: pin.accountId, certificateHash: pin.certificateHash, streamId: pin.streamId, signingSecretKey: device.signing.secretKey },
           epoch: stream.highestCommittedEpoch + 1,
           createdAt: this.now(),
-          audience,
+          audience: target,
           desiredRevision: revision
         });
         // Under the lock, another context may have prepared or even promoted first. One unresolved
@@ -1147,6 +1194,10 @@ class ClientImpl implements Client {
           }
           if (st.highestCommittedEpoch !== stream.highestCommittedEpoch || st.activeEpoch !== undefined) return undefined;
           t4PersistPrepared(tx, fresh);
+          if (catchUpFor !== undefined) {
+            const r = tx.get("epochs", String(fresh.epoch));
+            if (r) tx.put("epochs", String(fresh.epoch), { ...r, catchUpFor });
+          }
           return fresh;
         });
         if (!adopted) continue;
@@ -1160,9 +1211,9 @@ class ClientImpl implements Client {
           : { status: outcome.status === "IGNORED_OLDER" ? "RETRYABLE" : outcome.status }
       );
       if (resolution === "RETRY") return "pending";
-      const promoted = await this.store.transaction((tx) => t5Committed(tx, prepared.epoch, audience.key));
+      const promoted = await this.store.transaction((tx) => t5Committed(tx, prepared.epoch, target.key));
       if (promoted === "PROMOTED") {
-        if (attempt > 0 || stream.activeEpoch === undefined) this.emit({ kind: "refresh", reason: "rotation" });
+        if (catchUpFor === undefined && (attempt > 0 || stream.activeEpoch === undefined)) this.emit({ kind: "refresh", reason: "rotation" });
         return "prepared";
       }
     }
@@ -1215,7 +1266,7 @@ class ClientImpl implements Client {
       opId,
       metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 },
       epoch: "unchanged",
-      outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0 },
+      outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0, acceptedLocalIds: [] },
       inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, skipped: 0, acked: 0, hasMore: false },
       purged: 0,
       maintenance: options.skipMaintenance ? "skipped" : "done",
@@ -1251,7 +1302,8 @@ class ClientImpl implements Client {
       // The round's work counts whether or not it was the last: what it accepted, stored and failed
       // is merged first, and only then is a close that landed meanwhile reported.
       for (const k of Object.keys(merged.metadata) as (keyof SyncReport["metadata"])[]) merged.metadata[k] += r.metadata[k];
-      for (const k of Object.keys(merged.outbox) as (keyof SyncReport["outbox"])[]) merged.outbox[k] += r.outbox[k];
+      for (const k of ["sent", "accepted", "cancelled", "unknown", "retry", "held", "resealed"] as const) merged.outbox[k] += r.outbox[k];
+      merged.outbox.acceptedLocalIds.push(...r.outbox.acceptedLocalIds);
       merged.inbox.streams += r.inbox.streams;
       merged.inbox.stored += r.inbox.stored;
       merged.inbox.keyPending += r.inbox.keyPending;
@@ -1279,8 +1331,11 @@ class ClientImpl implements Client {
       }
       const bootstrapIncomplete = (await this.inspect()).bootstrap?.complete === false;
       const currentChains = await chains();
-      // Records held this round are resealed by the next one, which runs full.
-      const more = r.inbox.hasMore || bootstrapIncomplete || currentChains.size > 0 || r.outbox.held > 0;
+      // Records held this round are resealed by the next one, which runs full. Records queued while
+      // the round ran (by a caller that joined this drain) go out before it reports drained, unless
+      // the round could not send at all.
+      const sendable = await this.store.read((tx) => tx.list("outbox").some(([, o]) => o.status === "queued"));
+      const more = r.inbox.hasMore || bootstrapIncomplete || currentChains.size > 0 || r.outbox.held > 0 || (sendable && !r.errors.some((e) => e.operation === "outbox"));
       const status = (await this.getState()).status;
       if (status === "replacementPrepared" || status === "accountRecoveryRequired") {
         stop = "authentication";
@@ -1293,7 +1348,7 @@ class ClientImpl implements Client {
       const signature = r.errors.map((e) => `${e.operation}:${e.code}`).sort().join(",");
       const chainsAdvanced = [...currentChains].some(([k, next]) => previousChains.get(k) !== next) || [...previousChains.keys()].some((k) => !currentChains.has(k));
       previousChains = currentChains;
-      const changed = chainsAdvanced || r.inbox.stored + r.metadata.certificates + r.metadata.snapshots + r.metadata.successions + (r.bootstrap?.circles ?? 0) + (r.bootstrap?.pending ?? 0) > 0;
+      const changed = chainsAdvanced || r.outbox.accepted + r.inbox.stored + r.metadata.certificates + r.metadata.snapshots + r.metadata.successions + (r.bootstrap?.circles ?? 0) + (r.bootstrap?.pending ?? 0) > 0;
       if (!changed && signature !== "" && signature === previousErrors) {
         stop = r.errors.some((e) => e.code === "METADATA_REQUIRED" || e.code === "RESET_KEYS_REQUIRED" || e.code === "RESET_CLOCK_UNTRUSTED") ? "metadata" : "noProgress";
         break;
@@ -1325,7 +1380,7 @@ class ClientImpl implements Client {
       opId: "",
       metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 },
       epoch: "unchanged",
-      outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0 },
+      outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0, acceptedLocalIds: [] },
       inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, skipped: 0, acked: 0, hasMore: false },
       purged: 0,
       maintenance: options.skipMaintenance ? "skipped" : "done",
@@ -1437,10 +1492,22 @@ class ClientImpl implements Client {
     phase("epoch");
     if (this.closed) return report;
     try {
-      const drained = await drain(this.outboxDeps());
-      report.outbox = { sent: drained.sent, accepted: drained.accepted, cancelled: drained.cancelled, unknown: drained.unknown, retry: drained.retry, held: drained.held, resealed: drained.resealed };
-      report.timings.bytesSent += drained.bytes;
-      if (drained.blocked) report.errors.push(syncError("outbox", drained.blocked)); // the records stay queued
+      // A catch-up epoch carries held records only (revision 13): once they are out it is retired and
+      // the next epoch, to the whole audience, carries what waited behind them, in this sync.
+      for (let pass = 0; pass < 3; pass++) {
+        const drained = await drain(this.outboxDeps());
+        addDrain(report, drained);
+        if (drained.blocked) {
+          report.errors.push(syncError("outbox", drained.blocked)); // the records stay queued
+          break;
+        }
+        const catchUp = await this.store.read((tx) => {
+          const st = tx.get("stream", STREAM);
+          return st?.activeEpoch === undefined ? false : tx.get("epochs", String(st.activeEpoch))?.catchUpFor !== undefined;
+        });
+        if (!catchUp || this.closed) break;
+        report.epoch = await this.ensureEpoch();
+      }
     } catch (e) {
       report.errors.push(syncError("outbox", e));
     }
@@ -2136,11 +2203,23 @@ class ClientImpl implements Client {
 
   private async retire(): Promise<void> {
     this.retired = true;
-    await this.store.transaction((tx) => {
+    const dropped = await this.store.transaction((tx) => {
       const meta = tx.get("meta", META);
       if (meta) tx.put("meta", META, { ...meta, state: "RETIRED" });
-      for (const [k, r] of tx.list("outbox")) if (r.status === "queued" || r.status === "inflight") tx.put("outbox", k, { ...r, wire: "", status: "cancelled", reason: "retired" });
+      // This device can send nothing more; each record still waiting is given up, and the app is told.
+      const out: RecordRef[] = [];
+      for (const [k, r] of tx.list("outbox")) {
+        if (r.status === "queued" || r.status === "inflight" || r.status === "held" || r.status === "unsealed") {
+          const { payload: _payload, eventTime: _eventTime, ...rest } = r;
+          void _payload;
+          void _eventTime;
+          tx.put("outbox", k, { ...rest, wire: "", status: "cancelled", reason: "retired" });
+          out.push(refOf(k, r));
+        }
+      }
+      return out;
     });
+    for (const r of dropped) this.emit({ kind: "cancelled", localId: r.localId, recordId: r.recordId, idempotencyKey: r.idempotencyKey, reason: "retired" });
     await this.secrets.delete("deviceSeed");
     this.device = undefined;
     await this.emitState();
@@ -2345,7 +2424,7 @@ class ClientImpl implements Client {
   private async approve(circleId: Uint8Array, accountName: string): Promise<{ revision: bigint }> {
     const [resolved] = await this.transport.directory.resolveAccounts([accountName]);
     if (!resolved) throw new KavachError("METADATA_REQUIRED", "approve", "unknown account");
-    const report: SyncReport = { mode: "full", opId: "", metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, skipped: 0, acked: 0, hasMore: false }, purged: 0, maintenance: "done", timings: emptyTimings(), errors: [] };
+    const report: SyncReport = { mode: "full", opId: "", metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0, acceptedLocalIds: [] }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, skipped: 0, acked: 0, hasMore: false }, purged: 0, maintenance: "done", timings: emptyTimings(), errors: [] };
     await this.acceptMemberCertificate(resolved, report);
     const requester = resolvedAccountId(resolved);
     const pinned = await this.pinFor(requester);

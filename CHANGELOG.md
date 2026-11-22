@@ -2,6 +2,16 @@
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
+## 0.10.0
+
+Protocol revision 13, no wire change. The first product's report on 0.9.0: queued records lost without a signal, and four small asks.
+
+- **An audience change no longer cancels queued records.** Before, any membership change, a member's new phone, the counter running out or a hygiene rotation cancelled every record still queued, dropped its payload and told nobody, so an offline backlog (a check-in, a trip's route) was lost on reconnect. Now the records are held and sealed again under an epoch whose recipients could all read them before. When someone joined meanwhile, a **catch-up epoch** to the earlier audience carries them first and is retired once they are out, so a joiner never reads a record from before it; a removal alone needs no extra epoch, and a removed member is never a recipient. New records are never sealed under a catch-up epoch. A record already sent once is retried with its exact bytes and held only if the host fences it (`EPOCH_FENCED`), so nothing is delivered twice. Records still given up (past their window, superseded, from before payloads were kept, on a retired device) are reported with `cancelled`, the retired-device path included. Specification section 10 and the revision 13 note.
+- **A drain covers what was queued while it ran.** `syncUntilDrained` goes on while sealed records wait to be sent, unless a round could not send at all, and `report.outbox.acceptedLocalIds` lists the local ids the relay accepted.
+- **Expo: one handle per database per runtime.** `openKavach` refuses a second open of a database already open in the same runtime (`MALFORMED`), so two slots or two setups on one file fail at once instead of syncing side by side.
+- **`httpTransport` reads `{ error: { code, message } }`** into the error text. **`DeliveryStatus`** is exported from the package root.
+- *Migration:* `t3ApplyChange`'s result has `held` in place of `cancelled`; `SyncReport.outbox` gains `acceptedLocalIds`; `EpochRow` gains `catchUpFor`; `PROTOCOL_REVISION` is 13. A host sees one more epoch publication when an author with a backlog meets a join.
+
 ## 0.9.0
 
 Protocol revision 12, no wire change. What the first product's integration kept as its own plumbing, where it belongs in the SDK.

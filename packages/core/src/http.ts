@@ -90,7 +90,12 @@ export function httpTransport(o: HttpTransportOptions): Transport {
       if (res.ok) throw new KavachError("NETWORK", "transport", `${where}: the answer is not JSON`);
       throw new Error(`${where}: ${res.status}`);
     }
-    if (!res.ok) throw new Error(`${where}: ${String(data["error"] ?? res.status)}`);
+    if (!res.ok) {
+      // A host may answer `{ error: "..." }` or `{ error: { code, message } }`.
+      const err = data["error"];
+      const detail = typeof err === "object" && err !== null ? [(err as Json)["code"], (err as Json)["message"]].filter((x) => x !== undefined).map(String).join(": ") : String(err ?? res.status);
+      throw new Error(`${where}: ${detail || res.status}`);
+    }
     return data as T;
   };
   const outcome = (r: Json): MutationOutcome => ({

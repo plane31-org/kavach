@@ -2,7 +2,7 @@
 
 The Kavach v1 protocol in pure TypeScript: end-to-end encrypted, relayed, durable records between a person's devices and the devices of the people they share with, for circles of up to 100 accounts, through a server that stores only what it cannot open and deletes each record once every reader has it. The package is product-agnostic: a product declares its record kinds and keeps its payload codecs in its own profile. The specification is `spec/Kavach-v1.md` in the repository; `spec/Profile-template.md` lists what a product decides.
 
-Status: protocol revision 12, package 0.x. The primitives are audited libraries; the composition is not yet independently reviewed, and nothing here is production-ready. The API may change between 0.x minor versions; the protocol revision is tracked separately in the specification.
+Status: protocol revision 13, package 0.x. The primitives are audited libraries; the composition is not yet independently reviewed, and nothing here is production-ready. The API may change between 0.x minor versions; the protocol revision is tracked separately in the specification.
 
 ```
 pnpm add @plane31/blind-relay
@@ -30,6 +30,8 @@ Randomness comes from the Web Crypto global. A runtime without one (Hermes) inst
 **When the host fences a stale audience.** A host may refuse an append whose epoch still addresses someone who left (`AUDIENCE_STALE`). Nothing is lost: the records are held (`report.outbox.held`, the `audienceStale` event), the next sync runs full and rotates, and each record is sealed once more under the new epoch with a new id. The `resealed` event names the old and the new id; an app that kept record ids follows it. A record refused a second time is cancelled with reason `AUDIENCE_STALE`. The outbox keeps payloads until acceptance to make this possible.
 
 **Track a record by its local id (0.9.0).** `enqueue` returns a `localId` that names the record for its whole life: on `queued`, `accepted`, `cancelled` and `resealed`, with the idempotency key when you gave one, and in `client.delivery(localId)`, which answers `queued`, `held`, `accepted`, `cancelled` with its reason, or `unknown`, from the store, so any runtime sharing it can ask. Keep the local id, not the record id: a deferred seal and a reseal change the record id under it. Events fire only in the runtime that did the work; the delivery query is how the other runtime learns the outcome.
+
+**Nothing queued is lost to an audience change (revision 13).** A membership change, a member's new phone or a hygiene rotation holds the records still queued and seals them again under an epoch that may carry them: first a catch-up epoch to the earlier audience when someone joined, so a joiner never reads what was queued before it, then the epoch to everyone. A record already sent once is retried as it is. `delivery(localId)` shows such a record as `held` until it goes out. What is still given up (past its window, superseded, on a retired device) is reported with `cancelled`.
 
 **`enqueue` does not fail for a rotation.** When no epoch is usable now (a rotation pending, metadata missing, an `AUDIENCE_STALE` fence, the host unreachable), the record is queued unsealed and sealed at the next sync, in order; `recordId` is then absent from the result and arrives with `accepted`. An unsealed record is not yet in your own history or newest slot. `RECIPIENT_LIMIT` and `QUEUE_FULL` stay errors. No retry wrapper is needed.
 

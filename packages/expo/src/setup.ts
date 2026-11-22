@@ -224,11 +224,32 @@ export async function readEraseMarker(secretStore: SecretStore): Promise<{ value
   return { value: bytes ? Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("") : "", erasing: bytes?.[0] === 1 };
 }
 
+/**
+ * The databases open in this runtime, per database module (or driver factory) and context, so a
+ * second open of a file already open here is refused: two handles on one file in one runtime run
+ * their syncs side by side and deliver every event twice. Separate runtimes have separate maps.
+ */
+const openHere = new WeakMap<object, Set<string>>();
+
 export async function openKavach(options: KavachSetupOptions): Promise<KavachSetup> {
   installWebCrypto(options.getRandomValues);
   const cryptoBackend = await selectCryptoBackend(options);
   const namespace = options.namespace ?? "kavach";
   const fileName = databaseFileName(options.accountName, namespace);
+  const opened = openHere.get(options.database) ?? new Set<string>();
+  openHere.set(options.database, opened);
+  const handle = `${options.context}:${fileName}`;
+  if (opened.has(handle)) throw new KavachError("MALFORMED", "openKavach", "this account's database is already open in this runtime: share the one KavachSetup, or one kavachSlot per account");
+  opened.add(handle);
+  try {
+    return await openAccount(options, fileName, namespace, cryptoBackend, () => opened.delete(handle));
+  } catch (e) {
+    opened.delete(handle);
+    throw e;
+  }
+}
+
+async function openAccount(options: KavachSetupOptions, fileName: string, namespace: string, cryptoBackend: CryptoBackendStatus, released: () => void): Promise<KavachSetup> {
   const secretStore = accountSecretStore(options.secrets, options.accountName, namespace);
   const storageKey = await storageKeyFor(secretStore, `${namespace}.${options.accountName}`, options.context);
   const driver = typeof options.database === "function" ? options.database(fileName) : expoSqliteDriver(options.database.openDatabaseSync(fileName, { useNewConnection: true }));
@@ -248,8 +269,12 @@ export async function openKavach(options: KavachSetupOptions): Promise<KavachSet
   let closed: Promise<void> | undefined;
   const close = (): Promise<void> => {
     closed ??= (async () => {
-      await client.close();
-      await store.close();
+      try {
+        await client.close();
+        await store.close();
+      } finally {
+        released();
+      }
     })();
     return closed;
   };

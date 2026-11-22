@@ -76,6 +76,8 @@ describe("httpTransport failures", () => {
     expect([seen[0]?.get("authorization"), seen[0]?.get("x-kavach-device"), seen[0]?.get("x-kavach-op")]).toEqual(["Bearer token", "ab".repeat(32), "op-1"]);
     const refused = transportWith(async () => new Response(JSON.stringify({ error: "nope" }), { status: 403, headers: { "content-type": "application/json", "x-request-id": "req-42" } }));
     await expect(refused.directory.resolveAccounts(["alice"])).rejects.toThrow(/request req-42.*nope/);
+    const structured = transportWith(async () => new Response(JSON.stringify({ error: { code: "FORBIDDEN", message: "not a member" } }), { status: 403, headers: { "content-type": "application/json" } }));
+    await expect(structured.directory.resolveAccounts(["alice"])).rejects.toThrow(/FORBIDDEN: not a member/);
   });
 
   it("a body that fails while streaming is NETWORK; a success that is not JSON (a captive portal) is NETWORK; a refusal that is not JSON is a plain error", async () => {

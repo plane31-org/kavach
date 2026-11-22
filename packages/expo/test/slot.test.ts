@@ -7,7 +7,7 @@ import { toHex } from "@plane31/blind-relay";
 import { MemorySecretStore, ready, type SecretStore } from "@plane31/blind-relay/adapters";
 import { FakeHost, TestClock, testPolicy, testResetKeyList, testResetKeys } from "@plane31/blind-relay/testing";
 import { nodeSqliteDriver } from "../src/sqliteStore.js";
-import { databaseFileName, markErased } from "../src/setup.js";
+import { databaseFileName, markErased, openKavach } from "../src/setup.js";
 import { kavachSlot } from "../src/slot.js";
 import { openNodeDatabase } from "./sqlite.js";
 
@@ -217,6 +217,18 @@ describe("kavachSlot", () => {
     expect(existsSync(join(dir, databaseFileName("alice")))).toBe(true); // the store the use opened was not deleted after it
     expect(await slot.use(async (s) => (await s.client.getState()).status)).toBe("fresh");
     await slot.close();
+  });
+
+  it("a second open of a database already open in this runtime is refused; after a close, or in another context, it is fine", async () => {
+    const { options } = runtimes();
+    const fg = options("foreground");
+    const first = await openKavach(fg);
+    await expect(openKavach(fg)).rejects.toMatchObject({ code: "MALFORMED" });
+    const other = await openKavach({ ...fg, context: "background" }); // another runtime, as a test models it
+    await other.close();
+    await first.close();
+    const again = await openKavach(fg);
+    await again.close();
   });
 });
 

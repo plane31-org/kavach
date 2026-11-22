@@ -183,7 +183,7 @@ describe("T2 to T5, T8, T9", () => {
     expect(await store.transaction((tx) => t5Committed(tx, 1, audience.key))).toBe("PROMOTED");
     let stream = await store.read((tx) => tx.get("stream", "stream"));
     expect(stream).toEqual({ highestCommittedEpoch: 1, activeEpoch: 1, pendingEpoch: undefined });
-    // Two queued rows, then a membership change: both are cancelled and the epoch goes obsolete.
+    // Two rows, then a membership change: the queued one is held (revision 13), the in-flight one stays, and the epoch goes obsolete.
     await store.transaction((tx) => {
       for (const c of [0, 1]) {
         tx.put("outbox", `r${c}`, { recordId: `r${c}`, wire: "00", epoch: 1, counter: c, kind: 0, sentAt: "1", desiredRevision: "1", status: c === 0 ? "queued" : "inflight", attempts: 0, reason: undefined });
@@ -192,7 +192,7 @@ describe("T2 to T5, T8, T9", () => {
     const change = await store.transaction((tx) => t3ApplyChange(tx, { kind: "join", circleId: new Uint8Array(16) }));
     expect(change.changed).toBe(true);
     expect(change.desiredRevision).toBe(2n);
-    expect(change.cancelled).toEqual(["r0"]); // the in-flight row cannot be recalled
+    expect(change.held).toEqual(["r0"]); // the in-flight row cannot be recalled
     stream = await store.read((tx) => tx.get("stream", "stream"));
     expect(stream?.activeEpoch).toBeUndefined();
     expect(await store.read((tx) => tx.get("epochs", "1")?.status)).toBe("obsolete");

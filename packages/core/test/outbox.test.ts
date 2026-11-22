@@ -82,13 +82,14 @@ describe("enqueue (T6)", () => {
     expect(await alice.store.read((tx) => tx.list("history").length)).toBe(2);
   });
 
-  it("S06: a known change cancels queued rows, keeps history, and makes the next enqueue rotate", async () => {
+  it("S06: a known change holds queued rows (revision 13), keeps history, and makes the next enqueue rotate", async () => {
     const { alice, clock } = await pair();
     await enqueue(alice.outbox, 0, sample(clock));
     await enqueue(alice.outbox, 0, sample(clock));
     const r = await alice.store.transaction((tx) => t3ApplyChange(tx, { kind: "disable", circleId: new Uint8Array(16) }));
-    expect(r.cancelled.length).toBe(2);
-    expect(await outboxCount(alice.store)).toBe(0);
+    expect(r.held.length).toBe(2);
+    expect(await alice.store.read((tx) => tx.list("outbox").map(([, o]) => o.status))).toEqual(["held", "held"]);
+    expect(await outboxCount(alice.store)).toBe(2); // still to send
     expect(await alice.store.read((tx) => tx.list("history").length)).toBe(2);
     const waiting = await enqueue(alice.outbox, 0, sample(clock)); // no usable epoch: queued unsealed
     expect(waiting.recordId).toBeUndefined();
@@ -110,8 +111,8 @@ describe("enqueue (T6)", () => {
     expect(hygiene.recordId).toBeUndefined();
     await alice.rotate();
     const statuses = await alice.store.read((tx) => tx.list("outbox").map(([, r]) => [r.epoch, r.counter, r.status]));
-    expect(statuses).toEqual(expect.arrayContaining([[1, 0, "cancelled"], [0, 0, "unsealed"], [0, 0, "unsealed"]]));
-    await drain(alice.outbox); // both waiting records are sealed under the new epoch and go out
+    expect(statuses).toEqual(expect.arrayContaining([[1, 0, "held"], [0, 0, "unsealed"], [0, 0, "unsealed"]]));
+    await drain(alice.outbox); // the held record is sealed again, the two waiting ones for the first time, and all go out
     expect(await outboxCount(alice.store)).toBe(0);
     const small = { ...alice.outbox, policy: { ...alice.outbox.policy, maxOutboxRecords: 2 } };
     await enqueue(small, 0, sample(clock));
@@ -157,7 +158,8 @@ describe("the sender (T6h)", () => {
     const second = await drain(alice.outbox);
     expect(second).toMatchObject({ sent: 1, accepted: 1 });
     expect(host.retainedCount(alice.pin.streamId)).toBe(1);
-    // Now a row whose response was lost and whose audience then changed: cancelled, never resent.
+    // Now a row whose response was lost and whose audience then changed: its exact bytes are retried,
+    // never sealed again, and the host's checkpoint says it took them.
     await enqueue(alice.outbox, 0, sample(clock));
     host.dropAppendResponses = true;
     await drain(alice.outbox);
@@ -165,9 +167,10 @@ describe("the sender (T6h)", () => {
     const calls = host.appendCalls;
     await alice.store.transaction((tx) => t3ApplyChange(tx, { kind: "leave", circleId: new Uint8Array(16) }));
     const third = await drain(alice.outbox);
-    expect(third.sent).toBe(0);
-    expect(host.appendCalls).toBe(calls);
-    expect(await alice.store.read((tx) => tx.list("outbox").map(([, r]) => r.status).filter((s) => s !== "accepted"))).toEqual(["cancelled"]);
+    expect([third.sent, third.accepted, third.resealed]).toEqual([1, 1, 0]);
+    expect(host.appendCalls).toBe(calls + 1);
+    expect(host.appendLog.at(-1)?.status).toBe("ALREADY_ACCEPTED");
+    expect(await alice.store.read((tx) => tx.list("outbox").map(([, r]) => r.status).filter((s) => s !== "accepted"))).toEqual([]);
   });
 
   it("a synchronous transport failure rolls the in-flight mark back", async () => {

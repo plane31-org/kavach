@@ -153,21 +153,23 @@ describe("feedback findings", () => {
     expect((await w.sync(a)).outbox.sent).toBe(0);
   });
 
-  it("7: a cancelled record keeps only its summary and goes after the delivery window", async () => {
+  it("7: a cancelled record keeps only its summary and goes after the delivery window; a rotation holds a record instead", async () => {
     const w = world();
     const { a, circleId } = await pair(w);
-    const { recordId } = await enqueueLocation(a.client, w.loc(2));
+    const older = await a.client.enqueue(2, Uint8Array.of(1)); // latestWins: the next one cancels it
+    await a.client.enqueue(2, Uint8Array.of(2));
+    const row = await a.store.read((tx) => tx.get("outbox", toHex(older.localId)));
+    expect([row?.status, row?.reason, row?.wire, row?.payload]).toEqual(["cancelled", "superseded", "", undefined]);
+    // A rotation holds a queued record with its payload; it is not cancelled.
+    const { localId } = await enqueueLocation(a.client, w.loc(2));
     await a.client.circles.setEnabled(circleId, false);
-    const row = await a.store.read((tx) => tx.get("outbox", toHex(recordId)));
-    expect([row?.status, row?.reason, row?.wire]).toEqual(["cancelled", "rotation", ""]);
-    const before = await a.client.inspect();
-    expect([before.outbox.cancelled, before.outbox.queued, before.paused]).toEqual([1, 0, "rotation"]);
+    expect((await a.client.delivery(localId))?.status).toBe("held");
     await a.client.circles.setEnabled(circleId, true);
     expect((await w.sync(a)).purged).toBe(0);
-    expect(await a.store.read((tx) => tx.get("outbox", toHex(recordId)))).toBeDefined();
+    expect(await a.store.read((tx) => tx.get("outbox", toHex(older.localId)))).toBeDefined();
     w.clock.advance(86_400_000n);
     expect((await w.sync(a)).purged).toBeGreaterThanOrEqual(1);
-    expect(await a.store.read((tx) => tx.get("outbox", toHex(recordId)))).toBeUndefined();
+    expect(await a.store.read((tx) => tx.get("outbox", toHex(older.localId)))).toBeUndefined();
   });
 
   it("8: inspect shows the outbox by state, the oldest pending age and the vault's state, never a secret", async () => {
@@ -653,8 +655,9 @@ describe("feedback findings", () => {
     relay.publishEpoch = publish;
     a.t.knobs.refuse.delete("publishEpoch");
     const r = await w.sync(a);
-    expect(r.outbox.accepted).toBe(1);
+    expect(r.outbox.accepted).toBe(2); // the first record, held by the rotation (revision 13), and the one queued offline
     expect((await a.client.delivery(offline.localId))?.status).toBe("accepted");
+    expect((await a.client.delivery(first.localId))?.status).toBe("accepted");
   });
 
   it("27: a zero event time is none on both sides: sender and reader agree on the newest record", async () => {

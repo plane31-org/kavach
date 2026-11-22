@@ -58,6 +58,12 @@ export function resolveAudience(self: AccountPin, circles: readonly CircleState[
   return { rows, recipientCount: rows.length - 1, key: rows.map((r) => toHex(r.identityId) + ":" + toHex(r.certificateHash)).join(",") };
 }
 
+/** The audience restricted to the given account ids (the author is always among them), with its key. */
+export function restrictAudience(a: ResolvedAudience, ids: ReadonlySet<string>): ResolvedAudience {
+  const rows = a.rows.filter((r) => ids.has(toHex(r.identityId)));
+  return { rows, recipientCount: rows.length - 1, key: rows.map((r) => toHex(r.identityId) + ":" + toHex(r.certificateHash)).join(",") };
+}
+
 // Desired revision -----------------------------------------------------------------------------
 
 export type AudienceEvent =
@@ -75,7 +81,9 @@ export type AudienceEvent =
   | { readonly kind: "gone"; readonly circleId: Uint8Array }
   | { readonly kind: "returned"; readonly circleId: Uint8Array }
   /** Revision 12: the host refused an append as AUDIENCE_STALE; the epoch is not used again. */
-  | { readonly kind: "audienceStale" };
+  | { readonly kind: "audienceStale" }
+  /** Revision 13: a catch-up epoch carried its held records; the next epoch addresses the whole audience. */
+  | { readonly kind: "catchUp" };
 
 export interface RevisionState {
   readonly desiredRevision: bigint;

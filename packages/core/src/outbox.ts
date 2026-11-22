@@ -14,7 +14,7 @@ import { big, unbig } from "./rows.js";
 import type { EpochRow, HistoryRow, OutboxRow, Store, Tx } from "./store.js";
 import { META, REVISION, STREAM, currentRevision, t3ApplyChange } from "./transactions.js";
 import type { AppendOutcome, Relay } from "./transport.js";
-import { recordWireBytes, type RecordKind } from "./codec.js";
+import { DocumentType, expectType, parseDocument, recordWireBytes, type EpochManifest, type RecordKind } from "./codec.js";
 
 /** Which record an event is about: its local id, which never changes, its current record id when sealed, and its idempotency key. */
 export interface RecordRef {
@@ -127,6 +127,8 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
     // counter retires the epoch (T3) here rather than leaving it active and unusable.
     let epoch = activeEpochIn(tx);
     let rotated = false;
+    // A catch-up epoch carries held records only (revision 13): a new record waits for the next one.
+    if (epoch?.catchUpFor !== undefined) epoch = undefined;
     if (epoch) {
       const reason = rotationReason({ createdAt: unbig(epoch.createdAt), nextCounter: epoch.nextCounter, lastSentAt: epoch.lastSentAt === undefined ? undefined : unbig(epoch.lastSentAt) }, now, deps.policy.hygieneRotationMs);
       if (reason) {
@@ -187,9 +189,32 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
  * audience limit), outside an AUDIENCE_STALE fence and with a counter left. A hygiene rotation that
  * is due is the caller's to apply.
  */
-function usableEpoch(tx: Pick<Tx, "get">): EpochRow | undefined {
-  const epoch = activeEpochIn(tx);
-  return epoch && epoch.nextCounter <= MAX_COUNTER ? epoch : undefined;
+/** The account ids an epoch's manifest addresses, the author's own included. */
+export function recipientsOf(row: EpochRow | undefined): Set<string> {
+  if (!row) return new Set();
+  return new Set(expectType<EpochManifest>(parseDocument(fromHex(row.manifest)), DocumentType.EpochManifest).audience.map((r) => toHex(r.identityId)));
+}
+
+/**
+ * Whether `target` may carry a held record (revision 13): it is newer than the epoch the record was
+ * sealed under, and every account it addresses could already read the record then. An account
+ * added since is never a recipient of a record from before it; one removed is never in `target`.
+ */
+export function servesHeld(tx: Pick<Tx, "get">, target: EpochRow, row: OutboxRow): boolean {
+  const from = row.heldEpoch ?? row.epoch;
+  if (target.epoch <= from) return false;
+  const before = recipientsOf(tx.get("epochs", String(from)));
+  for (const id of recipientsOf(target)) if (!before.has(id)) return false;
+  return true;
+}
+
+/** Whether a catch-up epoch still has work: held records it may carry, or records sealed under it not yet out. */
+export function catchUpBusy(tx: Pick<Tx, "get" | "list">, epoch: EpochRow): boolean {
+  for (const [, r] of tx.list("outbox")) {
+    if ((r.status === "queued" || r.status === "inflight") && r.epoch === epoch.epoch) return true;
+    if (r.status === "held" && r.payload !== undefined && servesHeld(tx, epoch, r)) return true;
+  }
+  return false;
 }
 
 /** The active epoch outside a fence or a pause, whether or not its counter is spent. */
@@ -271,6 +296,8 @@ export interface DrainSummary {
   held: number;
   /** Held records sealed again under a new epoch in this drain. */
   resealed: number;
+  /** The local ids of the records the relay accepted in this drain. */
+  acceptedLocalIds: string[];
   /** Record bytes handed to the relay by this drain. */
   bytes: number;
   /** The error that ended the drain early, when a send failed before or without an answer (NETWORK, RATE_LIMITED); its record stays queued. */
@@ -287,7 +314,7 @@ type HandoffStep = { kind: "none" } | { kind: "skipped" } | { kind: "sent"; key:
  * revalidates first.
  */
 export async function drain(deps: OutboxDeps, maxRecords = 1000): Promise<DrainSummary> {
-  const summary: DrainSummary = { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0, bytes: 0 };
+  const summary: DrainSummary = { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0, acceptedLocalIds: [], bytes: 0 };
   for (let i = 0; i < maxRecords; i++) {
     const step = await handoffNext(deps, summary);
     if (step.kind === "none") break;
@@ -302,7 +329,10 @@ export async function drain(deps: OutboxDeps, maxRecords = 1000): Promise<DrainS
       if (e instanceof KavachError) summary.blocked ??= e; // and the reason reaches the report
     }
     const final = await recordOutcome(deps, step.key, outcome, summary);
-    if (final === "accepted") summary.accepted++;
+    if (final === "accepted") {
+      summary.accepted++;
+      summary.acceptedLocalIds.push(step.key);
+    }
     else if (final === "cancelled") summary.cancelled++;
     else if (final === "unknown") summary.unknown++;
     else if (final === "held") break; // the epoch is refused: nothing more goes out until the next one
@@ -354,7 +384,10 @@ function resealIn(tx: Tx, deps: OutboxDeps, key: string, row: OutboxRow, epoch: 
   const { heldEpoch: _held, ...rest } = row;
   void _held;
   // The row stays at its local id: only the record id moves.
-  tx.put("outbox", key, { ...rest, recordId: newId, wire: toHex(sealed.wire), epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), desiredRevision: big(currentRevision(tx)), status: "queued", attempts: 0, reason: undefined, resealed: true });
+  // Only a reseal after AUDIENCE_STALE counts toward its once-only rule; one after a rotation does not.
+  const { staleHeld: _stale, ...unmarked } = rest;
+  void _stale;
+  tx.put("outbox", key, { ...unmarked, recordId: newId, wire: toHex(sealed.wire), epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), desiredRevision: big(currentRevision(tx)), status: "queued", attempts: 0, reason: undefined, ...(row.staleHeld || row.resealed ? { resealed: true } : {}) });
   const next: EpochRow = { ...epoch, nextCounter: epoch.nextCounter + 1, lastSentAt: big(now) };
   tx.put("epochs", String(epoch.epoch), next);
   const history = tx.get("history", oldId);
@@ -383,10 +416,11 @@ function resealIn(tx: Tx, deps: OutboxDeps, key: string, row: OutboxRow, epoch: 
  * one is sealed for the first time. Returns how many were cancelled; events go to `after`.
  */
 function sealWaitingIn(tx: Tx, deps: OutboxDeps, now: bigint, summary: Pick<DrainSummary, "resealed">, after: (() => void)[]): number {
-  // Records waiting for an epoch first, oldest first: past their window they are cancelled;
-  // under a usable epoch a held one is sealed again once (never under the epoch it was refused
-  // in) and an unsealed one is sealed for the first time. Then they go out like any queued record.
-  let target = usableEpoch(tx);
+  // Records waiting for an epoch first, oldest first: past their window they are cancelled. A held
+  // one is sealed again under the active epoch only when every recipient of that epoch could read
+  // it before (revision 13): no one added since sees it, and anyone removed is already out. An
+  // unsealed one is sealed for the first time under a normal epoch, never a catch-up one.
+  let target = activeEpochIn(tx);
   let cancelled = 0;
   const waiting = [...tx.list("outbox")].filter(([, r]) => r.status === "held" || r.status === "unsealed").sort(([, a], [, b]) => (a.status === b.status ? 0 : a.status === "held" ? -1 : 1) || a.epoch - b.epoch || a.counter - b.counter || (a.sentAt < b.sentAt ? -1 : a.sentAt > b.sentAt ? 1 : 0));
   for (const [key, row] of waiting) {
@@ -396,9 +430,16 @@ function sealWaitingIn(tx: Tx, deps: OutboxDeps, now: bigint, summary: Pick<Drai
       after.push(() => deps.events?.cancelled?.(refOf(key, row), "expired"));
       continue;
     }
+    if (row.status === "held" && row.payload === undefined) {
+      // Held from before payloads were kept: it cannot be sealed again, and the app is told.
+      tx.put("outbox", key, terminal(row, "cancelled", "rotation"));
+      cancelled++;
+      after.push(() => deps.events?.cancelled?.(refOf(key, row), "rotation"));
+      continue;
+    }
     if (!target || target.nextCounter > MAX_COUNTER) continue;
     if (row.status === "held") {
-      if (target.epoch <= (row.heldEpoch ?? row.epoch)) continue;
+      if (!servesHeld(tx, target, row)) continue; // a catch-up epoch comes first, or a later one
       const moved = resealIn(tx, deps, key, row, target, now);
       if (!moved) continue;
       target = moved.epoch;
@@ -413,6 +454,7 @@ function sealWaitingIn(tx: Tx, deps: OutboxDeps, now: bigint, summary: Pick<Drai
         after.push(() => deps.events?.cancelled?.(refOf(key, row), "undeclared"));
         continue;
       }
+      if (target.catchUpFor !== undefined) continue; // a catch-up epoch carries held records only
       const sealed = firstSealIn(tx, deps, key, row, target, now);
       target = sealed.epoch;
       const ref: RecordRef = { localId: fromHex(key), recordId: fromHex(sealed.recordId), idempotencyKey: row.idempotencyKey };
@@ -449,11 +491,18 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
     // passed) is cancelled here, in bounded batches, and the first sendable row goes out in the
     // same transaction. A backlog of dead rows costs one scan, not one transaction per row.
     const live: [string, OutboxRow][] = [];
-    let refresh = false;
     let cancelled = sealWaitingIn(tx, deps, now, summary, after);
     for (const [key, row] of [...tx.list("outbox")].sort(([, a], [, b]) => a.epoch - b.epoch || a.counter - b.counter)) {
       if (row.status !== "queued" && row.status !== "inflight") continue;
-      const reason = cancelled >= CANCEL_BATCH ? undefined : unbig(row.desiredRevision) !== revision ? "rotation" : unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now ? "expired" : undefined;
+      if (row.status === "queued" && row.attempts === 0 && unbig(row.desiredRevision) !== revision) {
+        // Sealed under a revision that moved on and never sent: held for an epoch that may carry it
+        // (revision 13), never cancelled. One handed off before is retried as it is: the host may
+        // hold it, and a second seal would deliver it twice; its checkpoint answers, and only a
+        // refusal (EPOCH_FENCED) holds it.
+        tx.put("outbox", key, { ...row, status: "held", heldEpoch: row.epoch });
+        continue;
+      }
+      const reason = cancelled >= CANCEL_BATCH ? undefined : unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now ? "expired" : undefined;
       if (!reason) {
         live.push([key, row]);
         continue;
@@ -461,10 +510,8 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
       tx.put("outbox", key, terminal(row, "cancelled", reason));
       cancelled++;
       after.push(() => deps.events?.cancelled?.(refOf(key, row), reason));
-      if (reason === "rotation" && kindOf(deps.policy, row.kind)?.newest) refresh = true;
     }
     summary.cancelled += cancelled;
-    if (refresh) after.push(() => deps.events?.refresh?.("rotation"));
     // A full batch means unchecked rows remain: finish them in the next handoff before sending.
     if (cancelled >= CANCEL_BATCH) return { kind: "skipped" };
     const next = live.find(([, r]) => r.status === "inflight") ?? live[0];
@@ -546,7 +593,7 @@ export async function recordOutcome(deps: OutboxDeps, key: string, outcome: Appe
             if (k === key) fate = "cancelled";
             else if (summary) summary.cancelled++;
           } else {
-            tx.put("outbox", k, { ...current, status: "held", heldEpoch: current.epoch });
+            tx.put("outbox", k, { ...current, status: "held", heldEpoch: current.epoch, staleHeld: true });
             held++;
           }
         }
@@ -558,7 +605,19 @@ export async function recordOutcome(deps: OutboxDeps, key: string, outcome: Appe
         after.push(() => deps.events?.audienceStale?.(held));
         return fate;
       }
-      case "EPOCH_FENCED":
+      case "EPOCH_FENCED": {
+        if (row.payload !== undefined) {
+          // The epoch is no longer the stream's current one: the host did not take the record, so it
+          // is held and sealed again under an epoch that may carry it (revision 13).
+          tx.put("outbox", key, { ...row, status: "held", heldEpoch: row.epoch });
+          return "held";
+        }
+        // From before payloads were kept: it cannot be sealed again.
+        cancel("EPOCH_FENCED");
+        after.push(() => deps.events?.cancelled?.(id, "EPOCH_FENCED"));
+        if (kindOf(deps.policy, row.kind)?.newest) after.push(() => deps.events?.refresh?.("EPOCH_FENCED"));
+        return "cancelled";
+      }
       case "SUPERSEDED_DEVICE":
       case "UNAUTHORIZED":
         cancel(outcome.status);

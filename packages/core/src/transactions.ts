@@ -123,19 +123,20 @@ export function t2PrepareActivation(tx: Tx, row: ActivationRow): void {
 export interface ChangeResult {
   readonly changed: boolean;
   readonly desiredRevision: bigint;
-  readonly cancelled: readonly string[];
+  /** Queued rows the change held for an epoch that may carry them. */
+  readonly held: readonly string[];
 }
 
 /**
  * T3: a verified circle or device change. Bumps the desired revision, invalidates the active
- * epoch, burns its counters and cancels queued (not yet handed off) outbox rows sealed under the
- * obsolete revision. Pauses with `rotation`.
+ * epoch, burns its counters and holds queued (not yet handed off) outbox rows sealed under the
+ * obsolete revision for an epoch that may carry them. Pauses with `rotation`.
  */
 export function t3ApplyChange(tx: Tx, event: AudienceEvent): ChangeResult {
   const row = tx.get("revision", REVISION);
   const state = row ? rowToRevision(row) : initialRevisionState;
   const { state: next, changed } = applyAudienceEvent(state, event);
-  if (!changed) return { changed: false, desiredRevision: state.desiredRevision, cancelled: [] };
+  if (!changed) return { changed: false, desiredRevision: state.desiredRevision, held: [] };
   tx.put("revision", REVISION, revisionToRow(next, "rotation"));
   const stream = tx.get("stream", STREAM);
   if (stream?.activeEpoch !== undefined) {
@@ -143,17 +144,20 @@ export function t3ApplyChange(tx: Tx, event: AudienceEvent): ChangeResult {
     if (active) tx.put("epochs", String(stream.activeEpoch), { ...active, status: "obsolete" });
     tx.put("stream", STREAM, { ...stream, activeEpoch: undefined });
   }
-  const cancelled: string[] = [];
+  // Queued rows sealed under the obsolete revision are held, not cancelled (revision 13): the sender
+  // seals each again under an epoch whose recipients could all read it before, so nobody removed or
+  // added since receives it, and nothing is lost. A row without its payload (from before 0.8.0) is
+  // held too, and the sender cancels it with an event.
+  // A row already handed off once (a lost response requeues it) stays queued: its exact bytes are
+  // retried, and the host's checkpoint says whether it took them; only a refusal holds it.
+  const held: string[] = [];
   for (const [key, out] of tx.list("outbox")) {
-    if (out.status === "queued" && unbig(out.desiredRevision) < next.desiredRevision) {
-      const { payload: _payload, eventTime: _eventTime, ...rest } = out;
-      void _payload;
-      void _eventTime;
-      tx.put("outbox", key, { ...rest, wire: "", status: "cancelled", reason: "rotation" });
-      cancelled.push(key);
+    if (out.status === "queued" && out.attempts === 0 && unbig(out.desiredRevision) < next.desiredRevision) {
+      tx.put("outbox", key, { ...out, status: "held", heldEpoch: out.epoch });
+      held.push(key);
     }
   }
-  return { changed: true, desiredRevision: next.desiredRevision, cancelled };
+  return { changed: true, desiredRevision: next.desiredRevision, held };
 }
 
 /**
@@ -164,7 +168,7 @@ export function t3ApplyChange(tx: Tx, event: AudienceEvent): ChangeResult {
 export function t3Circle(tx: Tx, row: CircleRow, event?: AudienceEvent): ChangeResult {
   tx.put("circles", row.circleId, row);
   t9MarkVault(tx);
-  return event ? t3ApplyChange(tx, event) : { changed: false, desiredRevision: currentRevision(tx), cancelled: [] };
+  return event ? t3ApplyChange(tx, event) : { changed: false, desiredRevision: currentRevision(tx), held: [] };
 }
 
 export function currentRevision(tx: Pick<Tx, "get">): bigint {

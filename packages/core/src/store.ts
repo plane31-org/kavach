@@ -140,6 +140,12 @@ export interface EpochRow {
   createdAt: string;
   nextCounter: number;
   lastSentAt: string | undefined;
+  /**
+   * Set on a catch-up epoch (revision 13): the held epoch whose records it carries, to an audience
+   * of the current one minus anyone the older epoch did not address. New records are never sealed
+   * under it; it is retired once those records are out.
+   */
+  catchUpFor?: number;
 }
 
 export interface StreamRow {
@@ -182,8 +188,10 @@ export interface OutboxRow {
   eventTime?: string;
   /** Set on a held row: the epoch whose audience the host refused. */
   heldEpoch?: number;
-  /** Set once the row has been resealed: a second `AUDIENCE_STALE` cancels it. */
+  /** Set once the row has been resealed after an `AUDIENCE_STALE`: a second one cancels it. */
   resealed?: boolean;
+  /** Set on a row held by an `AUDIENCE_STALE` refusal, as against a rotation. */
+  staleHeld?: boolean;
   /** The idempotency key the record was enqueued under, carried on its lifecycle events. */
   idempotencyKey?: string;
 }
