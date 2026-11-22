@@ -1,6 +1,6 @@
 # Amendment A2: records readable by one circle
 
-Status: **adopted for protocol revision 14; implementation in this change, not published.** This document records the decisions and limits. The normative protocol is `spec/Kavach-v1.md`.
+Status: **adopted for protocol revision 14; implemented in package 0.11.0.** This document records the decisions and limits. The normative protocol is `spec/Kavach-v1.md`.
 
 ## 1. Model and public API
 
@@ -79,6 +79,6 @@ Lazy creation avoids unused streams. It does not eliminate growth with circle co
 
 Use a single parameterized sending state machine. Namespace sending epochs, counters and revisions by scoped stream id; keep stable local ids, account-wide limits and the shared reader implementation. Preserve existing author-stream keys and behavior.
 
-Ship the host capability first, then revision-14 readers, then enable scoped kinds on senders. Earlier readers do not recognize scoped stream ids. No npm publication or host deployment is implied by this implementation.
+Ship the host capability first, then revision-14 readers, then enable scoped kinds on senders. Earlier readers do not recognize scoped stream ids. Publishing the packages deploys no host.
 
 Conformance covers independent stream-id/manifest vectors, no crossing, scope/type rejection, per-circle queue replacement and newest slots, indexed history, late sealed backlog across a join, unsealed first-use semantics, removal, disable/resume without counter reuse, global limits, and the actual HTTP host path. Existing author-scoped, replacement and fault tests remain applicable.

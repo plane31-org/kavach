@@ -1,14 +1,16 @@
 # Changelog
 
-## Unreleased — protocol revision 14
+## 0.11.0
 
-- Resolve interrupted scoped publications across removals without reusing epoch numbers or distributing stale wraps; clear scoped reader keys when forgetting an author.
+Protocol revision 14: circle-scoped records (amendment A2, adopted). Author-scoped kinds, their streams and their wire bytes are unchanged.
 
 - Add optional circle-scoped kinds and deterministic per-device/per-circle streams, reusing epochs, catch-up, cursors and delivery tracking.
 - Isolate latest-wins queues and newest slots by circle; expose circle ids on history/events and index circle history. Queue limits and idempotency remain account-wide.
 - Add idempotent scoped registration to the HTTP adapter, fake host and reference worker, with circle-specific publication and append checks.
+- Resolve interrupted scoped publications across removals without reusing epoch numbers or distributing stale wraps; clear scoped reader keys when forgetting an author.
 - `SyncReport.epoch` is the author stream's step; each own scoped stream's step is in the new `scopedEpochs`. A queued record whose circle is suspended no longer keeps `syncUntilDrained` running to `maxRounds`. An idempotency key is answered before any circle-eligibility refusal, in `enqueue()` and inside the outbox transaction. The fake host keeps a scoped stream's first registration, as the worker does. Readers memoize derived scoped stream ids per certificate and circle.
 - Clarify first-seal privacy, suspension/resumption, host-visible circle metadata and host/readers/senders rollout in adopted Amendment A2.
+- *Migration:* a kind may declare `scope: "circle"` in the retention policy (absent is `"author"`); such a kind needs `{ circleId }` on `enqueue` and `newest`. `Directory.openScopedStream` is optional and required only for scoped kinds (`UNSUPPORTED_OPERATION` without it); the HTTP binding is `POST /circles/{circleId}/streams`. `SyncReport` gains `scopedEpochs`; scoped records' events and history entries carry `circleId`; `PROTOCOL_REVISION` is 14. Roll out the host capability first, then revision-14 readers, then scoped kinds on senders: earlier readers do not recognise scoped streams.
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
 
