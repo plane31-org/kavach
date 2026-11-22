@@ -1,5 +1,5 @@
 /**
- * @plane31/blind-relay: Kavach v1 protocol (revision 13, wire version 5).
+ * @plane31/blind-relay: Kavach v1 protocol (revision 14, wire version 5).
  *
  * This entry is what an application imports: the client, its types, the errors and the few
  * helpers an app needs around it. Adapter and host authors import `@plane31/blind-relay/adapters`;

@@ -32,7 +32,8 @@ export function authorPrefix(authorIdentityId: string, kind: number): string {
 
 function keysOf(r: HistoryRow): string[] {
   const tuple = historyTuple(r);
-  return [timelinePrefix(r.kind) + tuple, authorPrefix(r.authorIdentityId, r.kind) + tuple];
+  const keys = [timelinePrefix(r.kind) + tuple, authorPrefix(r.authorIdentityId, r.kind) + tuple];
+  return r.circleId ? [...keys, ...keys.map(k => `c:${r.circleId}:${k}`)] : keys;
 }
 
 /** Index a history row; written in the same transaction as the row (T6, T7). */

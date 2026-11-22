@@ -12,19 +12,20 @@ import { clampEventTime, slotKey, takeSlot } from "./slots.js";
 import { sealRecord } from "./record.js";
 import { big, unbig } from "./rows.js";
 import type { EpochRow, HistoryRow, OutboxRow, Store, Tx } from "./store.js";
-import { META, REVISION, STREAM, currentRevision, t3ApplyChange } from "./transactions.js";
+import { META, currentRevision, t3ApplyChange, epochKey, streamKey, revisionKey, inStream } from "./transactions.js";
 import type { AppendOutcome, Relay } from "./transport.js";
 import { DocumentType, expectType, parseDocument, recordWireBytes, type EpochManifest, type RecordKind } from "./codec.js";
 
 /** Which record an event is about: its local id, which never changes, its current record id when sealed, and its idempotency key. */
 export interface RecordRef {
+  readonly circleId?: Uint8Array;
   readonly localId: Uint8Array;
   readonly recordId: Uint8Array | undefined;
   readonly idempotencyKey: string | undefined;
 }
 
 export function refOf(key: string, row: OutboxRow): RecordRef {
-  return { localId: fromHex(key), recordId: row.recordId ? fromHex(row.recordId) : undefined, idempotencyKey: row.idempotencyKey };
+  return { ...(row.circleId ? { circleId: fromHex(row.circleId) } : {}), localId: fromHex(key), recordId: row.recordId ? fromHex(row.recordId) : undefined, idempotencyKey: row.idempotencyKey };
 }
 
 export interface OutboxEvents {
@@ -43,6 +44,8 @@ export interface OutboxEvents {
 }
 
 export interface OutboxDeps {
+  readonly scopeStream?: string;
+  readonly circleId?: string;
   readonly store: Store;
   readonly relay: Relay;
   readonly policy: RetentionPolicy;
@@ -59,6 +62,7 @@ function requireReady(tx: Pick<Tx, "get">): void {
 }
 
 export interface EnqueueOptions {
+  readonly circleId?: Uint8Array;
   /**
    * A caller-chosen key for this hand-over, derived from the sample itself (its fix time and
    * source, say). The guarantee: a keyed enqueue that returns has committed its record and the
@@ -114,25 +118,29 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
   const superseded: RecordRef[] = [];
   const result = await deps.store.transaction((tx): Enqueued => {
     requireReady(tx);
+    if (deps.circleId) {
+      const c = tx.get("circles", deps.circleId);
+      if (!c || c.status !== "member" || !c.enabled || !c.members.includes(toHex(deps.author().identityId))) throw new KavachError("NOT_AUTHORIZED", stage, "circle is not enabled for sharing");
+    }
     if (key !== undefined) {
       const seen = tx.get("enqueueKeys", key);
       if (seen) return { localId: fromHex(seen.localId ?? seen.recordId), recordId: seen.recordId ? fromHex(seen.recordId) : undefined, duplicate: true, own: false, rotated: false };
     }
-    const revision = tx.get("revision", REVISION);
+    const revision = tx.get("revision", revisionKey(deps.scopeStream));
     if (revision?.paused === "limit") throw new KavachError("RECIPIENT_LIMIT", stage);
     const now = deps.now();
     // A usable epoch seals the record now; without one (a rotation pending or due, metadata
     // missing, an AUDIENCE_STALE fence) the record is queued unsealed and sealed at the next sync.
     // The rotation reasons are read on the active epoch itself, exhausted or not, so a spent
     // counter retires the epoch (T3) here rather than leaving it active and unusable.
-    let epoch = activeEpochIn(tx);
+    let epoch = activeEpochIn(tx, deps.scopeStream);
     let rotated = false;
     // A catch-up epoch carries held records only (revision 13): a new record waits for the next one.
     if (epoch?.catchUpFor !== undefined) epoch = undefined;
     if (epoch) {
       const reason = rotationReason({ createdAt: unbig(epoch.createdAt), nextCounter: epoch.nextCounter, lastSentAt: epoch.lastSentAt === undefined ? undefined : unbig(epoch.lastSentAt) }, now, deps.policy.hygieneRotationMs);
       if (reason) {
-        t3ApplyChange(tx, { kind: reason }); // T3: the epoch is retired; this record waits for the next one
+        t3ApplyChange(tx, { kind: reason }, deps.scopeStream); // T3: the epoch is retired; this record waits for the next one
         epoch = undefined;
         rotated = true;
       }
@@ -140,7 +148,7 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
     let count = 0;
     let bytes = 0;
     for (const [k, row] of tx.list("outbox")) {
-      if (declared.queue === "latestWins" && row.kind === kind && (row.status === "queued" || row.status === "held" || row.status === "unsealed")) {
+      if (inStream(row, deps.scopeStream) && declared.queue === "latestWins" && row.kind === kind && (row.status === "queued" || row.status === "held" || row.status === "unsealed")) {
         tx.put("outbox", k, terminal(row, "cancelled", "superseded"));
         superseded.push(refOf(k, row));
         continue;
@@ -155,13 +163,14 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
     // The local id: the record id it is sealed with now, or a fresh one when sealing waits.
     const localId = epoch ? toHex(deriveRecordId(a.streamId, epoch.epoch, epoch.nextCounter)) : toHex(randomBytes(32)); // 32 bytes, like a record id
     const base: OutboxRow = {
+      ...(deps.scopeStream ? { scopeStream: deps.scopeStream, circleId: deps.circleId } : {}),
       recordId: "",
       wire: "",
       epoch: 0,
       counter: 0,
       kind,
       sentAt: big(now),
-      desiredRevision: big(currentRevision(tx)),
+      desiredRevision: big(currentRevision(tx, deps.scopeStream)),
       status: "unsealed",
       attempts: 0,
       reason: undefined,
@@ -178,7 +187,7 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
   });
   if (result.duplicate) return result;
   for (const ref of superseded) deps.events?.cancelled?.(ref, "superseded");
-  const ref: RecordRef = { localId: result.localId, recordId: result.recordId, idempotencyKey: key };
+  const ref: RecordRef = { ...(deps.circleId ? { circleId: fromHex(deps.circleId) } : {}), localId: result.localId, recordId: result.recordId, idempotencyKey: key };
   deps.events?.queued?.(ref, kind);
   if (result.recordId) deps.events?.sealed?.(ref, kind, result.own);
   return result;
@@ -206,14 +215,15 @@ export function servesHeld(tx: Pick<Tx, "get">, target: EpochRow, row: OutboxRow
   // A catch-up epoch carries the records of the epoch it was made for and no others: a record held
   // from a later, larger epoch would otherwise reach fewer people than it was sealed for.
   if (target.catchUpFor !== undefined && target.catchUpFor !== from) return false;
-  const before = recipientsOf(tx.get("epochs", String(from)));
+  const before = recipientsOf(tx.get("epochs", epochKey(from, row.scopeStream)));
   for (const id of recipientsOf(target)) if (!before.has(id)) return false;
   return true;
 }
 
 /** Whether a catch-up epoch still has work: held records it may carry, or records sealed under it not yet out. */
-export function catchUpBusy(tx: Pick<Tx, "get" | "list">, epoch: EpochRow): boolean {
+export function catchUpBusy(tx: Pick<Tx, "get" | "list">, epoch: EpochRow, scope?: string): boolean {
   for (const [, r] of tx.list("outbox")) {
+    if (!inStream(r, scope)) continue;
     if ((r.status === "queued" || r.status === "inflight") && r.epoch === epoch.epoch) return true;
     if (r.status === "held" && r.payload !== undefined && servesHeld(tx, epoch, r)) return true;
   }
@@ -221,14 +231,19 @@ export function catchUpBusy(tx: Pick<Tx, "get" | "list">, epoch: EpochRow): bool
 }
 
 /** The active epoch outside a fence or a pause, whether or not its counter is spent. */
-function activeEpochIn(tx: Pick<Tx, "get">): EpochRow | undefined {
+function activeEpochIn(tx: Pick<Tx, "get">, scope?: string): EpochRow | undefined {
+  const binding = scope ? tx.get("scopedStreams", scope) : undefined;
+  if (binding) {
+    const c = tx.get("circles", binding.circleId);
+    if (!c || c.status !== "member" || !c.enabled) return undefined;
+  }
   const meta = tx.get("meta", META);
   if (meta?.fullSyncDue) return undefined;
-  const revision = tx.get("revision", REVISION);
+  const revision = tx.get("revision", revisionKey(scope));
   if (revision?.paused === "metadata" || revision?.paused === "limit" || revision?.paused === "rotation") return undefined;
-  const stream = tx.get("stream", STREAM);
+  const stream = tx.get("stream", streamKey(scope));
   if (!stream || stream.activeEpoch === undefined) return undefined;
-  const epoch = tx.get("epochs", String(stream.activeEpoch));
+  const epoch = tx.get("epochs", epochKey(stream.activeEpoch, scope));
   return epoch && epoch.status === "active" ? epoch : undefined;
 }
 
@@ -257,16 +272,17 @@ function firstSealIn(tx: Tx, deps: OutboxDeps, key: string, row: OutboxRow, epoc
     signingSecretKey: a.signingSecretKey
   });
   const id = toHex(sealed.recordId);
-  tx.put("outbox", key, { ...row, recordId: id, wire: toHex(sealed.wire), epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), desiredRevision: big(currentRevision(tx)), status: "queued" });
+  tx.put("outbox", key, { ...row, recordId: id, wire: toHex(sealed.wire), epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), desiredRevision: big(currentRevision(tx, deps.scopeStream)), status: "queued" });
   if (row.idempotencyKey !== undefined) {
     const k = tx.get("enqueueKeys", row.idempotencyKey);
     if (k) tx.put("enqueueKeys", row.idempotencyKey, { ...k, localId: key, recordId: id, epoch: epoch.epoch, counter: sealed.counter });
   }
   const self = toHex(a.identityId);
   const hash = toHex(bodyHash(sealed.wire.subarray(0, sealed.wire.length - 64)));
-  const own = declared.newest ? takeSlot(tx, self, row.kind, { generation: a.generation, eventTime: clampEventTime(eventTime, now), epoch: epoch.epoch, counter: sealed.counter, recordId: id, bodyHash: hash, sentAt: now, receivedAt: now, payload }, toHex) : false;
+  const own = declared.newest ? takeSlot(tx, self, row.kind, { generation: a.generation, eventTime: clampEventTime(eventTime, now), epoch: epoch.epoch, counter: sealed.counter, recordId: id, bodyHash: hash, sentAt: now, receivedAt: now, payload }, toHex, row.circleId) : false;
   if (declared.history) {
     const ownRow: HistoryRow = {
+      ...(row.circleId ? { circleId: row.circleId } : {}),
       recordId: id,
       authorIdentityId: self,
       streamId: toHex(a.streamId),
@@ -285,7 +301,7 @@ function firstSealIn(tx: Tx, deps: OutboxDeps, key: string, row: OutboxRow, epoc
     indexHistory(tx, ownRow);
   }
   const next: EpochRow = { ...epoch, nextCounter: epoch.nextCounter + 1, lastSentAt: big(now) };
-  tx.put("epochs", String(epoch.epoch), next);
+  tx.put("epochs", epochKey(epoch.epoch, deps.scopeStream), next);
   return { epoch: next, recordId: id, own };
 }
 
@@ -390,9 +406,9 @@ function resealIn(tx: Tx, deps: OutboxDeps, key: string, row: OutboxRow, epoch: 
   // Only a reseal after AUDIENCE_STALE counts toward its once-only rule; one after a rotation does not.
   const { staleHeld: _stale, ...unmarked } = rest;
   void _stale;
-  tx.put("outbox", key, { ...unmarked, recordId: newId, wire: toHex(sealed.wire), epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), desiredRevision: big(currentRevision(tx)), status: "queued", attempts: 0, reason: undefined, ...(row.staleHeld || row.resealed ? { resealed: true } : {}) });
+  tx.put("outbox", key, { ...unmarked, recordId: newId, wire: toHex(sealed.wire), epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), desiredRevision: big(currentRevision(tx, deps.scopeStream)), status: "queued", attempts: 0, reason: undefined, ...(row.staleHeld || row.resealed ? { resealed: true } : {}) });
   const next: EpochRow = { ...epoch, nextCounter: epoch.nextCounter + 1, lastSentAt: big(now) };
-  tx.put("epochs", String(epoch.epoch), next);
+  tx.put("epochs", epochKey(epoch.epoch, deps.scopeStream), next);
   const history = tx.get("history", oldId);
   if (history) {
     unindexHistory(tx, history);
@@ -401,7 +417,7 @@ function resealIn(tx: Tx, deps: OutboxDeps, key: string, row: OutboxRow, epoch: 
     tx.put("history", newId, moved);
     indexHistory(tx, moved);
   }
-  const slot = slotKey(toHex(a.identityId), row.kind);
+  const slot = slotKey(toHex(a.identityId), row.kind, row.circleId);
   const own = tx.get("newest", slot);
   if (own?.recordId === oldId) {
     tx.put("newest", slot, { ...own, recordId: newId, epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), eventTime: big(clampEventTime(eventTime, now)), bodyHash: toHex(bodyHash(sealed.wire.subarray(0, sealed.wire.length - 64))) });
@@ -423,9 +439,9 @@ function sealWaitingIn(tx: Tx, deps: OutboxDeps, now: bigint, summary: Pick<Drai
   // one is sealed again under the active epoch only when every recipient of that epoch could read
   // it before (revision 13): no one added since sees it, and anyone removed is already out. An
   // unsealed one is sealed for the first time under a normal epoch, never a catch-up one.
-  let target = activeEpochIn(tx);
+  let target = activeEpochIn(tx, deps.scopeStream);
   let cancelled = 0;
-  const waiting = [...tx.list("outbox")].filter(([, r]) => r.status === "held" || r.status === "unsealed").sort(([, a], [, b]) => (a.status === b.status ? 0 : a.status === "held" ? -1 : 1) || a.epoch - b.epoch || a.counter - b.counter || (a.sentAt < b.sentAt ? -1 : a.sentAt > b.sentAt ? 1 : 0));
+  const waiting = [...tx.list("outbox")].filter(([, r]) => inStream(r, deps.scopeStream) && (r.status === "held" || r.status === "unsealed")).sort(([, a], [, b]) => (a.status === b.status ? 0 : a.status === "held" ? -1 : 1) || a.epoch - b.epoch || a.counter - b.counter || (a.sentAt < b.sentAt ? -1 : a.sentAt > b.sentAt ? 1 : 0));
   for (const [key, row] of waiting) {
     if (unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now) {
       tx.put("outbox", key, terminal(row, "cancelled", "expired"));
@@ -447,7 +463,7 @@ function sealWaitingIn(tx: Tx, deps: OutboxDeps, now: bigint, summary: Pick<Drai
       if (!moved) continue;
       target = moved.epoch;
       summary.resealed++;
-      const ref: RecordRef = { localId: fromHex(key), recordId: fromHex(moved.newId), idempotencyKey: row.idempotencyKey };
+      const ref: RecordRef = { ...(deps.circleId ? { circleId: fromHex(deps.circleId) } : {}), localId: fromHex(key), recordId: fromHex(moved.newId), idempotencyKey: row.idempotencyKey };
       after.push(() => deps.events?.resealed?.(ref, fromHex(moved.oldId)));
     } else {
       if (!kindOf(deps.policy, row.kind)) {
@@ -460,7 +476,7 @@ function sealWaitingIn(tx: Tx, deps: OutboxDeps, now: bigint, summary: Pick<Drai
       if (target.catchUpFor !== undefined) continue; // a catch-up epoch carries held records only
       const sealed = firstSealIn(tx, deps, key, row, target, now);
       target = sealed.epoch;
-      const ref: RecordRef = { localId: fromHex(key), recordId: fromHex(sealed.recordId), idempotencyKey: row.idempotencyKey };
+      const ref: RecordRef = { ...(deps.circleId ? { circleId: fromHex(deps.circleId) } : {}), localId: fromHex(key), recordId: fromHex(sealed.recordId), idempotencyKey: row.idempotencyKey };
       after.push(() => deps.events?.sealed?.(ref, row.kind, sealed.own));
     }
   }
@@ -489,14 +505,14 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
     const meta = tx.get("meta", META);
     if (!meta || meta.state !== "ACTIVE") return { kind: "none" };
     const now = deps.now();
-    const revision = currentRevision(tx);
+    const revision = currentRevision(tx, deps.scopeStream);
     // One pass: every row that is no longer sendable (its revision moved on, or its window has
     // passed) is cancelled here, in bounded batches, and the first sendable row goes out in the
     // same transaction. A backlog of dead rows costs one scan, not one transaction per row.
     const live: [string, OutboxRow][] = [];
     let cancelled = sealWaitingIn(tx, deps, now, summary, after);
     for (const [key, row] of [...tx.list("outbox")].sort(([, a], [, b]) => a.epoch - b.epoch || a.counter - b.counter)) {
-      if (row.status !== "queued" && row.status !== "inflight") continue;
+      if (!inStream(row, deps.scopeStream) || (row.status !== "queued" && row.status !== "inflight")) continue;
       if (row.status === "queued" && row.attempts === 0 && unbig(row.desiredRevision) !== revision) {
         // Sealed under a revision that moved on and never sent: held for an epoch that may carry it
         // (revision 13), never cancelled. One handed off before is retried as it is: the host may
@@ -517,6 +533,10 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
     summary.cancelled += cancelled;
     // A full batch means unchecked rows remain: finish them in the next handoff before sending.
     if (cancelled >= CANCEL_BATCH) return { kind: "skipped" };
+    if (deps.circleId) {
+      const c = tx.get("circles", deps.circleId);
+      if (!c || c.status !== "member" || !c.enabled || !c.members.includes(toHex(deps.author().identityId))) return { kind: "none" };
+    }
     const next = live.find(([, r]) => r.status === "inflight") ?? live[0];
     if (!next) return { kind: "none" };
     const [key, row] = next;
@@ -543,7 +563,7 @@ export async function recordOutcome(deps: OutboxDeps, key: string, outcome: Appe
   const after: (() => void)[] = [];
   const final = await deps.store.transaction((tx): Final => {
     const row = tx.get("outbox", key);
-    if (!row || row.status !== "inflight") return "retry";
+    if (!row || !inStream(row, deps.scopeStream) || row.status !== "inflight") return "retry";
     const id = refOf(key, row);
     const requeue = (): void => tx.put("outbox", key, { ...row, status: "queued", reason: undefined });
     const cancel = (reason: string): void => tx.put("outbox", key, terminal(row, "cancelled", reason));
@@ -585,7 +605,7 @@ export async function recordOutcome(deps: OutboxDeps, key: string, outcome: Appe
         let fate: Final = "held";
         let held = 0;
         let refreshNeeded = false;
-        const rows = tx.list("outbox").filter(([k, r]) => k === key || (r.epoch === row.epoch && r.status === "queued"));
+        const rows = tx.list("outbox").filter(([k, r]) => k === key || (inStream(r, deps.scopeStream) && r.epoch === row.epoch && r.status === "queued"));
         for (const [k, r] of rows) {
           const current = k === key ? row : r;
           const rid = refOf(k, current);
@@ -600,7 +620,7 @@ export async function recordOutcome(deps: OutboxDeps, key: string, outcome: Appe
             held++;
           }
         }
-        t3ApplyChange(tx, { kind: "audienceStale" });
+        t3ApplyChange(tx, { kind: "audienceStale" }, deps.scopeStream);
         const meta = tx.get("meta", META);
         if (meta) tx.put("meta", META, { ...meta, fullSyncDue: true });
         if (summary) summary.held += held;

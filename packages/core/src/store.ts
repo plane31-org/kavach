@@ -168,6 +168,9 @@ export type OutboxStatus = "unsealed" | "queued" | "inflight" | "held" | "accept
  * `recordId` in place. Rows from before 0.9.0 are keyed by their record id, which is their local id.
  */
 export interface OutboxRow {
+  circleId?: string;
+  /** Absent for the original author stream. */
+  scopeStream?: string;
   /** The current record id; empty while unsealed. */
   recordId: string;
   wire: string;
@@ -197,6 +200,7 @@ export interface OutboxRow {
 }
 
 export interface HistoryRow {
+  circleId?: string;
   recordId: string;
   authorIdentityId: string;
   streamId: string;
@@ -450,6 +454,7 @@ export interface Tables {
   chainProgress: ChainProgressRow;
   /** The pending join requests last read for a circle this device owns (0.9.0); absent when there are none. */
   joinRequests: { circleId: string; accountNames: string[] };
+  scopedStreams: { streamId: string; circleId: string; certificateHash: string; own: boolean };
 }
 
 export type TableName = keyof Tables;
@@ -491,7 +496,8 @@ export const RESET_TABLE_POLICY: Readonly<Record<TableName, "clear" | "keep">> =
   replacement: "clear",
   preferences: "clear",
   chainProgress: "clear",
-  joinRequests: "clear"
+  joinRequests: "clear",
+  scopedStreams: "clear"
 };
 
 /** Bounds for `Tx.range`: every given bound applies; an absent one is open. */

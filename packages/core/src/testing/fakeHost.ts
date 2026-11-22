@@ -20,7 +20,7 @@ import {
   type EpochManifest,
   type RecordKind
 } from "../codec.js";
-import { bodyHash, identityId, randomBytes, streamId as deriveStreamId, type SigningKeypair } from "../crypto.js";
+import { bodyHash, identityId, scopedStreamId, randomBytes, streamId as deriveStreamId, type SigningKeypair } from "../crypto.js";
 import type {
   AppendOutcome,
   CircleListing,
@@ -68,6 +68,8 @@ interface StoredRecord {
 }
 
 interface StreamState {
+  circleId?: string;
+  certificateHash?: string;
   authorIdentityId: string;
   accountName: string;
   currentEpoch: number;
@@ -159,6 +161,11 @@ export class FakeHost {
       for (const m of members) out.add(m);
     }
     return out;
+  }
+
+  circleMembers(circleId: string): Set<string> {
+    const c = this.circles.get(circleId);
+    return !c || c.closed ? new Set() : new Set(expectType<CircleSnapshot>(parseDocument(c.snapshot), DocumentType.CircleSnapshot).members.map(toHex));
   }
 
   accountByIdentity(iid: string): Account | undefined {
@@ -289,6 +296,16 @@ export class FakeHost {
     const current = (): boolean => caller().certificateHash === callerCert;
 
     const directory: Directory = {
+      async openScopedStream(circleId, streamId, certificateHash) {
+        const a = caller();
+        if (!current() || toHex(certificateHash) !== a.certificateHash || !host.circleMembers(toHex(circleId)).has(a.accountId)) return { status: "UNAUTHORIZED" };
+        const cert = expectType<AccountDevice>(parseDocument(a.certificate), DocumentType.AccountDevice);
+        if (!equalBytes(streamId, scopedStreamId(fromHex(a.identityId), cert.deviceId, circleId))) return { status: "UNAUTHORIZED" };
+        const existed = host.streams.has(toHex(streamId));
+        const s = host.stream(toHex(streamId), a.accountId, a.accountName);
+        s.circleId = toHex(circleId); s.certificateHash = a.certificateHash;
+        return { status: existed ? "ALREADY_COMMITTED" : "COMMITTED" };
+      },
       async resolveAccounts(names): Promise<ResolvedAccount[]> {
         return names.flatMap((n) => {
           const a = host.accounts.get(n);
@@ -576,6 +593,10 @@ export class FakeHost {
         if (!s || s.authorIdentityId !== a.accountId) return { status: "UNAUTHORIZED" as const };
         if (!current()) return { status: "UNAUTHORIZED" as const };
         const doc = expectType<EpochManifest>(parseDocument(manifest), DocumentType.EpochManifest);
+        if (s.circleId) {
+          const members = host.circleMembers(s.circleId);
+          if (s.certificateHash !== a.certificateHash || !members.has(a.accountId) || doc.audience.some(r => !members.has(toHex(r.identityId))) || !equalBytes(doc.streamId, streamId)) return { status: "UNAUTHORIZED" as const };
+        }
         const cur = s.epochs.get(s.currentEpoch);
         if (doc.epoch === s.currentEpoch && cur && equalBytes(cur.manifest, manifest)) return { status: "ALREADY_COMMITTED" as const };
         if (expectedEpoch !== s.currentEpoch || doc.epoch !== s.currentEpoch + 1) {
@@ -600,7 +621,7 @@ export class FakeHost {
           const rec = expectType<EncryptedRecord>(parseDocument(wire), DocumentType.EncryptedRecord);
           const s = host.streams.get(toHex(rec.streamId));
           if (!s || s.authorIdentityId !== a.accountId) return { status: "UNAUTHORIZED" };
-          if (!current()) return { status: "SUPERSEDED_DEVICE" };
+          if (!current() || (s.certificateHash && s.certificateHash !== a.certificateHash)) return { status: "SUPERSEDED_DEVICE" };
           const id = toHex(recordId);
           const hash = toHex(bodyHash(wire)); // exact bytes, signature included
           // Checkpoint first, then the epoch fence.
@@ -614,8 +635,8 @@ export class FakeHost {
           if (rec.epoch !== s.currentEpoch) return rec.epoch < s.currentEpoch ? { status: "EPOCH_FENCED" } : { status: "UNAUTHORIZED" };
           const epoch = s.epochs.get(rec.epoch);
           if (!epoch) return { status: "UNAUTHORIZED" };
-          if (host.audienceFence && (options?.revision ?? 0) >= 12) {
-            const shared = host.sharedWith(a.accountId);
+          if (s.circleId || (host.audienceFence && (options?.revision ?? 0) >= 12)) {
+            const shared = s.circleId ? host.circleMembers(s.circleId) : host.sharedWith(a.accountId);
             if (epoch.rows.some((r) => r.identityId !== a.accountId && !shared.has(r.identityId))) return { status: "AUDIENCE_STALE" };
           }
           const seq = ++s.tail;

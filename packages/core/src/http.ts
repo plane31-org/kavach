@@ -116,6 +116,7 @@ export function httpTransport(o: HttpTransportOptions): Transport {
     }));
 
   const directory: Directory = {
+    openScopedStream: async (circleId, streamId, certificateHash) => outcome(await call<Json>("POST", `/circles/${toHex(circleId)}/streams`, { streamId: toHex(streamId), certificateHash: toHex(certificateHash) })),
     resolveAccounts: async (names) => resolved((await call<Json[]>("GET", `/accounts?names=${names.join(",")}`)) ?? []),
     resolveIdentities: async (ids) => resolved((await call<Json[]>("GET", `/identities?ids=${ids.map(toHex).join(",")}`)) ?? []),
     getCertificate: async (hash) => {

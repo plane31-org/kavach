@@ -3,7 +3,8 @@
  * (protocol section 10, receiving; transaction T7).
  */
 import { equalBytes, fromHex, toHex } from "./bytes.js";
-import { DocumentType, expectType, parseDocument, type EncryptedRecord, type RecordKind } from "./codec.js";
+import { DocumentType, expectType, parseDocument, type EncryptedRecord, type RecordKind, type AccountDevice } from "./codec.js";
+import { scopedStreamId, identityId as keyIdentityId } from "./crypto.js";
 import { openEpoch, type AuthorView, type SelfView } from "./epoch.js";
 import { KavachError, isKavachError } from "./errors.js";
 import { authorPrefix, indexHistory, padTime, timelinePrefix, unindexHistory } from "./historyIndex.js";
@@ -18,8 +19,8 @@ export const MAX_FUTURE_SKEW_MS = 300_000n;
 export const READ_BATCH = 100;
 
 export type ReceiveResult =
-  | { readonly result: "updated"; readonly recordId: Uint8Array; readonly authorIdentityId: Uint8Array; readonly kind: RecordKind }
-  | { readonly result: "history"; readonly recordId: Uint8Array; readonly authorIdentityId: Uint8Array; readonly kind: RecordKind }
+  | { readonly result: "updated"; readonly circleId?: Uint8Array; readonly recordId: Uint8Array; readonly authorIdentityId: Uint8Array; readonly kind: RecordKind }
+  | { readonly result: "history"; readonly circleId?: Uint8Array; readonly recordId: Uint8Array; readonly authorIdentityId: Uint8Array; readonly kind: RecordKind }
   /** Verified, of a slot-only kind, and older than the slot's holder (or from a retired device): nothing kept. */
   | { readonly result: "older"; readonly recordId: Uint8Array; readonly authorIdentityId: Uint8Array; readonly kind: RecordKind }
   | { readonly result: "duplicate"; readonly recordId: Uint8Array }
@@ -50,18 +51,43 @@ export interface InboxDeps {
 // Views over the store --------------------------------------------------------------------------
 
 /** One scan of the certificates: the author the stream belongs to, every certificate of that author, and the stream's certificate generation. */
-function authorViewFor(tx: Pick<Tx, "get" | "list">, streamId: Uint8Array): { view: AuthorView; identityId: Uint8Array; generation: bigint } | undefined {
+export function authorViewFor(tx: Pick<Tx, "get" | "list">, streamId: Uint8Array): { view: AuthorView; identityId: Uint8Array; generation: bigint; circleId?: string } | undefined {
   const streamHex = toHex(streamId);
   const rows = tx.list("certificates").map(([, c]) => c);
-  const first = rows.find((c) => c.streamId === streamHex);
+  const binding = tx.get("scopedStreams", streamHex);
+  let first = binding ? rows.find(c => c.certificateHash === binding.certificateHash) : rows.find(c => c.streamId === streamHex);
+  let circleId: string | undefined = first && binding ? binding.circleId : undefined;
+  const derived = (c: (typeof rows)[number], circle: string): Uint8Array => {
+    const cert = expectType<AccountDevice>(parseDocument(fromHex(c.wire)), DocumentType.AccountDevice);
+    return scopedStreamId(keyIdentityId(cert.accountName, cert.accountKey), cert.deviceId, fromHex(circle));
+  };
+  if (!first) {
+    // Circle ids come from locally verified snapshots, never an untrusted subscription label.
+    for (const [id] of tx.list("circles")) {
+      first = rows.find(c => toHex(derived(c, id)) === streamHex);
+      if (first) { circleId = id; break; }
+    }
+  }
   if (!first) return undefined;
-  const certificates = new Map(
-    rows.filter((c) => c.identityId === first.identityId).map((c) => [c.certificateHash, { certificateHash: fromHex(c.certificateHash), signingKey: fromHex(c.signingKey), streamId: fromHex(c.streamId), current: c.current }])
-  );
-  return { view: { identityId: fromHex(first.identityId), certificates }, identityId: fromHex(first.identityId), generation: unbig(first.generation) };
+  const certificates = new Map(rows.filter(c => c.identityId === first.identityId).map(c => [c.certificateHash, {
+    certificateHash: fromHex(c.certificateHash), signingKey: fromHex(c.signingKey),
+    streamId: circleId ? derived(c, circleId) : fromHex(c.streamId), current: c.current
+  }]));
+  return { view: { identityId: fromHex(first.identityId), certificates }, identityId: fromHex(first.identityId), generation: unbig(first.generation), ...(circleId ? { circleId } : {}) };
 }
 
-function isAuthorized(tx: Pick<Tx, "get" | "list">, authorIdentityId: Uint8Array, self: Uint8Array): boolean {
+/** Cache only a binding recomputed from locally verified certificates/circles, never host labels. */
+function cacheScopedBinding(tx: Tx, streamId: Uint8Array, author: NonNullable<ReturnType<typeof authorViewFor>>): void {
+  if (!author.circleId || tx.get("scopedStreams", toHex(streamId))) return;
+  const cert = [...author.view.certificates.values()].find(c => equalBytes(c.streamId, streamId));
+  if (cert) tx.put("scopedStreams", toHex(streamId), { streamId: toHex(streamId), circleId: author.circleId, certificateHash: toHex(cert.certificateHash), own: false });
+}
+
+function isAuthorized(tx: Pick<Tx, "get" | "list">, authorIdentityId: Uint8Array, self: Uint8Array, circleId?: string): boolean {
+  if (circleId) {
+    const c = tx.get("circles", circleId);
+    return !!c && c.status === "member" && c.members.includes(toHex(self)) && c.members.includes(toHex(authorIdentityId));
+  }
   if (equalBytes(authorIdentityId, self)) return true;
   const hex = toHex(authorIdentityId);
   return tx.list("circles").some(([, c]) => c.status === "member" && c.members.includes(hex));
@@ -86,6 +112,7 @@ async function fetchEpochKey(deps: InboxDeps, streamId: Uint8Array, epoch: numbe
   return deps.store.transaction((tx) => {
     const author = authorViewFor(tx, streamId);
     if (!author) return false;
+    cacheScopedBinding(tx, streamId, author);
     const opened = openEpoch(bundle.manifest, author.view, self, wrap); // throws the section 8 codes
     tx.put("readerEpochs", `${toHex(streamId)}:${epoch}`, {
       streamId: toHex(streamId),
@@ -112,7 +139,8 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   if (parsed.sentAt > now + MAX_FUTURE_SKEW_MS) return { result: "expired", reason: "CLOCK_SKEW" };
   const author = authorViewFor(tx, parsed.streamId);
   if (!author) return { result: "invalid", reason: "NOT_AUTHORIZED" };
-  if (!isAuthorized(tx, author.identityId, self.identityId)) return { result: "invalid", reason: "NOT_AUTHORIZED" };
+  if (!isAuthorized(tx, author.identityId, self.identityId, author.circleId)) return { result: "invalid", reason: "NOT_AUTHORIZED" };
+  cacheScopedBinding(tx, parsed.streamId, author);
   let opened;
   try {
     opened = openParsedRecord(parsed, author.view, (s, e) => epochKeyFor(tx, s, e));
@@ -126,8 +154,9 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   const cert = [...author.view.certificates.values()].find((c) => equalBytes(c.streamId, parsed.streamId));
   const generation = author.generation;
   const kind = opened.kind;
-  const base = { recordId: opened.recordId, authorIdentityId: author.identityId, kind };
+  const base = { ...(author.circleId ? { circleId: fromHex(author.circleId) } : {}), recordId: opened.recordId, authorIdentityId: author.identityId, kind };
   const declared = kindOf(deps.policy, kind);
+  if (declared && (declared.scope === "circle") !== (author.circleId !== undefined)) return { result: "invalid", reason: "NOT_AUTHORIZED" };
   const authorHex = toHex(author.identityId);
   if (!declared) {
     // The record authenticated and opened, so it is an authorized author's; an undeclared kind
@@ -136,7 +165,7 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
     // second body under an id this reader retains is the author speaking twice whatever kind the
     // second claims, so it is still EQUIVOCATION (the reverse order, undeclared first, leaves
     // nothing retained to compare against and is not detected).
-    const retained = tx.get("history", id) ?? deps.policy.kinds.map((k) => tx.get("newest", slotKey(authorHex, k.kind))).find((row) => row?.recordId === id);
+    const retained = tx.get("history", id) ?? deps.policy.kinds.map((k) => tx.get("newest", slotKey(authorHex, k.kind, author.circleId))).find((row) => row?.recordId === id);
     if (retained) return retained.bodyHash === hash ? { result: "duplicate", recordId: opened.recordId } : { result: "invalid", reason: "EQUIVOCATION" };
     return { result: "unknownKind", ...base };
   }
@@ -145,13 +174,13 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   if (!declared.history) {
     // A slot-only kind is the author's current state, not an event: one row per author, the newest
     // from the current device wins. An older or superseded one changes nothing.
-    const current = tx.get("newest", slotKey(authorHex, kind));
+    const current = tx.get("newest", slotKey(authorHex, kind, author.circleId));
     if (current?.recordId === id) {
       if (current.bodyHash === hash) return { result: "duplicate", recordId: opened.recordId };
       return { result: "invalid", reason: "EQUIVOCATION" };
     }
     if (!fromCurrentDevice) return { result: "older", ...base };
-    return takeSlot(tx, authorHex, kind, candidate, toHex) ? { result: "updated", ...base } : { result: "older", ...base };
+    return takeSlot(tx, authorHex, kind, candidate, toHex, author.circleId) ? { result: "updated", ...base } : { result: "older", ...base };
   }
   const existing = tx.get("history", id);
   if (existing) {
@@ -159,6 +188,7 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
     return { result: "invalid", reason: "EQUIVOCATION" };
   }
   const row: HistoryRow = {
+    ...(author.circleId ? { circleId: author.circleId } : {}),
     recordId: id,
     authorIdentityId: toHex(author.identityId),
     streamId: toHex(parsed.streamId),
@@ -177,7 +207,7 @@ function storeRecord(tx: Tx, deps: InboxDeps, wire: Uint8Array, now: bigint): Re
   tx.put("history", id, row);
   indexHistory(tx, row);
   // A kind with a slot is news when it takes the slot; a kind without one is news every time.
-  const took = declared.newest && fromCurrentDevice ? takeSlot(tx, authorHex, kind, candidate, toHex) : false;
+  const took = declared.newest && fromCurrentDevice ? takeSlot(tx, authorHex, kind, candidate, toHex, author.circleId) : false;
   return took || !declared.newest ? { result: "updated", ...base } : { result: "history", ...base };
 }
 
@@ -385,6 +415,7 @@ async function processPage(deps: InboxDeps, streamId: Uint8Array, authorIdentity
 // Reads ------------------------------------------------------------------------------------------------
 
 export interface HistoryEntry {
+  readonly circleId?: Uint8Array;
   readonly recordId: Uint8Array;
   readonly authorIdentityId: Uint8Array;
   readonly kind: RecordKind;
@@ -404,6 +435,7 @@ export interface HistoryEntry {
  * records arrive or expire.
  */
 export interface HistoryQuery {
+  readonly circleId?: Uint8Array;
   readonly authorIdentityId?: Uint8Array;
   readonly kind?: RecordKind;
   readonly since?: bigint;
@@ -425,6 +457,7 @@ export const HISTORY_PAGE = 1000;
 
 function toEntry(r: HistoryRow): HistoryEntry {
   return {
+    ...(r.circleId ? { circleId: fromHex(r.circleId) } : {}),
     recordId: fromHex(r.recordId),
     authorIdentityId: fromHex(r.authorIdentityId),
     kind: r.kind,
@@ -446,7 +479,8 @@ export async function historyPage(store: Store, policy: RetentionPolicy, q: Hist
   if (limit === 0 || kinds.length === 0) return { entries: [], cursor: undefined };
   return store.read((tx) => {
     const scans = kinds.map((kind) => {
-      const prefix = q.authorIdentityId ? authorPrefix(toHex(q.authorIdentityId), kind) : timelinePrefix(kind);
+      const base = q.authorIdentityId ? authorPrefix(toHex(q.authorIdentityId), kind) : timelinePrefix(kind);
+      const prefix = q.circleId ? `c:${toHex(q.circleId)}:${base}` : base;
       // Bounds in tuple space, prefixed into key space: the lower end from `since` and an
       // ascending cursor, the upper end from `before` and a descending cursor, the tighter winning.
       const upper = [q.before === undefined ? undefined : padTime(q.before), reverse ? q.cursor : undefined].filter((b): b is string => b !== undefined).sort()[0];
@@ -476,7 +510,7 @@ export async function history(store: Store, policy: RetentionPolicy, q: HistoryQ
 }
 
 /** The newest history entry matching the filters, read as a one-entry descending page. */
-export async function newest(store: Store, policy: RetentionPolicy, q: Pick<HistoryQuery, "authorIdentityId" | "kind"> = {}): Promise<HistoryEntry | undefined> {
+export async function newest(store: Store, policy: RetentionPolicy, q: Pick<HistoryQuery, "authorIdentityId" | "kind" | "circleId"> = {}): Promise<HistoryEntry | undefined> {
   return (await historyPage(store, policy, { ...q, order: "desc", limit: 1 })).entries[0];
 }
 
@@ -515,9 +549,9 @@ export interface Newest {
 }
 
 /** The newest slot of an author and kind, or `undefined` when there is none or its payload expired (the slot stays, the payload is gone). */
-export async function newestSlot(store: Store, authorIdentityId: Uint8Array, kind: number, now: bigint): Promise<Newest | undefined> {
+export async function newestSlot(store: Store, authorIdentityId: Uint8Array, kind: number, now: bigint, circleId?: Uint8Array): Promise<Newest | undefined> {
   return store.read((tx) => {
-    const row = tx.get("newest", slotKey(toHex(authorIdentityId), kind));
+    const row = tx.get("newest", slotKey(toHex(authorIdentityId), kind, circleId ? toHex(circleId) : undefined));
     if (!row || row.payload === null) return undefined;
     return { recordId: fromHex(row.recordId), kind, payload: fromHex(row.payload), sentAt: unbig(row.sentAt), eventTime: unbig(row.eventTime), ageMs: now - unbig(row.sentAt) };
   });
@@ -537,7 +571,7 @@ export async function ensureSlots(store: Store, policy: RetentionPolicy): Promis
     for (const [, r] of tx.list("history")) {
       if (r.superseded || !kindOf(policy, r.kind)?.newest) continue;
       const payload = fromHex(r.plaintext);
-      takeSlot(tx, r.authorIdentityId, r.kind, { generation: unbig(r.generation), eventTime: clampEventTime(r.eventTime === undefined ? undefined : unbig(r.eventTime), unbig(r.sentAt)), epoch: r.epoch, counter: r.counter, recordId: r.recordId, bodyHash: r.bodyHash ?? "", sentAt: unbig(r.sentAt), receivedAt: unbig(r.receivedAt), payload }, toHex);
+      takeSlot(tx, r.authorIdentityId, r.kind, { generation: unbig(r.generation), eventTime: clampEventTime(r.eventTime === undefined ? undefined : unbig(r.eventTime), unbig(r.sentAt)), epoch: r.epoch, counter: r.counter, recordId: r.recordId, bodyHash: r.bodyHash ?? "", sentAt: unbig(r.sentAt), receivedAt: unbig(r.receivedAt), payload }, toHex, r.circleId);
     }
     tx.put("meta", "meta", { ...meta, newest: 1 });
     return true;

@@ -72,3 +72,11 @@ pnpm typecheck && pnpm lint && pnpm test
 ```
 
 The test suite runs under both cipher-suite backends and against the frozen conformance vectors. Apache-2.0.
+
+### Circle-scoped records (revision 14)
+
+Declare `scope: "circle"` on a kind, then pass `{ circleId }` to `enqueue` and `newest`. Author scope remains the default. `historyPage({ circleId })` filters that circle; unfiltered history merges circles and scoped rows/events carry `circleId`. Local IDs, idempotency keys and queue limits stay account-wide; latest-wins replacement is isolated by stream.
+
+A scoped record is readable only by its circle's eligible audience. The boundary is **first sealing**: sealed backlog excludes later joiners; a record waiting unsealed uses the audience when it is first sealed. Disable/leave suspends sending without resetting stream counters; local history retains its normal lifetime. This is private delivery, not automatic saved-state transfer to new members.
+
+Hosts implement `Directory.openScopedStream`; the HTTP adapter uses `POST /circles/{circleId}/streams`. Ship host support, then revision-14 readers, then enable scoped senders. No additional package is required.

@@ -4,15 +4,15 @@
  * corresponding durable transition.
  */
 import { equalBytes, fromHex, toHex } from "./bytes.js";
-import { resolveAudience, restrictAudience, type ResolvedAudience } from "./audience.js";
+import { resolveAudience, restrictAudience, isEligible, type ResolvedAudience } from "./audience.js";
 import { acceptSnapshot, checkMemberResolution, createCircleSnapshot, newCircleId, pinCircle, successorSnapshot, type CircleState } from "./circle.js";
 import { DocumentType, buildCircleSnapshot, expectType, parseDocument, parseVaultHeader, verifyDocument, type AccountDevice, type AccountSuccession, type RecordKind } from "./codec.js";
-import { randomBytes, ready, type BoxKeypair } from "./crypto.js";
+import { randomBytes, ready, scopedStreamId, type BoxKeypair } from "./crypto.js";
 import { MAX_COUNTER, prepareEpoch, resolvePublish, type PreparedEpoch } from "./epoch.js";
 import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { ensureHistoryIndex } from "./historyIndex.js";
-import { ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, purgeHistory, receive as receiveRecord, streamNeedsRead, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
+import { authorViewFor, ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, purgeHistory, receive as receiveRecord, streamNeedsRead, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
 import { catchUpBusy, drain, enqueue, outboxCountIn, outboxCounts, purgeOutbox, recipientsOf, refOf, sealWaiting, type DrainSummary, type EnqueueOptions, type OutboxCounts, type RecordRef } from "./outbox.js";
 export type { EnqueueOptions } from "./outbox.js";
 
@@ -49,7 +49,7 @@ import { acceptsSuccession, allowsContinuity, kindOf, validatePolicy, type Repla
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
 import type { BootstrapRetryRow, CircleRow, MetaRow, PendingResetRow, ReplacementRow, RevisionRow, SecretStore, Store, Tx, VaultRow } from "./store.js";
-import { META, REVISION, STREAM, VAULT, openStore, packPendingRoots, type PendingRoots, t1Activate, t1Header, t1Secrets, t10FinishReset, t10PrepareReset, t11ActivateReplacement, t11PrepareReplacement, t2PrepareActivation, t3ApplyChange, t3Circle, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault, unpackPendingRoots } from "./transactions.js";
+import { META, REVISION, STREAM, VAULT, epochKey, streamKey, revisionKey, inStream, openStore, packPendingRoots, type PendingRoots, t1Activate, t1Header, t1Secrets, t10FinishReset, t10PrepareReset, t11ActivateReplacement, t11PrepareReplacement, t2PrepareActivation, t3ApplyChange, t3Circle, t4PersistPrepared, t5Committed, t8OwnerSnapshot, t9MarkVault, t9Vault, unpackPendingRoots } from "./transactions.js";
 import { applySuccession, authenticateSuccession, pinnedState, recordChainIn, rootIdentityIn, rootState, sameTransition, transitionOf, validateTransition, verifyChain, type SuccessionEffect, type VerifiedLink } from "./succession.js";
 import type { CircleListing, Directory, Relay, ResolvedAccount, SuccessionLink, Transport } from "./transport.js";
 import { buildVault, encodeRecoveryCode, newRecoveryKey, openVault, recoverAccount, removeEntry, upsertEntry, type ProviderStatusResult, type RecoveryProvider, type VaultEntry } from "./vault.js";
@@ -144,11 +144,11 @@ export type ClientEvent =
   /** After a rotation, or when a sent record's acceptance is in doubt: the app may resend its current state of each kind with a slot. */
   | { kind: "refresh"; reason: string }
   /** Lifecycle events name the record by `localId`, which never changes, with its record id when it has one and its idempotency key when it was given. */
-  | { kind: "cancelled"; localId: Uint8Array; recordId: Uint8Array | undefined; idempotencyKey: string | undefined; reason: string }
-  | { kind: "queued"; localId: Uint8Array; recordId: Uint8Array | undefined; idempotencyKey: string | undefined; recordKind: RecordKind }
-  | { kind: "accepted"; localId: Uint8Array; recordId: Uint8Array; idempotencyKey: string | undefined }
+  | { kind: "cancelled"; circleId?: Uint8Array; localId: Uint8Array; recordId: Uint8Array | undefined; idempotencyKey: string | undefined; reason: string }
+  | { kind: "queued"; circleId?: Uint8Array; localId: Uint8Array; recordId: Uint8Array | undefined; idempotencyKey: string | undefined; recordKind: RecordKind }
+  | { kind: "accepted"; circleId?: Uint8Array; localId: Uint8Array; recordId: Uint8Array; idempotencyKey: string | undefined }
   /** A record was stored, received or the device's own; `tookSlot` when it became the author's newest of its kind. */
-  | { kind: "recordStored"; recordKind: RecordKind; authorIdentityId: Uint8Array; recordId: Uint8Array; tookSlot: boolean }
+  | { kind: "recordStored"; circleId?: Uint8Array; recordKind: RecordKind; authorIdentityId: Uint8Array; recordId: Uint8Array; tookSlot: boolean }
   | { kind: "waiting"; identityId: Uint8Array }
   /** The pending join requests of a circle this device owns, whenever a full sync finds them changed, including to none. */
   | { kind: "joinRequests"; circleId: Uint8Array; accountNames: readonly string[] }
@@ -160,7 +160,7 @@ export type ClientEvent =
   /** Revision 12: the host refused records as AUDIENCE_STALE. They are held, not cancelled; the next sync runs full, rotates and reseals them. */
   | { kind: "audienceStale"; held: number }
   /** Revision 12: a held record was sealed again under a new epoch, with a new record id; its `localId` is unchanged. */
-  | { kind: "resealed"; localId: Uint8Array; recordId: Uint8Array; newRecordId: Uint8Array; idempotencyKey: string | undefined }
+  | { kind: "resealed"; circleId?: Uint8Array; localId: Uint8Array; recordId: Uint8Array; newRecordId: Uint8Array; idempotencyKey: string | undefined }
   | { kind: "stateChanged"; state: ClientState };
 
 export interface OpenOptions {
@@ -234,9 +234,9 @@ export interface Client {
   /** One page of history in time order with a cursor for the next; served from the index. */
   historyPage(query?: HistoryQuery): Promise<HistoryPage>;
   /** The newest history entry for an author or kind, own records and superseded ones included. */
-  newestEntry(query?: Pick<HistoryQuery, "authorIdentityId" | "kind">): Promise<HistoryEntry | undefined>;
+  newestEntry(query?: Pick<HistoryQuery, "authorIdentityId" | "kind" | "circleId">): Promise<HistoryEntry | undefined>;
   /** The newest record of a kind from an author's current device, self included; `undefined` when none or expired. */
-  newest(identityId: Uint8Array, kind: RecordKind): Promise<Newest | undefined>;
+  newest(identityId: Uint8Array, kind: RecordKind, options?: { circleId?: Uint8Array }): Promise<Newest | undefined>;
   inspect(): Promise<Inspection>;
   readonly circles: {
     create(): Promise<{ circleId: Uint8Array }>;
@@ -698,26 +698,27 @@ class ClientImpl implements Client {
     return { identityId: pin.accountId, certificateHash: pin.certificateHash, box: device.box };
   }
 
-  private outboxDeps() {
+  private outboxDeps(circleId?: Uint8Array) {
     const { device, pin } = this.requireAccount("outbox");
     return {
+      ...(circleId ? { circleId: toHex(circleId), scopeStream: this.sendingScope(circleId) as string } : {}),
       store: this.store,
       relay: this.transport.relay,
       policy: this.policy,
       now: this.now,
-      author: () => ({ streamId: pin.streamId, signingSecretKey: device.signing.secretKey, generation: pin.generation, identityId: pin.accountId }),
+      author: () => ({ streamId: circleId ? scopedStreamId(pin.identityId, device.deviceId, circleId) : pin.streamId, signingSecretKey: device.signing.secretKey, generation: pin.generation, identityId: pin.accountId }),
       events: {
-        queued: (r: RecordRef, recordKind: RecordKind) => this.emit({ kind: "queued", localId: r.localId, recordId: r.recordId, idempotencyKey: r.idempotencyKey, recordKind }),
+        queued: (r: RecordRef, recordKind: RecordKind) => this.emit({ kind: "queued", ...(r.circleId ? { circleId: r.circleId } : {}), localId: r.localId, recordId: r.recordId, idempotencyKey: r.idempotencyKey, recordKind }),
         sealed: (r: RecordRef, recordKind: RecordKind, tookSlot: boolean) => {
           // The device's own record is stored like any author's, so one subscription covers self and others.
-          if (r.recordId && this.selfPin) this.emit({ kind: "recordStored", recordKind, authorIdentityId: this.selfPin.accountId, recordId: r.recordId, tookSlot });
+          if (r.recordId && this.selfPin) this.emit({ kind: "recordStored", ...(r.circleId ? { circleId: r.circleId } : {}), recordKind, authorIdentityId: this.selfPin.accountId, recordId: r.recordId, tookSlot });
         },
-        accepted: (r: RecordRef) => this.emit({ kind: "accepted", localId: r.localId, recordId: r.recordId ?? new Uint8Array(), idempotencyKey: r.idempotencyKey }),
-        cancelled: (r: RecordRef, reason: string) => this.emit({ kind: "cancelled", localId: r.localId, recordId: r.recordId, idempotencyKey: r.idempotencyKey, reason }),
+        accepted: (r: RecordRef) => this.emit({ kind: "accepted", ...(r.circleId ? { circleId: r.circleId } : {}), localId: r.localId, recordId: r.recordId ?? new Uint8Array(), idempotencyKey: r.idempotencyKey }),
+        cancelled: (r: RecordRef, reason: string) => this.emit({ kind: "cancelled", ...(r.circleId ? { circleId: r.circleId } : {}), localId: r.localId, recordId: r.recordId, idempotencyKey: r.idempotencyKey, reason }),
         refresh: (reason: string) => this.emit({ kind: "refresh", reason }),
         securityError: (code: string, detail: string) => this.emit({ kind: "securityError", code, detail }),
         audienceStale: (held: number) => this.emit({ kind: "audienceStale", held }),
-        resealed: (r: RecordRef, oldRecordId: Uint8Array) => this.emit({ kind: "resealed", localId: r.localId, recordId: oldRecordId, newRecordId: r.recordId ?? new Uint8Array(), idempotencyKey: r.idempotencyKey })
+        resealed: (r: RecordRef, oldRecordId: Uint8Array) => this.emit({ kind: "resealed", ...(r.circleId ? { circleId: r.circleId } : {}), localId: r.localId, recordId: oldRecordId, newRecordId: r.recordId ?? new Uint8Array(), idempotencyKey: r.idempotencyKey })
       }
     };
   }
@@ -731,7 +732,7 @@ class ClientImpl implements Client {
       self: () => this.selfView(),
       events: {
         received: (r: ReceiveResult) => {
-          if (r.result === "updated" || r.result === "history") this.emit({ kind: "recordStored", recordKind: r.kind, authorIdentityId: r.authorIdentityId, recordId: r.recordId, tookSlot: r.result === "updated" && (kindOf(this.policy, r.kind)?.newest ?? false) });
+          if (r.result === "updated" || r.result === "history") this.emit({ kind: "recordStored", ...(r.circleId ? { circleId: r.circleId } : {}), recordKind: r.kind, authorIdentityId: r.authorIdentityId, recordId: r.recordId, tookSlot: r.result === "updated" && (kindOf(this.policy, r.kind)?.newest ?? false) });
         },
         waiting: (identityId: Uint8Array) => this.emit({ kind: "waiting", identityId }),
         unknownKind: (recordKind: RecordKind, authorIdentityId: Uint8Array) => this.emit({ kind: "unknownKind", recordKind, authorIdentityId }),
@@ -1043,7 +1044,9 @@ class ClientImpl implements Client {
   // Sending ---------------------------------------------------------------------------------------
 
   private async enqueueNow(kind: RecordKind, payload: Uint8Array, options: EnqueueOptions): Promise<EnqueueResult> {
-    const deps = this.outboxDeps();
+    const circleId = options.circleId;
+    this.checkScope(kind, circleId);
+    const deps = this.outboxDeps(circleId);
     // A key answered before anything that may need the network: the record it names is already
     // durable, so a retry offline, or with a rotation due, returns it. The outbox checks the key
     // again inside its transaction for calls that race.
@@ -1051,11 +1054,12 @@ class ClientImpl implements Client {
       const seen = await this.store.read((tx) => tx.get("enqueueKeys", options.idempotencyKey ?? ""));
       if (seen) return seen.recordId ? { localId: fromHex(seen.localId ?? seen.recordId), recordId: fromHex(seen.recordId), duplicate: true } : { localId: fromHex(seen.localId ?? ""), duplicate: true };
     }
+    if (circleId) await this.initializeScopedStream(circleId);
     // An epoch is prepared when one is due and the host can be reached; when it cannot (offline,
     // metadata missing, an AUDIENCE_STALE fence), the record is queued unsealed and sealed by the
     // next sync, so a hand-over never fails for a rotation the device cannot do right now.
     try {
-      await this.ensureEpoch();
+      await this.ensureEpoch(circleId);
     } catch (e) {
       if (!(e instanceof KavachError) || !e.retryable) throw e;
     }
@@ -1065,7 +1069,7 @@ class ClientImpl implements Client {
     // Queued unsealed: if the device can rotate now (a hygiene rotation was due, say), it does, and
     // the record is sealed before this call returns; offline or fenced, it waits for the next sync.
     try {
-      await this.ensureEpoch();
+      await this.ensureEpoch(circleId);
       await sealWaiting(deps);
     } catch (e) {
       if (!(e instanceof KavachError) || !e.retryable) throw e;
@@ -1076,7 +1080,33 @@ class ClientImpl implements Client {
 
   // Epochs ----------------------------------------------------------------------------------------
 
-  private async currentAudience(): Promise<ResolvedAudience> {
+  private checkScope(kind: RecordKind, circleId?: Uint8Array): void {
+    const declaration = kindOf(this.policy, kind);
+    if (!declaration) throw new KavachError("MALFORMED", "scope", "kind not declared");
+    if ((declaration.scope === "circle") !== (circleId !== undefined) || (circleId !== undefined && circleId.length !== 16)) throw new KavachError("MALFORMED", "scope", "circleId is required only for a circle-scoped kind and must be 16 bytes");
+  }
+
+  private sendingScope(circleId?: Uint8Array): string | undefined {
+    if (!circleId) return undefined;
+    const { pin, device } = this.requireAccount("scope");
+    return toHex(scopedStreamId(pin.identityId, device.deviceId, circleId));
+  }
+
+  private async initializeScopedStream(circleId: Uint8Array): Promise<void> {
+    if (!this.transport.directory.openScopedStream) throw new KavachError("UNSUPPORTED_OPERATION", "scope", "transport has no openScopedStream");
+    const { pin } = this.requireAccount("scope");
+    const scope = this.sendingScope(circleId) as string;
+    await this.store.transaction(tx => {
+      const c = tx.get("circles", toHex(circleId));
+      if (!c || !isEligible(rowToCircle(c), pin.accountId)) throw new KavachError("NOT_AUTHORIZED", "scope", "circle is not enabled for sharing");
+      if (tx.get("scopedStreams", scope)) return;
+      tx.put("scopedStreams", scope, { streamId: scope, circleId: toHex(circleId), certificateHash: toHex(pin.certificateHash), own: true });
+      tx.put("stream", scope, { highestCommittedEpoch: 0, activeEpoch: undefined, pendingEpoch: undefined });
+      tx.put("revision", scope, { desiredRevision: "1", seenSnapshots: {}, seenCertificates: {}, paused: "rotation" });
+    });
+  }
+
+  private async currentAudience(circleId?: Uint8Array): Promise<ResolvedAudience> {
     const { pin } = this.requireAccount("audience");
     const retired = new Set(this.trust.state.retired);
     return this.store.read((tx) => {
@@ -1085,7 +1115,8 @@ class ClientImpl implements Client {
       const pins = new Map(tx.list("pins").map(([k, p]) => [k, rowToPin(p)]));
       // An account whose chain this device has not finished verifying is out of every audience until it has.
       for (const [, p] of tx.list("chainProgress")) if (!p.complete) pins.delete(p.accountId);
-      const circles = tx.list("circles").map(([, c]) => rowToCircle(c));
+      const circles = tx.list("circles").filter(([, c]) => !circleId || c.circleId === toHex(circleId)).map(([, c]) => rowToCircle(c));
+      if (circleId && (circles.length !== 1 || (!circles[0] || !isEligible(circles[0], pin.accountId)))) throw new KavachError("METADATA_REQUIRED", "audience", "circle is not enabled for sharing");
       return resolveAudience(pin, circles, pins, retired);
     });
   }
@@ -1095,12 +1126,13 @@ class ClientImpl implements Client {
    * whose recipients do not include everyone in the current audience. Its records go out under an
    * epoch addressed to the current audience minus anyone added since, so a joiner never reads them.
    */
-  private async catchUpTarget(audience: ResolvedAudience): Promise<{ audience: ResolvedAudience; forEpoch: number } | undefined> {
+  private async catchUpTarget(audience: ResolvedAudience, circleId?: Uint8Array): Promise<{ audience: ResolvedAudience; forEpoch: number } | undefined> {
+    const scope = this.sendingScope(circleId);
     return this.store.read((tx) => {
       const epochs = new Set<number>();
-      for (const [, r] of tx.list("outbox")) if (r.status === "held" && r.payload !== undefined) epochs.add(r.heldEpoch ?? r.epoch);
+      for (const [, r] of tx.list("outbox")) if (inStream(r, scope) && r.status === "held" && r.payload !== undefined) epochs.add(r.heldEpoch ?? r.epoch);
       for (const e of [...epochs].sort((a, b) => a - b)) {
-        const before = recipientsOf(tx.get("epochs", String(e)));
+        const before = recipientsOf(tx.get("epochs", epochKey(e, scope)));
         if (audience.rows.every((r) => before.has(toHex(r.identityId)))) continue; // the next full epoch can carry them
         return { audience: restrictAudience(audience, before), forEpoch: e };
       }
@@ -1112,12 +1144,13 @@ class ClientImpl implements Client {
    * The held epoch whose records need a catch-up epoch under the current audience, if any; the
    * audience unresolved (metadata missing, the limit) answers none, and the caller pauses as before.
    */
-  private async heldNeedCatchUp(): Promise<number | undefined> {
-    const held = await this.store.read((tx) => tx.list("outbox").some(([, r]) => r.status === "held" && r.payload !== undefined));
+  private async heldNeedCatchUp(circleId?: Uint8Array): Promise<number | undefined> {
+    const scope = this.sendingScope(circleId);
+    const held = await this.store.read((tx) => tx.list("outbox").some(([, r]) => inStream(r, scope) && r.status === "held" && r.payload !== undefined));
     if (!held) return undefined;
     if ((await this.store.read((tx) => tx.get("meta", META)))?.fullSyncDue) return undefined;
     try {
-      return (await this.catchUpTarget(await this.currentAudience()))?.forEpoch;
+      return (await this.catchUpTarget(await this.currentAudience(circleId), circleId))?.forEpoch;
     } catch (e) {
       if (isKavachError(e, "METADATA_REQUIRED") || isKavachError(e, "RECIPIENT_LIMIT")) return undefined;
       throw e;
@@ -1125,42 +1158,44 @@ class ClientImpl implements Client {
   }
 
   /** Whether the outbox waits on epoch work: an active catch-up epoch, or held records that need one. */
-  private async epochWorkPending(): Promise<boolean> {
+  private async epochWorkPending(circleId?: Uint8Array): Promise<boolean> {
+    const scope = this.sendingScope(circleId);
     const catchUp = await this.store.read((tx) => {
-      const st = tx.get("stream", STREAM);
-      return st?.activeEpoch === undefined ? false : tx.get("epochs", String(st.activeEpoch))?.catchUpFor !== undefined;
+      const st = tx.get("stream", streamKey(scope));
+      return st?.activeEpoch === undefined ? false : tx.get("epochs", epochKey(st.activeEpoch, scope))?.catchUpFor !== undefined;
     });
-    return catchUp || (await this.heldNeedCatchUp()) !== undefined;
+    return catchUp || (await this.heldNeedCatchUp(circleId)) !== undefined;
   }
 
   /** Prepare, publish and promote epochs until one is active under the current revision. */
-  private async ensureEpoch(): Promise<SyncReport["epoch"]> {
+  private async ensureEpoch(circleId?: Uint8Array): Promise<SyncReport["epoch"]> {
+    const scope = this.sendingScope(circleId);
     const { device, pin } = this.requireAccount("epoch");
     for (let attempt = 0; attempt < 4; attempt++) {
-      const stream = await this.store.read((tx) => tx.get("stream", STREAM));
-      const revisionRow = await this.store.read((tx) => tx.get("revision", REVISION));
+      const stream = await this.store.read((tx) => tx.get("stream", streamKey(scope)));
+      const revisionRow = await this.store.read((tx) => tx.get("revision", revisionKey(scope)));
       if (!stream) throw new KavachError("RECOVERY_REQUIRED", "epoch");
       if (stream.activeEpoch !== undefined && revisionRow?.paused !== "rotation") {
         // The one place that decides whether the active epoch may stay. It is retired (T3) and
         // replaced when its counter is spent, when it is a catch-up epoch whose records are out, or
         // when held records need a catch-up epoch it is not (revision 13): a record fenced after a
         // joiner's epoch went live, say, which that epoch must never carry.
-        const needs = await this.heldNeedCatchUp();
+        const needs = await this.heldNeedCatchUp(circleId);
         const spent = await this.store.transaction((tx) => {
-          const st = tx.get("stream", STREAM);
-          const active = st?.activeEpoch === undefined ? undefined : tx.get("epochs", String(st.activeEpoch));
+          const st = tx.get("stream", streamKey(scope));
+          const active = st?.activeEpoch === undefined ? undefined : tx.get("epochs", epochKey(st.activeEpoch, scope));
           if (!active || active.status !== "active") return false;
           if (active.nextCounter > MAX_COUNTER) {
-            t3ApplyChange(tx, { kind: "counterExhausted" });
+            t3ApplyChange(tx, { kind: "counterExhausted" }, scope);
             return true;
           }
           // A catch-up epoch whose records are out is retired: the next one addresses everyone.
-          if (active.catchUpFor !== undefined && !catchUpBusy(tx, active)) {
-            t3ApplyChange(tx, { kind: "catchUp" });
+          if (active.catchUpFor !== undefined && !catchUpBusy(tx, active, scope)) {
+            t3ApplyChange(tx, { kind: "catchUp" }, scope);
             return true;
           }
           if (needs !== undefined && active.catchUpFor !== needs) {
-            t3ApplyChange(tx, { kind: "catchUp" });
+            t3ApplyChange(tx, { kind: "catchUp" }, scope);
             return true;
           }
           return false;
@@ -1174,17 +1209,24 @@ class ClientImpl implements Client {
       if ((await this.store.read((tx) => tx.get("meta", META)))?.fullSyncDue) return "paused";
       let audience: ResolvedAudience;
       try {
-        audience = await this.currentAudience();
+        audience = await this.currentAudience(circleId);
       } catch (e) {
         if (isKavachError(e, "METADATA_REQUIRED") || isKavachError(e, "RECIPIENT_LIMIT")) {
           const reason = e.code === "METADATA_REQUIRED" ? "metadata" : "limit";
           await this.store.transaction((tx) => {
-            const r = tx.get("revision", REVISION);
-            if (r) tx.put("revision", REVISION, { ...r, paused: reason });
+            const r = tx.get("revision", revisionKey(scope));
+            if (r) tx.put("revision", revisionKey(scope), { ...r, paused: reason });
           });
           return "paused";
         }
         throw e;
+      }
+      if (circleId && scope) {
+        const register = this.transport.directory.openScopedStream;
+        if (!register) throw new KavachError("UNSUPPORTED_OPERATION", "scope", "transport has no openScopedStream");
+        const result = await register.call(this.transport.directory, circleId, fromHex(scope), pin.certificateHash);
+        if (result.status === "RETRYABLE") return "pending";
+        if (result.status !== "COMMITTED" && result.status !== "ALREADY_COMMITTED") throw new KavachError("NOT_AUTHORIZED", "scope", "scoped stream registration refused");
       }
       let prepared: PreparedEpoch;
       // The audience the epoch is for: the whole current one, or for a catch-up epoch the current
@@ -1192,23 +1234,24 @@ class ClientImpl implements Client {
       let target = audience;
       let catchUpFor: number | undefined;
       if (stream.pendingEpoch !== undefined) {
-        const row = await this.store.read((tx) => tx.get("epochs", String(stream.pendingEpoch)));
+        const pendingEpoch = stream.pendingEpoch;
+        const row = await this.store.read((tx) => tx.get("epochs", epochKey(pendingEpoch, scope)));
         if (!row) throw new KavachError("STORAGE_FAILURE", "epoch", "pending epoch row missing");
         prepared = rowToPrepared(row);
         if (row.catchUpFor !== undefined) {
           catchUpFor = row.catchUpFor;
           const forEpoch = row.catchUpFor;
-          target = restrictAudience(audience, await this.store.read((tx) => recipientsOf(tx.get("epochs", String(forEpoch)))));
+          target = restrictAudience(audience, await this.store.read((tx) => recipientsOf(tx.get("epochs", epochKey(forEpoch, scope)))));
         }
       } else {
-        const catchUp = await this.catchUpTarget(audience);
+        const catchUp = await this.catchUpTarget(audience, circleId);
         if (catchUp) {
           target = catchUp.audience;
           catchUpFor = catchUp.forEpoch;
         }
         const revision = revisionRow ? unbig(revisionRow.desiredRevision) : 1n;
         const fresh = prepareEpoch({
-          author: { identityId: pin.accountId, certificateHash: pin.certificateHash, streamId: pin.streamId, signingSecretKey: device.signing.secretKey },
+          author: { identityId: pin.accountId, certificateHash: pin.certificateHash, streamId: scope ? fromHex(scope) : pin.streamId, signingSecretKey: device.signing.secretKey },
           epoch: stream.highestCommittedEpoch + 1,
           createdAt: this.now(),
           audience: target,
@@ -1217,25 +1260,25 @@ class ClientImpl implements Client {
         // Under the lock, another context may have prepared or even promoted first. One unresolved
         // epoch per stream: adopt theirs, or start over if the stream moved on.
         const adopted = await this.store.transaction((tx): PreparedEpoch | undefined => {
-          const st = tx.get("stream", STREAM);
+          const st = tx.get("stream", streamKey(scope));
           if (!st) throw new KavachError("RECOVERY_REQUIRED", "epoch");
           if (st.pendingEpoch !== undefined) {
-            const row = tx.get("epochs", String(st.pendingEpoch));
+            const row = tx.get("epochs", epochKey(st.pendingEpoch, scope));
             if (!row) throw new KavachError("STORAGE_FAILURE", "epoch", "pending epoch row missing");
             return rowToPrepared(row);
           }
           if (st.highestCommittedEpoch !== stream.highestCommittedEpoch || st.activeEpoch !== undefined) return undefined;
-          t4PersistPrepared(tx, fresh);
+          t4PersistPrepared(tx, fresh, scope);
           if (catchUpFor !== undefined) {
-            const r = tx.get("epochs", String(fresh.epoch));
-            if (r) tx.put("epochs", String(fresh.epoch), { ...r, catchUpFor });
+            const r = tx.get("epochs", epochKey(fresh.epoch, scope));
+            if (r) tx.put("epochs", epochKey(fresh.epoch, scope), { ...r, catchUpFor });
           }
           return fresh;
         });
         if (!adopted) continue;
         prepared = adopted;
       }
-      const outcome = await this.transport.relay.publishEpoch({ streamId: pin.streamId, expectedEpoch: prepared.epoch - 1, expectedHash: undefined, manifest: prepared.manifest, wraps: prepared.wraps });
+      const outcome = await this.transport.relay.publishEpoch({ streamId: scope ? fromHex(scope) : pin.streamId, expectedEpoch: prepared.epoch - 1, expectedHash: undefined, manifest: prepared.manifest, wraps: prepared.wraps });
       const resolution = resolvePublish(
         prepared,
         outcome.status === "CONFLICT"
@@ -1243,7 +1286,7 @@ class ClientImpl implements Client {
           : { status: outcome.status === "IGNORED_OLDER" ? "RETRYABLE" : outcome.status }
       );
       if (resolution === "RETRY") return "pending";
-      const promoted = await this.store.transaction((tx) => t5Committed(tx, prepared.epoch, target.key));
+      const promoted = await this.store.transaction((tx) => t5Committed(tx, prepared.epoch, target.key, scope));
       if (promoted === "PROMOTED") {
         if (catchUpFor === undefined && (attempt > 0 || stream.activeEpoch === undefined)) this.emit({ kind: "refresh", reason: "rotation" });
         return "prepared";
@@ -1516,28 +1559,24 @@ class ClientImpl implements Client {
     phase("preferences");
     const after = await this.store.read((tx) => tx.get("meta", META));
     if (after?.state === "RETIRED" || this.closed) return report;
-    try {
-      report.epoch = await this.ensureEpoch();
-    } catch (e) {
-      report.errors.push(syncError("epoch", e));
+    const scopes: (Uint8Array | undefined)[] = [undefined, ...(await this.store.read(tx => tx.list("scopedStreams").filter(([, r]) => r.own && r.certificateHash === toHex(this.requireAccount("sync").pin.certificateHash)).map(([, r]) => fromHex(r.circleId))))];
+    for (const circleId of scopes) {
+      if (this.closed) return report;
+      try { report.epoch = await this.ensureEpoch(circleId); }
+      catch (e) { report.errors.push(syncError("epoch", e, circleId ? { circleId } : {})); }
     }
     phase("epoch");
-    if (this.closed) return report;
-    try {
-      // A catch-up epoch carries held records only (revision 13): once they are out it is retired and
-      // the next epoch, to the whole audience, carries what waited behind them, in this sync.
-      for (let pass = 0; pass < 3; pass++) {
-        const drained = await drain(this.outboxDeps());
-        addDrain(report, drained);
-        if (drained.blocked) {
-          report.errors.push(syncError("outbox", drained.blocked)); // the records stay queued
-          break;
+    for (const circleId of scopes) {
+      if (this.closed) return report;
+      try {
+        for (let pass = 0; pass < 3; pass++) {
+          const drained = await drain(this.outboxDeps(circleId));
+          addDrain(report, drained);
+          if (drained.blocked) { report.errors.push(syncError("outbox", drained.blocked, circleId ? { circleId } : {})); break; }
+          if (this.closed || !(await this.epochWorkPending(circleId))) break;
+          report.epoch = await this.ensureEpoch(circleId);
         }
-        if (this.closed || !(await this.epochWorkPending())) break;
-        report.epoch = await this.ensureEpoch();
-      }
-    } catch (e) {
-      report.errors.push(syncError("outbox", e));
+      } catch (e) { report.errors.push(syncError("outbox", e, circleId ? { circleId } : {})); }
     }
     phase("outbox");
     if (this.closed) return report;
@@ -1564,7 +1603,7 @@ class ClientImpl implements Client {
     for (const s of subs) {
       if (this.closed) return report;
       try {
-        const known = await this.store.read((tx) => tx.list("certificates").some(([, c]) => c.streamId === toHex(s.streamId)));
+        const known = await this.store.read((tx) => !!authorViewFor(tx, s.streamId));
         if (!known) continue;
         const r = await syncStream(this.inboxDeps(), s.streamId, s.authorIdentityId, budget);
         // What landed counts, whether or not the stream then failed; a failed stream is not synced.
@@ -2247,7 +2286,7 @@ class ClientImpl implements Client {
       }
       return out;
     });
-    for (const r of dropped) this.emit({ kind: "cancelled", localId: r.localId, recordId: r.recordId, idempotencyKey: r.idempotencyKey, reason: "retired" });
+    for (const r of dropped) this.emit({ kind: "cancelled", ...(r.circleId ? { circleId: r.circleId } : {}), localId: r.localId, recordId: r.recordId, idempotencyKey: r.idempotencyKey, reason: "retired" });
     await this.secrets.delete("deviceSeed");
     this.device = undefined;
     await this.emitState();
@@ -2263,12 +2302,13 @@ class ClientImpl implements Client {
     return historyPage(this.store, this.policy, query);
   }
 
-  newestEntry(query?: Pick<HistoryQuery, "authorIdentityId" | "kind">): Promise<HistoryEntry | undefined> {
+  newestEntry(query?: Pick<HistoryQuery, "authorIdentityId" | "kind" | "circleId">): Promise<HistoryEntry | undefined> {
     return newest(this.store, this.policy, query);
   }
 
-  newest(identityId: Uint8Array, kind: RecordKind): Promise<Newest | undefined> {
-    return newestSlot(this.store, identityId, kind, this.now());
+  newest(identityId: Uint8Array, kind: RecordKind, options?: { circleId?: Uint8Array }): Promise<Newest | undefined> {
+    this.checkScope(kind, options?.circleId);
+    return newestSlot(this.store, identityId, kind, this.now(), options?.circleId);
   }
 
   keyChanges(options: { accountId?: Uint8Array; limit?: number } = {}): Promise<KeyChangeEntry[]> {

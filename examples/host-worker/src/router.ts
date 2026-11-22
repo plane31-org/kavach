@@ -54,6 +54,10 @@ async function route(request: Request, env: Env): Promise<Response> {
     return json(await dir.publishVault(requireCaller(request), b));
   }
   if (seg[0] === "circles" && seg.length === 1 && m === "GET") return json(await dir.listCircles(requireCaller(request), url.searchParams.get("cursor") ?? undefined));
+  if (seg[0] === "circles" && seg[1] && seg[2] === "streams" && m === "POST") {
+    const b = await body<{ streamId: string; certificateHash: string }>(request);
+    return json(await dir.openScopedStream(requireCaller(request), seg[1], b.streamId, b.certificateHash));
+  }
   if (seg[0] === "circles" && seg[1] && seg[2] === "preference" && m === "PUT") {
     const b = await body<{ enabled: boolean; expectedRevision: string }>(request);
     if (typeof b.enabled !== "boolean") throw new HttpError(400, "MALFORMED", "enabled");
@@ -131,7 +135,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       const a = await dir.currentDevice(requireCaller(request));
       await dir.ensureStream(a); // the current device's stream exists before its first manifest, however its commit ended
       const b = await body<{ expectedEpoch: number; manifest: string; wraps: Record<string, string> }>(request);
-      const r = await call<{ status: string; newSubscriptions?: { certificateHash: string; identityId: string }[] }>("/publishEpoch", { callerIdentityId: accountIdOf(a), ...b });
+      const r = await call<{ status: string; newSubscriptions?: { certificateHash: string; identityId: string }[] }>("/publishEpoch", { callerIdentityId: accountIdOf(a), callerCertificateHash: a.certificate_hash, ...b });
       for (const s of r.newSubscriptions ?? []) {
         await env.DIRECTORY.prepare("INSERT OR IGNORE INTO subscriptions (stream_id, reader_certificate, author_identity) VALUES (?, ?, ?)").bind(streamId, s.certificateHash, accountIdOf(a)).run();
       }
@@ -142,7 +146,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       const b = await body<{ recordId: string; wire: string }>(request);
       const rec = expectType<EncryptedRecord>(parseDocument(unhex(b.wire, "wire")), DocumentType.EncryptedRecord);
       if (hex(rec.streamId) !== streamId) throw new HttpError(400, "MALFORMED", "record is for another stream");
-      const r = await call<{ status: string; notify?: { identityId: string; kind: string }[] }>("/append", { callerIdentityId: accountIdOf(a), recordId: b.recordId, wire: b.wire, now: now.toString() });
+      const r = await call<{ status: string; notify?: { identityId: string; kind: string }[] }>("/append", { callerIdentityId: accountIdOf(a), callerCertificateHash: a.certificate_hash, recordId: b.recordId, wire: b.wire, now: now.toString() });
       for (const n of r.notify ?? []) {
         const to = await dir.accountByIdentity(n.identityId);
         if (to) await dir.notify(n.kind, to.account_name, a.account_name);

@@ -28,8 +28,8 @@ export function clampEventTime(eventTime: bigint | undefined, sentAt: bigint): b
   return eventTime === undefined || eventTime > sentAt ? sentAt : eventTime;
 }
 
-export function slotKey(authorIdentityId: string, kind: number): string {
-  return `${authorIdentityId}:${kind}`;
+export function slotKey(authorIdentityId: string, kind: number, circleId?: string): string {
+  return circleId ? `${authorIdentityId}:${circleId}:${kind}` : `${authorIdentityId}:${kind}`;
 }
 
 export function slotOrderOf(row: NewestRow): SlotOrder {
@@ -45,8 +45,8 @@ export interface SlotCandidate extends SlotOrder {
 }
 
 /** Take the slot if the candidate orders after its current holder (or there is none); true when it did. */
-export function takeSlot(tx: Tx, authorIdentityId: string, kind: number, c: SlotCandidate, toHex: (b: Uint8Array) => string): boolean {
-  const key = slotKey(authorIdentityId, kind);
+export function takeSlot(tx: Tx, authorIdentityId: string, kind: number, c: SlotCandidate, toHex: (b: Uint8Array) => string, circleId?: string): boolean {
+  const key = slotKey(authorIdentityId, kind, circleId);
   const current = tx.get("newest", key);
   if (current && compareSlotOrder(c, slotOrderOf(current)) <= 0) return false;
   const next: NewestRow = { recordId: c.recordId, bodyHash: c.bodyHash, generation: big(c.generation), epoch: c.epoch, counter: c.counter, sentAt: big(c.sentAt), receivedAt: big(c.receivedAt), eventTime: big(c.eventTime), payload: toHex(c.payload) };

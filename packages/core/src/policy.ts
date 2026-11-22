@@ -9,6 +9,8 @@ import { KavachError } from "./errors.js";
 export interface KindDeclaration {
   /** The kind number carried by the record. Until revision 8 the wire carries 0, 1 or 2. */
   readonly kind: number;
+  /** Default author: union sharing. Circle kinds require an explicit circle at enqueue and newest. */
+  readonly scope?: "author" | "circle";
   /** How long a reader keeps records and the newest slot's payload, from `sentAt`. */
   readonly retentionMs: bigint;
   /** `keepAll`: every queued record is sent. `latestWins`: a newer queued record of this kind cancels the older one (`superseded`). */
@@ -76,9 +78,10 @@ export function validatePolicy(policy: unknown): RetentionPolicy {
     if (k.queue !== "keepAll" && k.queue !== "latestWins") throw new KavachError("MALFORMED", stage, `kinds[${i}].queue must be keepAll or latestWins`);
     if (typeof k.history !== "boolean" || typeof k.newest !== "boolean") throw new KavachError("MALFORMED", stage, `kinds[${i}].history and .newest must be booleans`);
     if (!k.history && !k.newest) throw new KavachError("MALFORMED", stage, `kinds[${i}] keeps nothing: declare history or newest`);
+    if (k.scope !== undefined && k.scope !== "author" && k.scope !== "circle") throw new KavachError("MALFORMED", stage, "scope must be author or circle");
     const headerClass = k.headerClass ?? 0;
     if (typeof headerClass !== "number" || !Number.isInteger(headerClass) || headerClass < 0 || headerClass > 7) throw new KavachError("MALFORMED", stage, `kinds[${i}].headerClass must be 0 to 7`);
-    return { kind, retentionMs: big(`kinds[${i}].retentionMs`, k.retentionMs), queue: k.queue, history: k.history, newest: k.newest, headerClass: headerClass as KindDeclaration["headerClass"] };
+    return { kind, ...(k.scope === undefined ? {} : { scope: k.scope as "author" | "circle" }), retentionMs: big(`kinds[${i}].retentionMs`, k.retentionMs), queue: k.queue, history: k.history, newest: k.newest, headerClass: headerClass as KindDeclaration["headerClass"] };
   });
   if (p.replacement !== "continuity" && p.replacement !== "recovery" && p.replacement !== "both") throw new KavachError("MALFORMED", stage, "replacement must be continuity, recovery or both");
   return {

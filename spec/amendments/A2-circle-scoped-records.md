@@ -1,107 +1,84 @@
 # Amendment A2: records readable by one circle
 
-Status: **proposed (November 2026), for review.** Nothing here is implemented. It would be protocol revision 14 if adopted. Section numbers refer to `spec/Kavach-v1.md` at revision 13.
+Status: **adopted for protocol revision 14; implementation in this change, not published.** This document records the decisions and limits. The normative protocol is `spec/Kavach-v1.md`.
 
-## 0. What this changes, in one paragraph
+## 1. Model and public API
 
-Today an author has one stream per device, and its epoch is sealed to the union of every circle the author shares with (section 7). Every record the author sends is readable by all of them. That fits continuous sharing, where one position goes to everyone who may see it. It does not fit a record that belongs to one circle: a check-in made "in Family" that Work must not read, or a circle's saved places. This amendment adds a **scoped stream** per author device per circle, beside the existing stream. A kind the product declares `scope: "circle"` is sent on the scoped stream of the circle the caller names, and only that circle's members can open it. Everything the protocol already does per stream applies unchanged: epochs, manifests, the reseal rule, subscriptions, acknowledgement, deletion and the audience fence.
+An author keeps the existing device stream, whose audience is the union of enabled circles. A circle-scoped kind uses a separate stream per (author device, circle). Each stream reuses the same epoch, counter, outbox, catch-up, subscription, cursor and deletion machinery. There is no second key hierarchy and no extra package.
 
-## 1. Decisions this amendment needs before adoption
+A kind declares `scope: "author" | "circle"` in the retention policy. Absent means `"author"`. A kind has exactly one scope; changing a deployed kind's scope requires a coordinated product-policy rollout.
 
-| # | Decision | Recommendation |
-| --- | --- | --- |
-| D1 | How to scope a record to one circle | A scoped stream per (author device, circle), not several audiences inside one stream. Section 8 says why |
-| D2 | Accept that the host learns which circle each scoped record is for | Accept, and state it in section 15. The host already knows every circle's members; it does not learn the payload, the kind or the event time |
-| D3 | Which kinds are scoped | Declared per kind in the retention policy: `scope: "author"` (today's behaviour, the default) or `scope: "circle"`. A kind is one or the other, never both |
-| D4 | What "newest" and history mean for a scoped kind | The newest slot is per (author, kind, circle). History entries carry the circle id, and history paging filters by it |
-| D5 | Whether a scoped stream exists before its first record | No: it is opened at the author's first scoped record for that circle, and retired when the circle is closed, left or gone |
+- `enqueue(kind, payload, { circleId })`: the circle is required for a circle kind and refused for an author kind (`MALFORMED`). A circle id is 16 bytes. The author must have a verified, joined, enabled circle; an unknown or disabled circle is `NOT_AUTHORIZED`.
+- `newest(identityId, kind, { circleId })`: the same scope validation. Slots are keyed by (author account, circle, kind), or (author account, kind) for author kinds.
+- `historyPage({ circleId })` and `history({ circleId })` filter through a circle index. Without that filter, results deliberately aggregate readable circles and author-scoped records in time order. Every scoped entry carries `circleId`.
+- `queued`, `accepted`, `cancelled`, `resealed` and `recordStored` carry `circleId` for scoped records. Stable `localId` and `delivery(localId)` retain their meaning.
+- A record belongs to exactly one stream. Sending to two circles is two explicit enqueues.
 
-## 2. The scoped stream
+Queue replacement is per (stream, kind): Family's latest-wins record never replaces Work's. Idempotency keys remain account-wide; callers must use distinct keys for distinct sends, including copies sent to different circles. Queue record and byte limits are account-wide, across every stream. History retention and the delivery window do not change.
 
-**Identity.** `scopedStreamId = H(C("scoped-stream") || identityId || deviceId || circleId)`. It is derived like the existing stream id, with the circle id added, so a reader can recompute it and the host cannot substitute one circle's stream for another's.
+## 2. Stream identity and reader verification
 
-**Audience.** The epoch of a scoped stream for circle X is sealed to the members of X, at their current certificates, the author included. This is the same rule as section 7, applied to one circle instead of the union: eligibility, retirement after a reset, unfinished succession chains and the 100-account limit all apply. A circle the author has disabled sharing to, has left, or that is closed or `gone`, has no usable scoped stream. Its queued records are held under the reseal rule and given up with `cancelled` when their window passes.
+`scopedStreamId = H(C("scoped-stream") || identityId || deviceId || circleId)`.
 
-**Rotation.** A scoped stream rotates on the changes that touch its circle:
-- a snapshot of X,
-- a device change of one of X's members,
-- the author's sharing preference for X,
-- the hygiene period and counter exhaustion, as today.
+Here `identityId` is the **key identity derived from the signing certificate**, not the stable account id after a host-authorized succession. The manifest author and circle membership still use the stable account id. The domain label is new; wire version 5 and existing document layouts are unchanged.
 
-A change in another circle does not rotate it. The existing stream still rotates on every change, as today.
+The reader derives candidate scoped ids from its locally verified circle ids and verified author certificates. It accepts a binding only when the derived id equals the stream id. Host subscription labels are not authority for a circle binding. Thus `listSubscriptions` and `syncState` retain their shapes. A previously unknown circle must first be learned and verified through full metadata sync; an unknown stream is not acknowledged as valid content.
 
-**The author's own replacement.** A new device opens its own scoped streams, as it opens its own stream (section 4). A reader pins the scoped stream ids under the new certificate, exactly as for the existing stream.
+Epoch and record verification use the certificate's signing key with this derived stream id. Receiving requires the reader and author to be members of that specific circle, not merely to share some other circle. A decrypted circle kind on an author stream, or an author kind on a scoped stream, is rejected. Old-device signatures retain the existing supersession rules.
 
-## 3. Sending
+## 3. Audience, rotation and resumption
 
-- `enqueue(kind, payload, { circleId })`. `circleId` is required for a kind declared `scope: "circle"` and refused for an author-scoped kind, both with `MALFORMED`.
-- Each scoped stream has its own epochs, counter and outbox order. T6 and T6h run per stream exactly as today.
-- The reseal rule of revision 13 applies per stream. So does the catch-up epoch when the circle has gained a member, and so does the `AUDIENCE_STALE` fence: the host checks the scoped epoch against the circle's own snapshot.
-- One record is one write to one stream. Nothing is duplicated across circles. An app that wants the same thing in two circles sends two records.
+The audience is the author plus the eligible members of the selected circle, at their greatest verified certificates. Retired accounts and unresolved succession chains follow the existing rules. Each actual epoch independently enforces the 100-account bound; a scoped stream does not depend on resolving the union audience.
 
-## 4. Receiving
+A verified snapshot/preference change for X invalidates X's sending epoch atomically. A member device change invalidates the scoped streams whose circles contain that member. Hygiene and counter exhaustion apply independently per stream. An unrelated circle's change does not rotate X. The author stream keeps its existing union behavior.
 
-- The host subscribes each member of X to every member's scoped stream for X when that member is admitted, and when an author opens or rotates the stream. A subscription starts at the admission boundary, as for the existing stream. A member who joins later never receives a scoped record appended before they joined, and the catch-up epoch keeps that true for a backlog the author sends late.
-- A record that opens under a scoped stream carries its circle implicitly: the reader knows which stream it read. History rows gain `circleId`. `historyPage({ circleId })` filters by it, and without a filter a page merges the author's records across the circles this device can read, in the same time order.
-- `newest(identityId, kind, { circleId })` reads the slot for that circle. For a scoped kind `circleId` is required.
-- `recordStored` and the lifecycle events gain `circleId` for scoped records. `delivery(localId)` is unchanged.
+Streams are created locally on the first scoped enqueue and registered with the host when an epoch can be published. They are **suspended, not deleted**, on disable, leave, closure or `gone`. No new scoped record is accepted for a suspended circle; queued records remain subject to expiration. No unsent record is handed off while the local circle is suspended. Already-started network requests cannot be recalled.
 
-## 5. The host
+If sharing resumes or a verified circle returns/rejoins on the same device, reuse its deterministic stream id and durable epoch high-water mark. Never reset epoch numbers/counters or reuse epoch keys. Retain local history for its normal retention window. A new device derives new streams and follows ordinary replacement and bootstrap; it does not import the previous device's sending counters.
 
-The relay stores, serves and deletes scoped streams like any stream; `appendRecord`, `readRecords`, `ackThrough` and `syncState` need no change. The directory gains one operation and one check:
+## 4. Precise privacy boundary for backlog
 
-- `openScopedStream(circleId, streamId, certificateHash)`, idempotent. The host verifies that the caller is a member of the circle under its current snapshot and that the stream id derives from the caller's identity, device and the circle. It records the stream as belonging to the circle and subscribes the circle's members.
-- On `publishEpoch` for a scoped stream, the host refuses a manifest that addresses an account outside the circle's current members. That is the scoped form of the audience fence.
+The audience boundary is **first sealing, not event time or enqueue time**.
 
-Notifications follow the header class, as today, and go to that circle's members only. This is what lets a check-in made in Family wake Family and nobody else.
+- A record already sealed before a join is held on rotation and resealed only to the intersection of its earlier recipients and the current eligible audience. Revision 13's catch-up epochs apply independently per stream. A new member gets no wrap for that backlog.
+- A record queued **unsealed**, including first-use while offline or without usable metadata, has no earlier cryptographic audience. Its first seal uses the verified audience at that time. A member who joined while it waited may receive it. Products needing enqueue-time membership semantics must not treat this as that guarantee.
+- Current members cannot read records for another circle without being recipients of that circle's epoch. Removed members receive no newly sealed record after the author's verified removal/rotation. Previously disclosed keys and plaintext cannot be revoked.
+- Host subscriptions do not expose pre-admission records to a newly admitted device; epoch wraps also exclude accounts that were not recipients. A malicious host can withhold membership updates, as in the existing protocol.
 
-## 6. Security consequences (for section 15)
+This supplies private delivery, **not persistent shared state**. A saved-places product must separately publish its current state for newly admitted members; scoped history is not automatically replayed to them.
 
-**What holds.**
-- **Pre-join history.** A member reads no scoped record appended before they joined: their subscription starts at admission, and the reseal rule keeps a late backlog off their epoch.
-- **Removal.** A removed member reads no scoped record sealed after the circle's next rotation, the same bound as section 15's limit 2, per circle.
-- **No crossing.** A member of Work who is not in Family can open no Family record. The scoped stream's epochs never address them, and the host refuses a manifest that would.
+## 5. Host contract
 
-**What the host learns, beyond today.**
-- Which circle each scoped record is for.
-- Per circle, when and how often each author sends scoped records.
+The optional directory capability `openScopedStream(circleId, streamId, certificateHash)` becomes required when a product uses scoped kinds. It is idempotent, authenticated, and returns the existing mutation outcomes. Missing capability fails explicitly with `UNSUPPORTED_OPERATION`.
 
-Today the union stream hides which circle a record concerns. A product that needs that hidden should not use scoped kinds for it.
+The host verifies current-device authentication, current circle membership, the certificate hash and the deterministic scoped id. The registration is immutable and preserves counters/cursors on repeated calls. The HTTP binding is `POST /circles/{circleId}/streams` with hex `streamId` and `certificateHash` in the JSON body, relative to the configured base URL.
 
-**What does not change.** The host still learns no payload, kind or event time, and still holds no key.
+On scoped epoch publication, the host verifies the registered author/device/stream binding and rejects recipients outside the current circle. A subset is allowed for catch-up epochs. Publication creates subscriptions for addressed recipient devices at the current tail; no old record is added to a new recipient's required-reader set. A subscription may therefore be materialized lazily at the first epoch addressing that device.
 
-## 7. Cost, for an author in one to five circles
+Append checkpoints remain first: retrying an accepted record does not send it twice. For a new append, the scoped audience fence checks against the scoped circle, not the union; removal since publication returns `AUDIENCE_STALE`. Current-device checks still apply. Notifications follow header class and go only to actual recipient accounts of that epoch, never to the whole union or to joiners excluded from a catch-up epoch.
 
-| | Today (union stream only) | With scoped kinds in use |
-| --- | --- | --- |
-| Writes per scoped record | n/a | 1, to one stream |
-| Wraps per epoch | members of the union | the union stream: as today; a scoped stream: members of that circle |
-| Rotations when circle X changes | 1 (the union stream) | 1 (union) + 1 (X's scoped stream, if the author has one) |
-| Rotations when circle Y changes | 1 | 1 (union) + 0 for X's stream |
-| Streams per author device | 1 | 1 + the circles the author has sent scoped records in |
-| Subscriptions per reader | one per author | one per author, plus one per author per shared circle with scoped records |
+`appendRecord`, `readRecords`, `ackThrough`, `listSubscriptions` and `syncState` retain their interfaces. The SDK and host distinguish streams by id. One blocked stream does not prevent the sync from attempting the others; each pass uses the existing bounded per-stream drain. Global queue limits bound durable pending work.
 
-The extra cost grows with use, not as a multiple: an author who never sends a scoped record in a circle has no stream for it. For the expected case of 1 to 3 circles, a membership change costs at most two rotations instead of one. A scoped epoch has fewer wraps than the union epoch, because a circle is never larger than the union.
+## 6. Metadata and cost
 
-## 8. Alternatives considered
+The host learns the scoped circle id and per-circle sending activity. It still receives no payload, plaintext kind or event time. Header classes and traffic patterns may permit inferences; this amendment does not hide them. Accepting circle-visible metadata is a product decision, not a new SDK option.
 
-| Alternative | Why not |
+| Work | Cost |
 | --- | --- |
-| Several audiences in one stream: a record names an epoch from a per-circle series | Breaks "one current epoch per stream", which the append fence, the checkpoint, acknowledgement prefixes and deletion all rely on; every one of them would need a per-series variant |
-| A circle group key: the owner shares a key with the members and scoped payloads are encrypted under it inside the union stream | The union still receives and stores every record; a removal needs the owner online to rekey; the host's notifications reach the whole union; and it adds a second key hierarchy beside the epochs |
-| A scoped record sealed per recipient (one box per member) | One write per member and no deletion by cursor; cost grows with circle size per record, not per rotation |
-| A separate account per circle | Multiplies identities, recovery and replacement by the circle count; the user would be several people |
+| Record | One append to its selected stream |
+| Streams per author device | One union stream plus each circle used for scoped sends |
+| Normal change to one circle | Union rotation plus that circle's active scoped rotation, if any |
+| Backlog across joins | Additional catch-up publications for affected earlier audiences |
+| Member device replacement | May rotate several shared scoped streams, plus the union |
+| Subscriptions | One per author stream plus the scoped author/circle streams used |
+| Wraps | Per recipient in each published epoch |
 
-## 9. Open questions for review
+Lazy creation avoids unused streams. It does not eliminate growth with circle count, overlapping membership or catch-up work. Do not promise an absolute two-rotation maximum or device performance from fake-host counts. Measure device latency, storage and network calls with the product's actual circles and traffic.
 
-1. A history page without a circle filter merges circles. Should it instead require a filter for scoped kinds, so an app can never mix them by accident?
-2. Should leaving a circle erase its scoped history on this device, or keep it for the retention window as history does today? The recommendation is to keep it, as today.
-3. Is per-circle send timing (section 6) acceptable as host-visible metadata for the products that would use scoped kinds?
-4. Should the 100-account limit count a scoped stream's audience separately from the union's? It cannot be larger, so the recommendation is that it needs no separate limit.
+## 7. Implementation and rollout
 
-## 10. Delivery, if adopted
+Use a single parameterized sending state machine. Namespace sending epochs, counters and revisions by scoped stream id; keep stable local ids, account-wide limits and the shared reader implementation. Preserve existing author-stream keys and behavior.
 
-1. Specification text for sections 7, 9, 10, 13 and 15, the revision 14 note, and fixture vectors for a scoped stream id and a scoped epoch manifest.
-2. The policy's `scope`, `enqueue`'s `circleId`, scoped streams in the store and outbox, and the reader's history and slot changes.
-3. `openScopedStream` and the scoped manifest check in the fake host and the reference worker.
-4. Conformance tests: no crossing between circles; no pre-join history, including a late backlog; removal per circle; a scoped kind refused without a circle; the cost table measured on the fake host.
+Ship the host capability first, then revision-14 readers, then enable scoped kinds on senders. Earlier readers do not recognize scoped stream ids. No npm publication or host deployment is implied by this implementation.
+
+Conformance covers independent stream-id/manifest vectors, no crossing, scope/type rejection, per-circle queue replacement and newest slots, indexed history, late sealed backlog across a join, unsealed first-use semantics, removal, disable/resume without counter reuse, global limits, and the actual HTTP host path. Existing author-scoped, replacement and fault tests remain applicable.

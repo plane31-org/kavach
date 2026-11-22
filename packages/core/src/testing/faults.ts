@@ -100,7 +100,7 @@ export class FaultyStore implements Store {
 
 // The malicious transport ----------------------------------------------------------------------------
 
-export type MutationName = "registerAccount" | "activateDevice" | "publishVault" | "publishOwnedCircle" | "requestJoin" | "requestLeave" | "resetAccount" | "succeedAccount" | "setSharingPreference" | "publishEpoch" | "appendRecord" | "ackThrough" | "syncState" | "getCircle";
+export type MutationName = "openScopedStream" | "registerAccount" | "activateDevice" | "publishVault" | "publishOwnedCircle" | "requestJoin" | "requestLeave" | "resetAccount" | "succeedAccount" | "setSharingPreference" | "publishEpoch" | "appendRecord" | "ackThrough" | "syncState" | "getCircle";
 
 export type ServedKind = "certificate" | "snapshot" | "vault" | "manifest" | "wrap" | "record" | "keyList" | "receipt" | "succession";
 
@@ -287,6 +287,7 @@ export class MaliciousTransport implements Transport {
         if (k.withhold.has("circleList")) throw new KavachError("NETWORK", "transport", "network unreachable");
         return d().listCircles(cursor);
       },
+      openScopedStream: (circleId, streamId, certificateHash) => this.mutate("openScopedStream", () => { const f = d().openScopedStream; if (!f) throw new KavachError("UNSUPPORTED_OPERATION", "scope"); return f.call(d(), circleId, streamId, certificateHash); }),
       setSharingPreference: (circleId, enabled, expected) => this.mutate("setSharingPreference", () => d().setSharingPreference(circleId, enabled, expected))
     };
   }

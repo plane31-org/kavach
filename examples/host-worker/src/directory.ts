@@ -14,6 +14,7 @@ import {
   randomBytes,
   signingKeypairFromSeed,
   streamId,
+  scopedStreamId,
   verifyDocument,
   type AccountDevice,
   type CircleSnapshot
@@ -478,6 +479,21 @@ export class Directory {
     ]);
     await this.openStream(hex(newIid), doc.deviceId, a.account_name);
     return { status: "COMMITTED", receipt: receiptHex };
+  }
+
+  /** Register a deterministic stream only for a current device and a current member. */
+  async openScopedStream(c: Caller, circleId: string, stream: string, certificateHash: string): Promise<{ status: string }> {
+    const a = await this.currentDevice(c);
+    const snapshot = await this.circle(circleId);
+    if (!snapshot || certificateHash !== a.certificate_hash) return { status: "UNAUTHORIZED" };
+    const circle = expectType<CircleSnapshot>(parseDocument(unhex(snapshot, "snapshot")), DocumentType.CircleSnapshot);
+    if (!circle.members.some(m => hex(m) === accountIdOf(a))) return { status: "UNAUTHORIZED" };
+    const cert = expectType<AccountDevice>(parseDocument(unhex(a.certificate, "certificate")), DocumentType.AccountDevice);
+    const expected = hex(scopedStreamId(unhex(a.identity_id, "identity"), cert.deviceId, unhex(circleId, "circle")));
+    if (stream !== expected) return { status: "UNAUTHORIZED" };
+    const stub = this.env.STREAMS.get(this.env.STREAMS.idFromName(stream));
+    await stub.fetch("https://stream/open", { method: "POST", body: JSON.stringify({ streamId: stream, authorIdentityId: accountIdOf(a), accountName: a.account_name, circleId, certificateHash }) });
+    return { status: "COMMITTED" };
   }
 
   async subscriptions(c: Caller): Promise<SubscriptionView[]> {

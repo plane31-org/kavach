@@ -8,22 +8,26 @@
  * single-threaded SQLite transaction is the serialisation the protocol requires.
  */
 import { DurableObject } from "cloudflare:workers";
-import { DocumentType, bodyHash, expectType, fromHex, parseDocument, toHex, type EncryptedRecord, type EpochManifest } from "@plane31/blind-relay/adapters";
+import { DocumentType, bodyHash, expectType, fromHex, parseDocument, toHex, type EncryptedRecord, type EpochManifest, type CircleSnapshot } from "@plane31/blind-relay/adapters";
 import type { Env } from "./env.js";
 
 interface OpenBody {
+  circleId?: string;
+  certificateHash?: string;
   streamId: string;
   authorIdentityId: string;
   accountName: string;
 }
 interface PublishBody {
   callerIdentityId: string;
+  callerCertificateHash?: string;
   expectedEpoch: number;
   manifest: string;
   wraps: Record<string, string>;
 }
 interface AppendBody {
   callerIdentityId: string;
+  callerCertificateHash?: string;
   recordId: string;
   wire: string;
   now: string;
@@ -77,6 +81,7 @@ export class StreamDO extends DurableObject<Env> {
             this.set("streamId", b.streamId);
             this.set("authorIdentityId", b.authorIdentityId);
             this.set("accountName", b.accountName);
+            if (b.circleId && b.certificateHash) { this.set("circleId", b.circleId); this.set("certificateHash", b.certificateHash); }
             this.set("currentEpoch", 0);
             this.set("tail", 0);
             this.set("expiredThrough", 0);
@@ -100,9 +105,9 @@ export class StreamDO extends DurableObject<Env> {
           return reply({ manifest: row.manifest, wrap: wraps[callerIdentityId] ?? null });
         }
         case "/publishEpoch":
-          return reply(this.publish((await request.json()) as PublishBody));
+          return reply(await this.publish((await request.json()) as PublishBody));
         case "/append":
-          return reply(this.append((await request.json()) as AppendBody));
+          return reply(await this.append((await request.json()) as AppendBody));
         case "/read":
           return reply(this.read((await request.json()) as ReadBody));
         case "/ack":
@@ -122,10 +127,21 @@ export class StreamDO extends DurableObject<Env> {
     }
   }
 
-  private publish(b: PublishBody): { status: string; currentEpoch?: number; currentManifest?: string; newSubscriptions?: { certificateHash: string; identityId: string }[] } {
+  private async scopedMembers(): Promise<Set<string> | undefined> {
+    const circleId = this.get("circleId");
+    if (!circleId) return undefined;
+    const c = await this.env.DIRECTORY.prepare("SELECT snapshot, closed FROM circles WHERE circle_id = ?").bind(circleId).first<{ snapshot: string; closed: number }>();
+    return !c || c.closed ? new Set() : new Set(expectType<CircleSnapshot>(parseDocument(fromHex(c.snapshot)), DocumentType.CircleSnapshot).members.map(toHex));
+  }
+
+  private async publish(b: PublishBody): Promise<{ status: string; currentEpoch?: number; currentManifest?: string; newSubscriptions?: { certificateHash: string; identityId: string }[] }> {
     if (this.get("authorIdentityId") !== b.callerIdentityId) return { status: "UNAUTHORIZED" };
+    const members = await this.scopedMembers();
+    if (members && (this.get("certificateHash") !== b.callerCertificateHash || !members.has(b.callerIdentityId))) return { status: "UNAUTHORIZED" };
     const manifest = fromHex(b.manifest);
     const doc = expectType<EpochManifest>(parseDocument(manifest), DocumentType.EpochManifest);
+    if (toHex(doc.streamId) !== this.get("streamId")) return { status: "UNAUTHORIZED" };
+    if (members && doc.audience.some(r => !members.has(toHex(r.identityId)))) return { status: "UNAUTHORIZED" };
     const current = this.num("currentEpoch");
     const currentRow = this.sql.exec("SELECT manifest FROM epochs WHERE epoch = ?", current).toArray()[0] as { manifest: string } | undefined;
     if (doc.epoch === current && currentRow?.manifest === b.manifest) return { status: "ALREADY_COMMITTED" };
@@ -155,8 +171,10 @@ export class StreamDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM epochs WHERE epoch != ? AND epoch NOT IN (SELECT DISTINCT epoch FROM records)", current);
   }
 
-  private append(b: AppendBody): { status: string; deliverySeq?: string; notify?: { identityId: string; kind: string }[] } {
+  private async append(b: AppendBody): Promise<{ status: string; deliverySeq?: string; notify?: { identityId: string; kind: string }[] }> {
     if (this.get("authorIdentityId") !== b.callerIdentityId) return { status: "UNAUTHORIZED" };
+    const members = await this.scopedMembers();
+    if (members && this.get("certificateHash") !== b.callerCertificateHash) return { status: "SUPERSEDED_DEVICE" };
     const wire = fromHex(b.wire);
     const rec = expectType<EncryptedRecord>(parseDocument(wire), DocumentType.EncryptedRecord);
     if (toHex(rec.streamId) !== this.get("streamId")) return { status: "UNAUTHORIZED" };
@@ -184,6 +202,7 @@ export class StreamDO extends DurableObject<Env> {
     const epoch = this.sql.exec("SELECT rows FROM epochs WHERE epoch = ?", rec.epoch).toArray()[0] as { rows: string } | undefined;
     if (!epoch) return { status: "UNAUTHORIZED" };
     const rows = JSON.parse(epoch.rows) as { identityId: string; certificateHash: string }[];
+    if (members && (!members.has(b.callerIdentityId) || rows.some(r => !members.has(r.identityId)))) return { status: "AUDIENCE_STALE" };
     const required = rows.filter((r) => r.identityId !== b.callerIdentityId).map((r) => r.certificateHash);
     const seq = this.num("tail") + 1;
     const lastAccepted = BigInt(this.get("lastAcceptedAt") ?? "0");

@@ -75,6 +75,8 @@ export interface JoinRequest {
 }
 
 export interface Directory {
+  /** Revision 14. Required when circle-scoped kinds are used. */
+  openScopedStream?(circleId: Uint8Array, streamId: Uint8Array, certificateHash: Uint8Array): Promise<MutationOutcome>;
   resolveAccounts(names: readonly string[]): Promise<readonly ResolvedAccount[]>;
   /** Snapshots name identities; the directory maps them back to accounts (host-trusted, like first contact). */
   resolveIdentities(identityIds: readonly Uint8Array[]): Promise<readonly ResolvedAccount[]>;

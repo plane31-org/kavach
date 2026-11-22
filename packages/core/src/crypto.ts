@@ -31,6 +31,7 @@ export const RECOVERY_CODE_PREFIX = "KV1R-";
 export type Label =
   | "identity"
   | "stream"
+  | "scoped-stream"
   | "record-id"
   | "doc-hash"
   | "device-sign"
@@ -106,6 +107,12 @@ export function identityId(accountName: string, accountPublicKey: Uint8Array): U
 
 export function streamId(identity: Uint8Array, deviceId: Uint8Array): Uint8Array {
   return H(concat(C("stream"), identity, deviceId));
+}
+
+/** Revision 14: bound to the certificate's key identity, device and circle. */
+export function scopedStreamId(identity: Uint8Array, deviceId: Uint8Array, circleId: Uint8Array): Uint8Array {
+  if (identity.length !== 32 || deviceId.length !== 16 || circleId.length !== 16) throw new KavachError("MALFORMED", "scopedStreamId", "invalid identifier length");
+  return H(concat(C("scoped-stream"), identity, deviceId, circleId));
 }
 
 export function recordId(stream: Uint8Array, epoch: number, counter: number): Uint8Array {

@@ -1,6 +1,6 @@
 /** Devices as clients of the real Worker, through SELF.fetch. */
 import { SELF, env } from "cloudflare:test";
-import { open, toHex, type Client, type ClientEvent, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@plane31/blind-relay";
+import { open, toHex, type Client, type RetentionPolicy, type ClientEvent, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@plane31/blind-relay";
 import { MemorySecretStore, MemoryStore } from "@plane31/blind-relay/adapters";
 import { TestClock, testPolicy } from "@plane31/blind-relay/testing";
 import { httpTransport } from "@plane31/blind-relay/http";
@@ -33,7 +33,7 @@ export interface Device {
 export const clock = new TestClock();
 export const fetchHost = (input: string, init?: RequestInit): Promise<Response> => SELF.fetch(input, init);
 
-export async function device(name: string, provider = new Platform()): Promise<Device> {
+export async function device(name: string, provider = new Platform(), retentionPolicy: RetentionPolicy = testPolicy): Promise<Device> {
   const store = new MemoryStore();
   const secrets = new MemorySecretStore();
   const events: ClientEvent[] = [];
@@ -50,7 +50,7 @@ export async function device(name: string, provider = new Platform()): Promise<D
   });
   const client = await open({
     accountName: name,
-    retentionPolicy: testPolicy,
+    retentionPolicy,
     recoveryProvider: provider,
     resetTrust: { managementKey: Uint8Array.from(Buffer.from(env.TEST_MANAGEMENT_PUBLIC, "hex")), minimumVersion: 1n },
     secretStore: secrets,

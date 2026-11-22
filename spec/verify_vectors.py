@@ -182,8 +182,8 @@ def snapshot(owner,circle,revision,members):
     body=b'\x05\x02'+circle+owner['iid']+U64(revision)+U16(len(members))+b''.join(sorted(members))
     return sign(owner['a'],'snapshot-sig',body)
 
-def manifest(author,epoch,created,key,wraps,recipients):
-    stream=stream_id(author['iid'],author['device_id'])
+def manifest(author,epoch,created,key,wraps,recipients,scope=None):
+    stream=stream_id(author['iid'],author['device_id']) if scope is None else H(C('scoped-stream')+author['iid']+author['device_id']+scope)
     commit=H(C('epoch-key')+stream+U32(epoch)+key)
     rows=b''.join(i+doc_hash(recipients[i]['wire'][:-64])+H(C('wrap')+w) for i,w in sorted(wraps.items()))
     body=b'\x05\x03'+stream+author['iid']+doc_hash(author['wire'][:-64])+U32(epoch)+U64(created)+commit+U16(len(wraps))+rows
@@ -691,6 +691,12 @@ def build():
         'reattested_receipt_wire':reissued.hex(),
         'rejected_wires':{'equal_version_conflict':conflict.hex(),'operational_self_signed':self_signed.hex(),'excess_lifetime':too_long.hex(),'duplicate_keys':duplicate_ids.hex(),'root_as_operational':root_as_op.hex(),'reset_binding_conflict':conflicting_receipt.hex()},
         'cases':cases,'expected_sizes':[187,139,91]}
+    scoped_id=H(C('scoped-stream')+alice['iid']+alice['device_id']+circle)
+    scoped_manifest=manifest(alice,1,now,key,wraps,{p['iid']:p for p in identities},scope=circle)
+    scoped_doc=verify(scoped_manifest,bytes(alice['d'].verify_key))
+    assert scoped_doc['stream']==scoped_id and scoped_id!=stream_id(alice['iid'],alice['device_id'])
+    assert scoped_doc['commit']==H(C('epoch-key')+scoped_id+U32(1)+key)
+    vectors['circle_scope']={'circle_id':circle.hex(),'identity_id':alice['iid'].hex(),'device_id':alice['device_id'].hex(),'stream_id':scoped_id.hex(),'manifest_wire':scoped_manifest.hex(),'epoch_key':key.hex()}
     # Normalize tuples to JSON arrays for stable reload comparison.
     return json.loads(json.dumps(vectors))
 
