@@ -263,6 +263,36 @@ describe("circle-scoped records: review fixes", () => {
     await expect(a.client.enqueue(3, Uint8Array.of(91), { circleId: family })).rejects.toMatchObject({ code: "NOT_AUTHORIZED" });
   });
 
+  it("a public enqueue that raced a committed key and a disabled circle returns the stored record", async () => {
+    const { a, family } = await setup();
+    // The first call reads the key as absent, then pauses before anything else.
+    const read = a.store.read.bind(a.store);
+    let resume: () => void = () => undefined;
+    let paused: () => void = () => undefined;
+    const reached = new Promise<void>((r) => (paused = r));
+    let armed = true;
+    a.store.read = (async (fn: Parameters<typeof read>[0]) => {
+      const out = await read(fn);
+      if (armed) {
+        armed = false;
+        paused();
+        await new Promise<void>((r) => (resume = r));
+      }
+      return out;
+    }) as typeof a.store.read;
+    const first = a.client.enqueue(3, Uint8Array.of(92), { circleId: family, idempotencyKey: "race" });
+    await reached;
+    a.store.read = read;
+    // Meanwhile another call commits the key, and sharing to the circle is disabled.
+    const committed = await a.client.enqueue(3, Uint8Array.of(92), { circleId: family, idempotencyKey: "race" });
+    await a.client.circles.setEnabled(family, false);
+    resume();
+    const r = await first;
+    expect([toHex(r.localId), r.duplicate]).toEqual([toHex(committed.localId), true]);
+    // Without a committed key the refusal stands.
+    await expect(a.client.enqueue(3, Uint8Array.of(93), { circleId: family, idempotencyKey: "fresh" })).rejects.toMatchObject({ code: "NOT_AUTHORIZED" });
+  });
+
   it("the fake host keeps a scoped stream's first registration on a repeat", async () => {
     const { w, a, family } = await setup();
     await a.client.enqueue(3, Uint8Array.of(95), { circleId: family });

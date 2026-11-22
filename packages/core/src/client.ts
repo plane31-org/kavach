@@ -1053,20 +1053,33 @@ class ClientImpl implements Client {
     // A key answered before anything that may need the network: the record it names is already
     // durable, so a retry offline, or with a rotation due, returns it. The outbox checks the key
     // again inside its transaction for calls that race.
-    if (options.idempotencyKey !== undefined) {
+    const answered = async (): Promise<EnqueueResult | undefined> => {
+      if (options.idempotencyKey === undefined) return undefined;
       const seen = await this.store.read((tx) => tx.get("enqueueKeys", options.idempotencyKey ?? ""));
-      if (seen) return seen.recordId ? { localId: fromHex(seen.localId ?? seen.recordId), recordId: fromHex(seen.recordId), duplicate: true } : { localId: fromHex(seen.localId ?? ""), duplicate: true };
-    }
-    if (circleId) await this.initializeScopedStream(circleId);
-    // An epoch is prepared when one is due and the host can be reached; when it cannot (offline,
-    // metadata missing, an AUDIENCE_STALE fence), the record is queued unsealed and sealed by the
-    // next sync, so a hand-over never fails for a rotation the device cannot do right now.
+      if (!seen) return undefined;
+      return seen.recordId ? { localId: fromHex(seen.localId ?? seen.recordId), recordId: fromHex(seen.recordId), duplicate: true } : { localId: fromHex(seen.localId ?? ""), duplicate: true };
+    };
+    const known = await answered();
+    if (known) return known;
+    let r;
     try {
-      await this.ensureEpoch(circleId);
+      if (circleId) await this.initializeScopedStream(circleId);
+      // An epoch is prepared when one is due and the host can be reached; when it cannot (offline,
+      // metadata missing, an AUDIENCE_STALE fence), the record is queued unsealed and sealed by the
+      // next sync, so a hand-over never fails for a rotation the device cannot do right now.
+      try {
+        await this.ensureEpoch(circleId);
+      } catch (e) {
+        if (!(e instanceof KavachError) || !e.retryable) throw e;
+      }
+      r = await enqueue(deps, kind, payload, options);
     } catch (e) {
-      if (!(e instanceof KavachError) || !e.retryable) throw e;
+      // A call with the same key may have committed since the lookup above. Its record is durable,
+      // so it is the answer, ahead of any refusal this call met afterwards (a circle disabled since).
+      const raced = await answered();
+      if (raced) return raced;
+      throw e;
     }
-    const r = await enqueue(deps, kind, payload, options);
     if (r.rotated) this.emit({ kind: "refresh", reason: "rotation" });
     if (r.recordId || r.duplicate) return r.recordId ? { localId: r.localId, recordId: r.recordId, duplicate: r.duplicate } : { localId: r.localId, duplicate: r.duplicate };
     // Queued unsealed: if the device can rotate now (a hygiene rotation was due, say), it does, and

@@ -7,7 +7,7 @@
 - Add optional circle-scoped kinds and deterministic per-device/per-circle streams, reusing epochs, catch-up, cursors and delivery tracking.
 - Isolate latest-wins queues and newest slots by circle; expose circle ids on history/events and index circle history. Queue limits and idempotency remain account-wide.
 - Add idempotent scoped registration to the HTTP adapter, fake host and reference worker, with circle-specific publication and append checks.
-- `SyncReport.epoch` is the author stream's step; each own scoped stream's step is in the new `scopedEpochs`. A queued record whose circle is suspended no longer keeps `syncUntilDrained` running to `maxRounds`. An idempotency key is answered before the circle check inside the outbox transaction. The fake host keeps a scoped stream's first registration, as the worker does. Readers memoize derived scoped stream ids per certificate and circle.
+- `SyncReport.epoch` is the author stream's step; each own scoped stream's step is in the new `scopedEpochs`. A queued record whose circle is suspended no longer keeps `syncUntilDrained` running to `maxRounds`. An idempotency key is answered before any circle-eligibility refusal, in `enqueue()` and inside the outbox transaction. The fake host keeps a scoped stream's first registration, as the worker does. Readers memoize derived scoped stream ids per certificate and circle.
 - Clarify first-seal privacy, suspension/resumption, host-visible circle metadata and host/readers/senders rollout in adopted Amendment A2.
 
 Package versions follow semver for the TypeScript API. The protocol revision is a wire fact, tracked in `spec/Kavach-v1.md`; a package version names the revision it implements.
