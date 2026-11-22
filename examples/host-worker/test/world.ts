@@ -3,7 +3,7 @@ import { SELF, env } from "cloudflare:test";
 import { open, toHex, type Client, type ClientEvent, type ProviderLoadResult, type ProviderSaveResult, type ProviderStatusResult, type RecoveryProvider } from "@plane31/blind-relay";
 import { MemorySecretStore, MemoryStore } from "@plane31/blind-relay/adapters";
 import { TestClock, testPolicy } from "@plane31/blind-relay/testing";
-import { httpTransport } from "../client/httpTransport.js";
+import { httpTransport } from "@plane31/blind-relay/http";
 
 export class Platform implements RecoveryProvider {
   readonly items = new Map<string, Uint8Array>();
@@ -38,11 +38,15 @@ export async function device(name: string, provider = new Platform()): Promise<D
   const secrets = new MemorySecretStore();
   const events: ClientEvent[] = [];
   let certHash: Uint8Array | undefined;
+  // The client attaches itself: the reference host's stand-in bearer comes from the device the
+  // client speaks for, and the test clock rides along as a header of the app's own.
   const transport = httpTransport({
-    baseUrl: "https://host",
+    baseUrl: "https://host/v1",
     fetch: fetchHost,
-    caller: () => (certHash ? { accountName: name, certificateHash: certHash } : undefined),
-    now: clock.now
+    headers: (ctx) => {
+      const d = ctx?.device();
+      return { ...(d ? { authorization: `Bearer ${d.accountName}:${toHex(d.certificateHash)}` } : {}), "x-test-now": clock.now().toString() };
+    }
   });
   const client = await open({
     accountName: name,

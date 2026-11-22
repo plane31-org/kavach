@@ -43,6 +43,10 @@
     "./sodium": {
       "types": "./dist/crypto/sodium.d.ts",
       "import": "./dist/crypto/sodium.js"
+    },
+    "./http": {
+      "types": "./dist/http.d.ts",
+      "import": "./dist/http.js"
     }
   },
   "files": [

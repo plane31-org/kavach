@@ -3,7 +3,7 @@
  */
 import { fromHex, toHex } from "./bytes.js";
 import { rotationReason, MAX_COUNTER } from "./epoch.js";
-import { bodyHash } from "./crypto.js";
+import { bodyHash, randomBytes, recordId as deriveRecordId } from "./crypto.js";
 import { KavachError } from "./errors.js";
 import { indexHistory, unindexHistory } from "./historyIndex.js";
 import { kindOf, type RetentionPolicy } from "./policy.js";
@@ -16,17 +16,30 @@ import { META, REVISION, STREAM, currentRevision, t3ApplyChange } from "./transa
 import type { AppendOutcome, Relay } from "./transport.js";
 import { recordWireBytes, type RecordKind } from "./codec.js";
 
+/** Which record an event is about: its local id, which never changes, its current record id when sealed, and its idempotency key. */
+export interface RecordRef {
+  readonly localId: Uint8Array;
+  readonly recordId: Uint8Array | undefined;
+  readonly idempotencyKey: string | undefined;
+}
+
+export function refOf(key: string, row: OutboxRow): RecordRef {
+  return { localId: fromHex(key), recordId: row.recordId ? fromHex(row.recordId) : undefined, idempotencyKey: row.idempotencyKey };
+}
+
 export interface OutboxEvents {
-  queued?(recordId: Uint8Array, kind: RecordKind): void;
-  accepted?(recordId: Uint8Array): void;
-  cancelled?(recordId: Uint8Array, reason: string): void;
+  queued?(ref: RecordRef, kind: RecordKind): void;
+  /** The sender's own record was sealed and stored under its rules: at enqueue, or at the sync that sealed a deferred one. */
+  sealed?(ref: RecordRef, kind: RecordKind, tookSlot: boolean): void;
+  accepted?(ref: RecordRef): void;
+  cancelled?(ref: RecordRef, reason: string): void;
   /** A record of a kind with a newest slot was cancelled or is in doubt: the app may resend its current state of that kind. */
   refresh?(reason: string): void;
   securityError?(code: string, detail: string): void;
   /** The host refused records as AUDIENCE_STALE: they are held, and the next sync runs full. */
   audienceStale?(held: number): void;
-  /** A held record was sealed again under a new epoch: it has a new id, and the old one is gone. */
-  resealed?(oldRecordId: Uint8Array, newRecordId: Uint8Array): void;
+  /** A held record was sealed again under a new epoch: `ref.recordId` is the new id, and the old one is gone. */
+  resealed?(ref: RecordRef, oldRecordId: Uint8Array): void;
 }
 
 export interface OutboxDeps {
@@ -67,13 +80,16 @@ export interface EnqueueOptions {
 }
 
 export interface Enqueued {
-  recordId: Uint8Array;
-  counter: number;
-  epoch: number;
+  /** The record's local id: stable for its whole life, across a deferred seal and a reseal. */
+  localId: Uint8Array;
+  /** The record id, when the record was sealed at enqueue; absent when sealing was deferred. */
+  recordId: Uint8Array | undefined;
   /** True when the idempotency key matched an earlier enqueue and this call made no record. */
   duplicate: boolean;
   /** True when this record took the sender's own newest slot for its kind. */
   own: boolean;
+  /** True when this enqueue retired the epoch (hygiene or the last counter); rows queued under it were cancelled. */
+  rotated: boolean;
 }
 
 export const MAX_IDEMPOTENCY_KEY = 128;
@@ -95,110 +111,146 @@ export async function enqueue(deps: OutboxDeps, kind: RecordKind, payload: Uint8
   // One reading of the event time for the envelope, the own slot and the history row: zero is none.
   const eventTime = options.eventTime === undefined || options.eventTime === 0n ? undefined : options.eventTime;
   if (eventTime !== undefined && eventTime < 0n) throw new KavachError("MALFORMED", stage, "event time before the epoch");
-  const superseded: Uint8Array[] = [];
-  const result = await deps.store.transaction((tx) => {
+  const superseded: RecordRef[] = [];
+  const result = await deps.store.transaction((tx): Enqueued => {
     requireReady(tx);
     if (key !== undefined) {
       const seen = tx.get("enqueueKeys", key);
-      if (seen) return { recordId: fromHex(seen.recordId), counter: seen.counter, epoch: seen.epoch, duplicate: true, own: false } as const;
+      if (seen) return { localId: fromHex(seen.localId ?? seen.recordId), recordId: seen.recordId ? fromHex(seen.recordId) : undefined, duplicate: true, own: false, rotated: false };
     }
     const revision = tx.get("revision", REVISION);
-    if (revision?.paused === "metadata") throw new KavachError("METADATA_REQUIRED", stage);
     if (revision?.paused === "limit") throw new KavachError("RECIPIENT_LIMIT", stage);
-    const stream = tx.get("stream", STREAM);
-    if (!stream || stream.activeEpoch === undefined || revision?.paused === "rotation") throw new KavachError("ROTATION_REQUIRED", stage, "no active epoch");
-    const epoch = tx.get("epochs", String(stream.activeEpoch));
-    if (!epoch || epoch.status !== "active") throw new KavachError("ROTATION_REQUIRED", stage, "epoch not active");
     const now = deps.now();
-    const reason = rotationReason({ createdAt: unbig(epoch.createdAt), nextCounter: epoch.nextCounter, lastSentAt: epoch.lastSentAt === undefined ? undefined : unbig(epoch.lastSentAt) }, now, deps.policy.hygieneRotationMs);
-    if (reason) {
-      // Commit the invalidation (T3) and report the rotation after the transaction, so the
-      // burned counters and cancelled rows are durable even though nothing was enqueued.
-      t3ApplyChange(tx, { kind: reason });
-      return { rotate: reason } as const;
+    // A usable epoch seals the record now; without one (a rotation pending or due, metadata
+    // missing, an AUDIENCE_STALE fence) the record is queued unsealed and sealed at the next sync.
+    let epoch = usableEpoch(tx);
+    let rotated = false;
+    if (epoch) {
+      const reason = rotationReason({ createdAt: unbig(epoch.createdAt), nextCounter: epoch.nextCounter, lastSentAt: epoch.lastSentAt === undefined ? undefined : unbig(epoch.lastSentAt) }, now, deps.policy.hygieneRotationMs);
+      if (reason) {
+        t3ApplyChange(tx, { kind: reason }); // T3: the epoch is retired; this record waits for the next one
+        epoch = undefined;
+        rotated = true;
+      }
     }
     let count = 0;
     let bytes = 0;
-    for (const [key, row] of tx.list("outbox")) {
-      if (declared.queue === "latestWins" && row.kind === kind && (row.status === "queued" || row.status === "held")) {
-        tx.put("outbox", key, terminal(row, "cancelled", "superseded"));
-        superseded.push(fromHex(row.recordId));
+    for (const [k, row] of tx.list("outbox")) {
+      if (declared.queue === "latestWins" && row.kind === kind && (row.status === "queued" || row.status === "held" || row.status === "unsealed")) {
+        tx.put("outbox", k, terminal(row, "cancelled", "superseded"));
+        superseded.push(refOf(k, row));
         continue;
       }
-      if (row.status === "queued" || row.status === "inflight" || row.status === "held") {
+      if (row.status === "queued" || row.status === "inflight" || row.status === "held" || row.status === "unsealed") {
         count++;
-        bytes += row.wire.length / 2;
+        bytes += row.wire ? row.wire.length / 2 : recordWireBytes((row.payload?.length ?? 0) / 2);
       }
     }
     if (count >= deps.policy.maxOutboxRecords || bytes + recordWireBytes(payload.length) > deps.policy.maxOutboxBytes) throw new KavachError("QUEUE_FULL", stage);
     const a = deps.author();
-    const sealed = sealRecord({
-      streamId: a.streamId,
-      epoch: epoch.epoch,
-      nextCounter: epoch.nextCounter,
-      kind,
-      eventTime,
-      headerClass: declared.headerClass,
-      payload,
-      sentAt: now,
-      epochKey: fromHex(epoch.epochKey),
-      signingSecretKey: a.signingSecretKey
-    });
-    const id = toHex(sealed.recordId);
-    tx.put("outbox", id, {
-      recordId: id,
-      wire: toHex(sealed.wire),
-      epoch: epoch.epoch,
-      counter: sealed.counter,
+    // The local id: the record id it is sealed with now, or a fresh one when sealing waits.
+    const localId = epoch ? toHex(deriveRecordId(a.streamId, epoch.epoch, epoch.nextCounter)) : toHex(randomBytes(32)); // 32 bytes, like a record id
+    const base: OutboxRow = {
+      recordId: "",
+      wire: "",
+      epoch: 0,
+      counter: 0,
       kind,
       sentAt: big(now),
       desiredRevision: big(currentRevision(tx)),
-      status: "queued",
+      status: "unsealed",
       attempts: 0,
       reason: undefined,
-      // Kept until acceptance, so a record the host refuses as AUDIENCE_STALE is resealed, not lost.
+      // Kept until acceptance, so a deferred record can be sealed and a refused one resealed.
       payload: toHex(payload),
-      ...(eventTime === undefined ? {} : { eventTime: big(eventTime) })
-    });
-    if (key !== undefined) tx.put("enqueueKeys", key, { recordId: id, epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now) });
-    // The sender's own row, under the rules a reader applies (section 10): history when the kind
-    // keeps it, and the own newest slot when the kind has one, so `newest` answers for self.
-    const self = toHex(a.identityId);
-    const hash = toHex(bodyHash(sealed.wire.subarray(0, sealed.wire.length - 64)));
-    const own = declared.newest ? takeSlot(tx, self, kind, { generation: a.generation, eventTime: clampEventTime(eventTime, now), epoch: epoch.epoch, counter: sealed.counter, recordId: id, bodyHash: hash, sentAt: now, receivedAt: now, payload }, toHex) : false;
-    if (declared.history) {
-      const ownRow: HistoryRow = {
-        recordId: id,
-        authorIdentityId: toHex(a.identityId),
-        streamId: toHex(a.streamId),
-        generation: big(a.generation),
-        epoch: epoch.epoch,
-        counter: sealed.counter,
-        kind,
-        sentAt: big(now),
-        receivedAt: big(now),
-        plaintext: toHex(payload),
-        superseded: false,
-        own: true,
-        ...(eventTime === undefined ? {} : { eventTime: big(eventTime) })
-      };
-      tx.put("history", id, ownRow);
-      indexHistory(tx, ownRow);
-    }
-    const nextCounter = epoch.nextCounter + 1;
-    tx.put("epochs", String(epoch.epoch), { ...epoch, nextCounter, lastSentAt: big(now) });
-    if (nextCounter > MAX_COUNTER) {
-      // The final counter was just used: the next enqueue rotates.
-    }
-    return { recordId: sealed.recordId, counter: sealed.counter, epoch: epoch.epoch, duplicate: false, own } as const;
+      ...(eventTime === undefined ? {} : { eventTime: big(eventTime) }),
+      ...(key === undefined ? {} : { idempotencyKey: key })
+    };
+    tx.put("outbox", localId, base);
+    if (key !== undefined) tx.put("enqueueKeys", key, { localId, recordId: "", epoch: 0, counter: 0, sentAt: big(now) });
+    if (!epoch) return { localId: fromHex(localId), recordId: undefined, duplicate: false, own: false, rotated };
+    const sealed = firstSealIn(tx, deps, localId, base, epoch, now);
+    return { localId: fromHex(localId), recordId: fromHex(sealed.recordId), duplicate: false, own: sealed.own, rotated };
   });
-  if ("rotate" in result) {
-    throw new KavachError(result.rotate === "counterExhausted" ? "COUNTER_EXHAUSTED" : "ROTATION_REQUIRED", stage, result.rotate);
-  }
   if (result.duplicate) return result;
-  for (const id of superseded) deps.events?.cancelled?.(id, "superseded");
-  deps.events?.queued?.(result.recordId, kind);
+  for (const ref of superseded) deps.events?.cancelled?.(ref, "superseded");
+  const ref: RecordRef = { localId: result.localId, recordId: result.recordId, idempotencyKey: key };
+  deps.events?.queued?.(ref, kind);
+  if (result.recordId) deps.events?.sealed?.(ref, kind, result.own);
   return result;
+}
+
+/**
+ * The active epoch a record may be sealed under now: active, unpaused (rotation, metadata, an
+ * audience limit), outside an AUDIENCE_STALE fence and with a counter left. A hygiene rotation that
+ * is due is the caller's to apply.
+ */
+function usableEpoch(tx: Pick<Tx, "get">): EpochRow | undefined {
+  const meta = tx.get("meta", META);
+  if (meta?.fullSyncDue) return undefined;
+  const revision = tx.get("revision", REVISION);
+  if (revision?.paused === "metadata" || revision?.paused === "limit" || revision?.paused === "rotation") return undefined;
+  const stream = tx.get("stream", STREAM);
+  if (!stream || stream.activeEpoch === undefined) return undefined;
+  const epoch = tx.get("epochs", String(stream.activeEpoch));
+  return epoch && epoch.status === "active" && epoch.nextCounter <= MAX_COUNTER ? epoch : undefined;
+}
+
+/**
+ * Seal a record for the first time under `epoch` (T6), at its local id `key`: the wire, the
+ * sender's own history row and newest slot under the reader's rules (section 10), the idempotency
+ * key's record id, and the epoch's counter, in the caller's transaction. Used by `enqueue` with a
+ * usable epoch and by the sender for a record enqueued unsealed.
+ */
+function firstSealIn(tx: Tx, deps: OutboxDeps, key: string, row: OutboxRow, epoch: EpochRow, now: bigint): { epoch: EpochRow; recordId: string; own: boolean } {
+  const declared = kindOf(deps.policy, row.kind);
+  if (!declared || row.payload === undefined) throw new KavachError("MALFORMED", "enqueue", "kind not declared or payload gone");
+  const a = deps.author();
+  const eventTime = row.eventTime === undefined ? undefined : unbig(row.eventTime);
+  const payload = fromHex(row.payload);
+  const sealed = sealRecord({
+    streamId: a.streamId,
+    epoch: epoch.epoch,
+    nextCounter: epoch.nextCounter,
+    kind: row.kind,
+    eventTime,
+    headerClass: declared.headerClass,
+    payload,
+    sentAt: now,
+    epochKey: fromHex(epoch.epochKey),
+    signingSecretKey: a.signingSecretKey
+  });
+  const id = toHex(sealed.recordId);
+  tx.put("outbox", key, { ...row, recordId: id, wire: toHex(sealed.wire), epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), desiredRevision: big(currentRevision(tx)), status: "queued" });
+  if (row.idempotencyKey !== undefined) {
+    const k = tx.get("enqueueKeys", row.idempotencyKey);
+    if (k) tx.put("enqueueKeys", row.idempotencyKey, { ...k, localId: key, recordId: id, epoch: epoch.epoch, counter: sealed.counter });
+  }
+  const self = toHex(a.identityId);
+  const hash = toHex(bodyHash(sealed.wire.subarray(0, sealed.wire.length - 64)));
+  const own = declared.newest ? takeSlot(tx, self, row.kind, { generation: a.generation, eventTime: clampEventTime(eventTime, now), epoch: epoch.epoch, counter: sealed.counter, recordId: id, bodyHash: hash, sentAt: now, receivedAt: now, payload }, toHex) : false;
+  if (declared.history) {
+    const ownRow: HistoryRow = {
+      recordId: id,
+      authorIdentityId: self,
+      streamId: toHex(a.streamId),
+      generation: big(a.generation),
+      epoch: epoch.epoch,
+      counter: sealed.counter,
+      kind: row.kind,
+      sentAt: big(now),
+      receivedAt: big(now),
+      plaintext: row.payload,
+      superseded: false,
+      own: true,
+      ...(eventTime === undefined ? {} : { eventTime: big(eventTime) })
+    };
+    tx.put("history", id, ownRow);
+    indexHistory(tx, ownRow);
+  }
+  const next: EpochRow = { ...epoch, nextCounter: epoch.nextCounter + 1, lastSentAt: big(now) };
+  tx.put("epochs", String(epoch.epoch), next);
+  return { epoch: next, recordId: id, own };
 }
 
 export interface DrainSummary {
@@ -266,16 +318,6 @@ export function terminal(row: OutboxRow, status: "cancelled" | "unknown", reason
   return { ...rest, wire: "", status, reason };
 }
 
-/** The active epoch a held record may be resealed under: active, unpaused, newer than the refused one, with a counter left. */
-function resealEpoch(tx: Pick<Tx, "get">): EpochRow | undefined {
-  const revision = tx.get("revision", REVISION);
-  if (revision?.paused === "metadata" || revision?.paused === "limit" || revision?.paused === "rotation") return undefined;
-  const stream = tx.get("stream", STREAM);
-  if (!stream || stream.activeEpoch === undefined) return undefined;
-  const epoch = tx.get("epochs", String(stream.activeEpoch));
-  return epoch && epoch.status === "active" && epoch.nextCounter <= MAX_COUNTER ? epoch : undefined;
-}
-
 /**
  * Seal a held record again under `epoch`, with the next counter: a new record with a new id. The
  * row, the sender's own history row and slot, and an idempotency key that named the old id all
@@ -303,8 +345,8 @@ function resealIn(tx: Tx, deps: OutboxDeps, key: string, row: OutboxRow, epoch: 
   const newId = toHex(sealed.recordId);
   const { heldEpoch: _held, ...rest } = row;
   void _held;
-  tx.delete("outbox", key);
-  tx.put("outbox", newId, { ...rest, recordId: newId, wire: toHex(sealed.wire), epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), desiredRevision: big(currentRevision(tx)), status: "queued", attempts: 0, reason: undefined, resealed: true });
+  // The row stays at its local id: only the record id moves.
+  tx.put("outbox", key, { ...rest, recordId: newId, wire: toHex(sealed.wire), epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), desiredRevision: big(currentRevision(tx)), status: "queued", attempts: 0, reason: undefined, resealed: true });
   const next: EpochRow = { ...epoch, nextCounter: epoch.nextCounter + 1, lastSentAt: big(now) };
   tx.put("epochs", String(epoch.epoch), next);
   const history = tx.get("history", oldId);
@@ -320,8 +362,70 @@ function resealIn(tx: Tx, deps: OutboxDeps, key: string, row: OutboxRow, epoch: 
   if (own?.recordId === oldId) {
     tx.put("newest", slot, { ...own, recordId: newId, epoch: epoch.epoch, counter: sealed.counter, sentAt: big(now), eventTime: big(clampEventTime(eventTime, now)), bodyHash: toHex(bodyHash(sealed.wire.subarray(0, sealed.wire.length - 64))) });
   }
-  for (const [k, e] of tx.list("enqueueKeys")) if (e.recordId === oldId) tx.put("enqueueKeys", k, { ...e, recordId: newId, epoch: epoch.epoch, counter: sealed.counter });
+  if (row.idempotencyKey !== undefined) {
+    const k = tx.get("enqueueKeys", row.idempotencyKey);
+    if (k) tx.put("enqueueKeys", row.idempotencyKey, { ...k, localId: k.localId ?? key, recordId: newId, epoch: epoch.epoch, counter: sealed.counter });
+  } else for (const [k, e] of tx.list("enqueueKeys")) if (e.recordId === oldId) tx.put("enqueueKeys", k, { ...e, localId: e.localId ?? key, recordId: newId, epoch: epoch.epoch, counter: sealed.counter });
   return { epoch: next, oldId, newId };
+}
+
+/**
+ * Records waiting for an epoch, oldest first: past their window they are cancelled; under a usable
+ * epoch a held one is sealed again once (never under the epoch it was refused in) and an unsealed
+ * one is sealed for the first time. Returns how many were cancelled; events go to `after`.
+ */
+function sealWaitingIn(tx: Tx, deps: OutboxDeps, now: bigint, summary: Pick<DrainSummary, "resealed">, after: (() => void)[]): number {
+  // Records waiting for an epoch first, oldest first: past their window they are cancelled;
+  // under a usable epoch a held one is sealed again once (never under the epoch it was refused
+  // in) and an unsealed one is sealed for the first time. Then they go out like any queued record.
+  let target = usableEpoch(tx);
+  let cancelled = 0;
+  const waiting = [...tx.list("outbox")].filter(([, r]) => r.status === "held" || r.status === "unsealed").sort(([, a], [, b]) => (a.status === b.status ? 0 : a.status === "held" ? -1 : 1) || a.epoch - b.epoch || a.counter - b.counter || (a.sentAt < b.sentAt ? -1 : a.sentAt > b.sentAt ? 1 : 0));
+  for (const [key, row] of waiting) {
+    if (unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now) {
+      tx.put("outbox", key, terminal(row, "cancelled", "expired"));
+      cancelled++;
+      after.push(() => deps.events?.cancelled?.(refOf(key, row), "expired"));
+      continue;
+    }
+    if (!target || target.nextCounter > MAX_COUNTER) continue;
+    if (row.status === "held") {
+      if (target.epoch <= (row.heldEpoch ?? row.epoch)) continue;
+      const moved = resealIn(tx, deps, key, row, target, now);
+      if (!moved) continue;
+      target = moved.epoch;
+      summary.resealed++;
+      const ref: RecordRef = { localId: fromHex(key), recordId: fromHex(moved.newId), idempotencyKey: row.idempotencyKey };
+      after.push(() => deps.events?.resealed?.(ref, fromHex(moved.oldId)));
+    } else {
+      if (!kindOf(deps.policy, row.kind)) {
+        // The kind left the policy while the record waited: it cannot be sealed.
+        tx.put("outbox", key, terminal(row, "cancelled", "undeclared"));
+        cancelled++;
+        after.push(() => deps.events?.cancelled?.(refOf(key, row), "undeclared"));
+        continue;
+      }
+      const sealed = firstSealIn(tx, deps, key, row, target, now);
+      target = sealed.epoch;
+      const ref: RecordRef = { localId: fromHex(key), recordId: fromHex(sealed.recordId), idempotencyKey: row.idempotencyKey };
+      after.push(() => deps.events?.sealed?.(ref, row.kind, sealed.own));
+    }
+  }
+  return cancelled;
+}
+
+/**
+ * Seal what waits for an epoch now, without sending (0.9.0): `enqueue` calls it after preparing an
+ * epoch, so a record queued unsealed is sealed at once when the device could rotate.
+ */
+export async function sealWaiting(deps: OutboxDeps): Promise<void> {
+  const after: (() => void)[] = [];
+  await deps.store.transaction((tx) => {
+    const meta = tx.get("meta", META);
+    if (!meta || meta.state !== "ACTIVE") return;
+    sealWaitingIn(tx, deps, deps.now(), { resealed: 0 }, after);
+  });
+  for (const fire of after) fire();
 }
 
 async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<HandoffStep> {
@@ -337,25 +441,8 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
     // passed) is cancelled here, in bounded batches, and the first sendable row goes out in the
     // same transaction. A backlog of dead rows costs one scan, not one transaction per row.
     const live: [string, OutboxRow][] = [];
-    let cancelled = 0;
     let refresh = false;
-    // Held records first: past their window they are cancelled, under a newer usable epoch they
-    // are sealed again once, in their original order, and then go out like any queued record.
-    let target = resealEpoch(tx);
-    for (const [key, row] of [...tx.list("outbox")].filter(([, r]) => r.status === "held").sort(([, a], [, b]) => a.epoch - b.epoch || a.counter - b.counter)) {
-      if (unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now) {
-        tx.put("outbox", key, terminal(row, "cancelled", "expired"));
-        cancelled++;
-        after.push(() => deps.events?.cancelled?.(fromHex(row.recordId), "expired"));
-        continue;
-      }
-      if (!target || target.epoch <= (row.heldEpoch ?? row.epoch) || target.nextCounter > MAX_COUNTER) continue;
-      const moved = resealIn(tx, deps, key, row, target, now);
-      if (!moved) continue;
-      target = moved.epoch;
-      summary.resealed++;
-      after.push(() => deps.events?.resealed?.(fromHex(moved.oldId), fromHex(moved.newId)));
-    }
+    let cancelled = sealWaitingIn(tx, deps, now, summary, after);
     for (const [key, row] of [...tx.list("outbox")].sort(([, a], [, b]) => a.epoch - b.epoch || a.counter - b.counter)) {
       if (row.status !== "queued" && row.status !== "inflight") continue;
       const reason = cancelled >= CANCEL_BATCH ? undefined : unbig(row.desiredRevision) !== revision ? "rotation" : unbig(row.sentAt) + deps.policy.deliveryWindowMs <= now ? "expired" : undefined;
@@ -365,7 +452,7 @@ async function handoffNext(deps: OutboxDeps, summary: DrainSummary): Promise<Han
       }
       tx.put("outbox", key, terminal(row, "cancelled", reason));
       cancelled++;
-      after.push(() => deps.events?.cancelled?.(fromHex(row.recordId), reason));
+      after.push(() => deps.events?.cancelled?.(refOf(key, row), reason));
       if (reason === "rotation" && kindOf(deps.policy, row.kind)?.newest) refresh = true;
     }
     summary.cancelled += cancelled;
@@ -399,7 +486,7 @@ export async function recordOutcome(deps: OutboxDeps, key: string, outcome: Appe
   const final = await deps.store.transaction((tx): Final => {
     const row = tx.get("outbox", key);
     if (!row || row.status !== "inflight") return "retry";
-    const id = fromHex(row.recordId);
+    const id = refOf(key, row);
     const requeue = (): void => tx.put("outbox", key, { ...row, status: "queued", reason: undefined });
     const cancel = (reason: string): void => tx.put("outbox", key, terminal(row, "cancelled", reason));
     if (!outcome) {
@@ -408,10 +495,17 @@ export async function recordOutcome(deps: OutboxDeps, key: string, outcome: Appe
     }
     switch (outcome.status) {
       case "ACCEPTED":
-      case "ALREADY_ACCEPTED":
-        tx.delete("outbox", key);
+      case "ALREADY_ACCEPTED": {
+        // Kept without bytes for the delivery window, so `delivery(localId)` can answer later, from
+        // any runtime; the retention purge removes it with the other finished rows.
+        const { payload: _payload, eventTime: _eventTime, heldEpoch: _heldEpoch, ...rest } = row;
+        void _payload;
+        void _eventTime;
+        void _heldEpoch;
+        tx.put("outbox", key, { ...rest, wire: "", status: "accepted", reason: undefined });
         after.push(() => deps.events?.accepted?.(id));
         return "accepted";
+      }
       case "RETRYABLE":
         requeue();
         return "retry";
@@ -436,7 +530,7 @@ export async function recordOutcome(deps: OutboxDeps, key: string, outcome: Appe
         const rows = tx.list("outbox").filter(([k, r]) => k === key || (r.epoch === row.epoch && r.status === "queued"));
         for (const [k, r] of rows) {
           const current = k === key ? row : r;
-          const rid = fromHex(current.recordId);
+          const rid = refOf(k, current);
           if (current.resealed || current.payload === undefined) {
             tx.put("outbox", k, terminal(current, "cancelled", "AUDIENCE_STALE"));
             after.push(() => deps.events?.cancelled?.(rid, "AUDIENCE_STALE"));
@@ -474,7 +568,7 @@ export async function purgeOutbox(store: Store, policy: RetentionPolicy, now: bi
   return store.transaction((tx) => {
     let purged = 0;
     for (const [key, row] of tx.list("outbox")) {
-      if ((row.status === "cancelled" || row.status === "unknown") && unbig(row.sentAt) + policy.deliveryWindowMs <= now) {
+      if ((row.status === "cancelled" || row.status === "unknown" || row.status === "accepted") && unbig(row.sentAt) + policy.deliveryWindowMs <= now) {
         tx.delete("outbox", key);
         purged++;
       }
@@ -490,6 +584,8 @@ export interface OutboxCounts {
   readonly inflight: number;
   /** Refused as AUDIENCE_STALE, waiting for the next epoch. */
   readonly held: number;
+  /** Enqueued while no epoch was usable, waiting to be sealed. */
+  readonly unsealed: number;
   readonly cancelled: number;
   readonly unknown: number;
   /** Age of the oldest row still to send, when there is one. */
@@ -498,12 +594,12 @@ export interface OutboxCounts {
 
 /** Rows by state, for diagnostics. */
 export function outboxCounts(tx: Pick<Tx, "list">, now: bigint): OutboxCounts {
-  const counts = { queued: 0, inflight: 0, held: 0, cancelled: 0, unknown: 0 };
+  const counts = { queued: 0, inflight: 0, held: 0, unsealed: 0, cancelled: 0, unknown: 0 };
   let oldest: bigint | undefined;
   for (const [, r] of tx.list("outbox")) {
     if (r.status === "accepted") continue;
     counts[r.status]++;
-    if (r.status === "queued" || r.status === "inflight" || r.status === "held") {
+    if (r.status === "queued" || r.status === "inflight" || r.status === "held" || r.status === "unsealed") {
       const sentAt = unbig(r.sentAt);
       if (oldest === undefined || sentAt < oldest) oldest = sentAt;
     }
@@ -518,5 +614,5 @@ export async function outboxCount(store: Store): Promise<number> {
 
 /** The records still to send, inside a read the caller holds. */
 export function outboxCountIn(tx: Pick<Tx, "list">): number {
-  return tx.list("outbox").filter(([, r]) => r.status === "queued" || r.status === "inflight" || r.status === "held").length;
+  return tx.list("outbox").filter(([, r]) => r.status === "queued" || r.status === "inflight" || r.status === "held" || r.status === "unsealed").length;
 }

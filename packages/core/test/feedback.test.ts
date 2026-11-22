@@ -148,7 +148,7 @@ describe("feedback findings", () => {
     await enqueueLocation(a.client, w.loc(2));
     const r = await w.sync(a);
     expect([r.errors, r.outbox.accepted]).toEqual([[], 1]);
-    expect(await a.store.read((tx) => tx.count("outbox"))).toBe(0);
+    expect(await a.store.read((tx) => tx.list("outbox").filter(([, r]) => r.status !== "accepted").length)).toBe(0);
     expect(seen).toContain("accepted");
     expect((await w.sync(a)).outbox.sent).toBe(0);
   });
@@ -181,7 +181,7 @@ describe("feedback findings", () => {
     expect(i.vault).toEqual({ revision: BigInt(vault?.revision ?? "0"), pending: false, dirty: false });
     expect(JSON.stringify(i, (_, v) => (typeof v === "bigint" ? v.toString() : v))).not.toContain(toHex((await a.secrets.get("accountSeed")) ?? new Uint8Array(1)));
     await w.sync(a);
-    expect((await a.client.inspect()).outbox).toEqual({ queued: 0, inflight: 0, held: 0, cancelled: 0, unknown: 0, oldestPendingAgeMs: undefined });
+    expect((await a.client.inspect()).outbox).toEqual({ queued: 0, inflight: 0, held: 0, unsealed: 0, cancelled: 0, unknown: 0, oldestPendingAgeMs: undefined });
   });
 
   it("9: an expired backlog does not delay a fresh location: one sync cancels the old rows and delivers the new one", async () => {
@@ -630,7 +630,7 @@ describe("feedback findings", () => {
     expect([...(stream?.records.values() ?? [])].map((x) => x.kind).sort()).toEqual([]); // delivered and deleted: the relay kept no copy
   });
 
-  it("26: a retry of a saved key is answered offline, even with a rotation due; a new record still needs the network", async () => {
+  it("26: a retry of a saved key is answered offline, even with a rotation due; a new record waits unsealed and goes out once the host is back", async () => {
     const w = world();
     const { a } = await pair(w);
     const first = await a.client.enqueue(0, Uint8Array.of(1), { idempotencyKey: "fix:9", eventTime: w.clock.now() });
@@ -642,7 +642,19 @@ describe("feedback findings", () => {
     const again = await a.client.enqueue(0, Uint8Array.of(1), { idempotencyKey: "fix:9", eventTime: w.clock.now() });
     expect([again.duplicate, toHex(again.recordId)]).toEqual([true, toHex(first.recordId)]);
     expect(a.t.calls.filter((c) => c === "publishEpoch").length).toBe(publishes);
-    expect(await thrown(() => a.client.enqueue(0, Uint8Array.of(2), { idempotencyKey: "fix:10" }))).toBe("NETWORK");
+    // The host stays unreachable for epoch publication while the new record is enqueued.
+    const relay = a.t.relay as { publishEpoch: unknown };
+    const publish = relay.publishEpoch;
+    relay.publishEpoch = () => Promise.reject(new KavachError("NETWORK", "transport", "unreachable"));
+    const offline = await a.client.enqueue(0, Uint8Array.of(2), { idempotencyKey: "fix:10" });
+    expect(offline.recordId).toBeUndefined();
+    const retried = await a.client.enqueue(0, Uint8Array.of(2), { idempotencyKey: "fix:10" });
+    expect([retried.duplicate, toHex(retried.localId)]).toEqual([true, toHex(offline.localId)]);
+    relay.publishEpoch = publish;
+    a.t.knobs.refuse.delete("publishEpoch");
+    const r = await w.sync(a);
+    expect(r.outbox.accepted).toBe(1);
+    expect((await a.client.delivery(offline.localId))?.status).toBe("accepted");
   });
 
   it("27: a zero event time is none on both sides: sender and reader agree on the newest record", async () => {

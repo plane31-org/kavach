@@ -6,8 +6,9 @@ export default defineWorkersConfig(async () => {
   const core = path.join(__dirname, "../../packages/core/src/index.ts");
   const coreTesting = path.join(__dirname, "../../packages/core/src/testing/index.ts");
   const coreAdapters = path.join(__dirname, "../../packages/core/src/adapters/index.ts");
+  const coreHttp = path.join(__dirname, "../../packages/core/src/http.ts");
   return {
-    resolve: { alias: { "@plane31/blind-relay/testing": coreTesting, "@plane31/blind-relay/adapters": coreAdapters, "@plane31/blind-relay": core } },
+    resolve: { alias: { "@plane31/blind-relay/testing": coreTesting, "@plane31/blind-relay/adapters": coreAdapters, "@plane31/blind-relay/http": coreHttp, "@plane31/blind-relay": core } },
     test: {
       include: ["test/**/*.test.ts"],
       // Integration tests over workerd: the default 5 s is too tight on a loaded CI runner.

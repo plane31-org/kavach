@@ -114,7 +114,8 @@ export type {
   SuccessionLink,
   SuccessionPage,
   SyncState,
-  Transport
+  Transport,
+  TransportContext
 } from "../transport.js";
 
 // Recovery provider --------------------------------------------------------------------------------

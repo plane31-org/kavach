@@ -17,7 +17,12 @@ export interface SecretStore {
   delete(name: SecretName): Promise<void>;
 }
 
-export type SecretName = "accountSeed" | "deviceSeed" | "recoveryKey" | "storageKey" | "instanceId" | "pendingReset" | "pendingReplacement";
+/**
+ * `eraseGeneration` (0.9.0) is not the account's: a marker an erasure replaces before deleting
+ * anything, so another runtime holding the database open learns of it and lets go. It outlives
+ * the erasure, which is why it is not in `SECRET_NAMES`.
+ */
+export type SecretName = "accountSeed" | "deviceSeed" | "recoveryKey" | "storageKey" | "instanceId" | "pendingReset" | "pendingReplacement" | "eraseGeneration";
 
 /** Every secret the SDK keeps for an account, in the order an erasure deletes them: the account's roots first, the storage key last, so an interrupted erasure leaves a store that refuses to open rather than one that re-enrolls under old roots. */
 export const SECRET_NAMES: readonly SecretName[] = ["accountSeed", "deviceSeed", "recoveryKey", "instanceId", "pendingReset", "pendingReplacement", "storageKey"];
@@ -143,10 +148,21 @@ export interface StreamRow {
   pendingEpoch: number | undefined;
 }
 
-/** `held` (revision 12): refused as `AUDIENCE_STALE`, kept with its payload until a new epoch, then resealed once. */
-export type OutboxStatus = "queued" | "inflight" | "held" | "accepted" | "cancelled" | "unknown";
+/**
+ * `unsealed` (0.9.0): enqueued while no epoch was usable; sealed at the next sync. `held` (revision
+ * 12): refused as `AUDIENCE_STALE`, kept with its payload until a new epoch, then resealed once.
+ * `accepted`: the relay took it; the row keeps its summary without bytes for the delivery window,
+ * so `delivery(localId)` answers from any runtime.
+ */
+export type OutboxStatus = "unsealed" | "queued" | "inflight" | "held" | "accepted" | "cancelled" | "unknown";
 
+/**
+ * One outbound record, keyed by its local id: the record id it was first sealed with, or a fresh
+ * random id when sealing was deferred. The key never changes; a reseal or a deferred seal updates
+ * `recordId` in place. Rows from before 0.9.0 are keyed by their record id, which is their local id.
+ */
 export interface OutboxRow {
+  /** The current record id; empty while unsealed. */
   recordId: string;
   wire: string;
   epoch: number;
@@ -168,6 +184,8 @@ export interface OutboxRow {
   heldEpoch?: number;
   /** Set once the row has been resealed: a second `AUDIENCE_STALE` cancels it. */
   resealed?: boolean;
+  /** The idempotency key the record was enqueued under, carried on its lifecycle events. */
+  idempotencyKey?: string;
 }
 
 export interface HistoryRow {
@@ -289,6 +307,9 @@ export interface HistoryIndexRow {
 
 /** A caller's idempotency key and the record it produced, kept for the delivery window. */
 export interface EnqueueKeyRow {
+  /** The record's local id (0.9.0); absent on rows from before, whose local id is `recordId`. */
+  localId?: string;
+  /** The current record id; empty while the record is unsealed. */
   recordId: string;
   epoch: number;
   counter: number;
@@ -419,6 +440,8 @@ export interface Tables {
   replacement: ReplacementRow;
   preferences: PreferenceRow;
   chainProgress: ChainProgressRow;
+  /** The pending join requests last read for a circle this device owns (0.9.0); absent when there are none. */
+  joinRequests: { circleId: string; accountNames: string[] };
 }
 
 export type TableName = keyof Tables;
@@ -459,7 +482,8 @@ export const RESET_TABLE_POLICY: Readonly<Record<TableName, "clear" | "keep">> =
   keyChanges: "clear",
   replacement: "clear",
   preferences: "clear",
-  chainProgress: "clear"
+  chainProgress: "clear",
+  joinRequests: "clear"
 };
 
 /** Bounds for `Tx.range`: every given bound applies; an absent one is open. */

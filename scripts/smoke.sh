@@ -17,6 +17,7 @@ const core = await import("@plane31/blind-relay");
 const adapters = await import("@plane31/blind-relay/adapters");
 const testing = await import("@plane31/blind-relay/testing");
 const sodium = await import("@plane31/blind-relay/sodium");
+const http = await import("@plane31/blind-relay/http");
 const expo = await import("@plane31/blind-relay-expo");
 const must = (ok, what) => { if (!ok) throw new Error("smoke: " + what); };
 must(typeof core.open === "function" && core.PROTOCOL_REVISION >= 8, "core entry");
@@ -24,11 +25,12 @@ must(typeof adapters.MemoryStore === "function" && typeof adapters.buildResetKey
 must(typeof testing.FakeHost === "function", "testing entry");
 const backend = await sodium.loadSodiumBackend();
 must(backend.name === "sodium" && backend.randomBytes(8).length === 8, "sodium backend loads and runs");
-must(typeof expo.openKavach === "function" && typeof expo.SqliteStore === "function", "expo entry");
+must(typeof expo.openKavach === "function" && typeof expo.SqliteStore === "function" && typeof expo.kavachSlot === "function", "expo entry");
+must(typeof http.httpTransport === "function" && typeof http.httpTransport({ baseUrl: "http://x", fetch: async () => ({}) }).attach === "function", "http entry");
 core.validatePolicy({ version: 1, replacement: "continuity", deliveryWindowMs: 1n, appendRetryWindowMs: 1n, hygieneRotationMs: 1n, maxOutboxRecords: 1, maxOutboxBytes: 1, kinds: [{ kind: 0, retentionMs: 1n, queue: "keepAll", history: true, newest: true }] });
 try { core.validatePolicy({}); must(false, "policy validation"); } catch (e) { must(e.code === "MALFORMED", "error code"); }
 const { existsSync } = await import("node:fs");
 must(existsSync(new URL("./node_modules/@plane31/blind-relay/src/index.ts", import.meta.url)), "sources ship with the maps");
-console.log("smoke: core, adapters, testing, sodium, expo entries load from the packed tarballs");
+console.log("smoke: core, adapters, testing, sodium, http, expo entries load from the packed tarballs");
 JS
 node smoke.mjs

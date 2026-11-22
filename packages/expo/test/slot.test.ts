@@ -1,0 +1,130 @@
+/** `kavachSlot`: one account's client per runtime, shared by leases, closed cleanly, and let go when another runtime erases the account. */
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { beforeAll, describe, expect, it } from "vitest";
+import { toHex } from "@plane31/blind-relay";
+import { MemorySecretStore, ready } from "@plane31/blind-relay/adapters";
+import { FakeHost, TestClock, testPolicy, testResetKeyList, testResetKeys } from "@plane31/blind-relay/testing";
+import { nodeSqliteDriver } from "../src/sqliteStore.js";
+import { databaseFileName } from "../src/setup.js";
+import { kavachSlot } from "../src/slot.js";
+import { openNodeDatabase } from "./sqlite.js";
+
+beforeAll(() => ready());
+
+function world() {
+  const host = new FakeHost();
+  const clock = new TestClock();
+  host.now = clock.now;
+  const resetKeys = testResetKeys();
+  host.resetSigner = { key: resetKeys.operational, keyId: resetKeys.operationalId };
+  host.resetKeyList = testResetKeyList(resetKeys, clock.now());
+  const transport = (name: string) => ({
+    get directory() {
+      const a = host.accounts.get(name);
+      return host.asDevice(name, a ? Uint8Array.from(Buffer.from(a.certificateHash, "hex")) : new Uint8Array(32)).directory;
+    },
+    get relay() {
+      const a = host.accounts.get(name);
+      return host.asDevice(name, a ? Uint8Array.from(Buffer.from(a.certificateHash, "hex")) : new Uint8Array(32)).relay;
+    }
+  });
+  return { host, clock, resetTrust: { managementKey: resetKeys.management.publicKey, minimumVersion: 1n }, transport };
+}
+
+const leased = async (slot: { readonly leases: number }): Promise<void> => {
+  while (slot.leases === 0) await new Promise((r) => setTimeout(r, 1));
+};
+
+const deleteFiles = (dir: string) => (fileName: string) => {
+  for (const suffix of ["", "-wal", "-shm"]) rmSync(join(dir, fileName + suffix), { force: true });
+};
+
+/** Two runtimes over one account: the same files and the same secret store, each with its own slot. */
+function runtimes() {
+  const w = world();
+  const dir = mkdtempSync(join(tmpdir(), "kavach-slot-"));
+  const secrets = new MemorySecretStore();
+  let opens = 0;
+  const options = (context: "foreground" | "background") => ({
+    accountName: "alice",
+    transport: w.transport("alice"),
+    retentionPolicy: { ...testPolicy, replacement: "recovery" as const },
+    resetTrust: w.resetTrust,
+    secrets,
+    database: (fileName: string) => {
+      opens++;
+      return nodeSqliteDriver(openNodeDatabase(join(dir, fileName)));
+    },
+    context,
+    now: w.clock.now
+  });
+  return { w, dir, secrets, options, opens: () => opens };
+}
+
+describe("kavachSlot", () => {
+  it("opens once for concurrent uses, closes only when the leases end, and a use during the close opens afresh after it", async () => {
+    const { options, opens } = runtimes();
+    const slot = kavachSlot(options("foreground"));
+    const [a, b] = await Promise.all([slot.use((s) => s.client), slot.use((s) => s.client)]);
+    expect(a).toBe(b);
+    expect(opens()).toBe(1);
+    let release: () => void = () => undefined;
+    const running = slot.use(async (s) => {
+      await new Promise<void>((r) => (release = r));
+      return (await s.client.getState()).status; // still open: the close waits for this lease
+    });
+    await leased(slot);
+    expect(slot.leases).toBe(1);
+    const closing = slot.close();
+    const after = slot.use((s) => s.client);
+    release();
+    expect(await running).toBe("fresh");
+    await closing;
+    const reopened = await after;
+    expect(reopened).not.toBe(a);
+    expect(opens()).toBe(2);
+    await slot.close();
+  });
+
+  it("releaseIdle closes an idle handle and leaves one in use alone", async () => {
+    const { options, opens } = runtimes();
+    const slot = kavachSlot(options("foreground"));
+    let release: () => void = () => undefined;
+    const running = slot.use(() => new Promise<void>((r) => (release = r)));
+    await leased(slot);
+    await slot.releaseIdle(); // in use: nothing happens
+    expect(slot.leases).toBe(1);
+    release();
+    await running;
+    await slot.releaseIdle();
+    await slot.use(() => undefined);
+    expect(opens()).toBe(2); // released, then opened again on the next use
+    await slot.close();
+  });
+
+  it("a runtime that erases the account makes the other one let go of its handle and open afresh", async () => {
+    const { options, dir } = runtimes();
+    const foreground = kavachSlot(options("foreground"));
+    const background = kavachSlot(options("background"));
+    const before = await foreground.use(async (s) => {
+      await s.client.initializeAccount();
+      return toHex((await s.client.inspect()).identityId ?? new Uint8Array());
+    });
+    expect(await background.use(async (s) => (await s.client.getState()).status)).toBe("ready");
+    // The foreground signs out and erases; the background still holds its handle on the old file.
+    await foreground.erase(deleteFiles(dir));
+    expect(existsSync(join(dir, databaseFileName("alice")))).toBe(false);
+    // The background's next use sees the marker change, drops the old handle and opens afresh: it
+    // finds no storage key, and a background runtime never mints one, so it waits for the foreground.
+    await expect(background.use((s) => s.client.getState())).rejects.toMatchObject({ code: "LOCKED" });
+    // The foreground opens the account afresh (the erasure was local; the app restores or enrolls
+    // from here), and the background then opens the same fresh store, never the erased one.
+    expect(await foreground.use(async (s) => (await s.client.getState()).status)).toBe("fresh");
+    expect(await background.use(async (s) => [(await s.client.getState()).status, (await s.client.inspect()).identityId])).toEqual(["fresh", undefined]);
+    expect(before).toHaveLength(64);
+    await foreground.close();
+    await background.close();
+  });
+});

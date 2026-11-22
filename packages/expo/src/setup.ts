@@ -198,15 +198,24 @@ async function selectCryptoBackend(options: Pick<KavachSetupOptions, "crypto" | 
   return reason === undefined ? { kind: "portable" } : { kind: "portable", reason };
 }
 
+/** The secret store an account's secrets live in, under its namespace: the one `openKavach`, `eraseKavach` and a slot share. */
+export function accountSecretStore(secrets: KavachSetupOptions["secrets"], accountName: string, namespace = "kavach"): SecretStore {
+  return "secureStore" in secrets
+    ? new ExpoSecretStore(secrets.secureStore, { thisDeviceOnly: secrets.thisDeviceOnly, namespace: `${namespace}.${accountName}`, ...(secrets.keychainService ? { keychainService: secrets.keychainService } : {}) })
+    : secrets;
+}
+
+/** Replace the account's erase marker: every slot that opened under the old one lets its handle go at its next use. */
+export async function markErased(secretStore: SecretStore): Promise<void> {
+  await secretStore.set("eraseGeneration", randomBytes(16));
+}
+
 export async function openKavach(options: KavachSetupOptions): Promise<KavachSetup> {
   installWebCrypto(options.getRandomValues);
   const cryptoBackend = await selectCryptoBackend(options);
   const namespace = options.namespace ?? "kavach";
   const fileName = databaseFileName(options.accountName, namespace);
-  const secretStore =
-    "secureStore" in options.secrets
-      ? new ExpoSecretStore(options.secrets.secureStore, { thisDeviceOnly: options.secrets.thisDeviceOnly, namespace: `${namespace}.${options.accountName}`, ...(options.secrets.keychainService ? { keychainService: options.secrets.keychainService } : {}) })
-      : options.secrets;
+  const secretStore = accountSecretStore(options.secrets, options.accountName, namespace);
   const storageKey = await storageKeyFor(secretStore, `${namespace}.${options.accountName}`, options.context);
   const driver = typeof options.database === "function" ? options.database(fileName) : expoSqliteDriver(options.database.openDatabaseSync(fileName, { useNewConnection: true }));
   const store = SqliteStore.open({ driver, storageKey, ...(options.busyTimeoutMs !== undefined ? { busyTimeoutMs: options.busyTimeoutMs } : {}) });
@@ -235,7 +244,9 @@ export async function openKavach(options: KavachSetupOptions): Promise<KavachSet
 
 /**
  * Erase one account from this device: every secret the SDK keeps for it, then its database with
- * the journal files. Close the account's `KavachSetup` first; this touches nothing it did not
+ * the journal files. It replaces the account's erase marker first, so a `kavachSlot` in another
+ * runtime drops its handle at its next use. Close the account's `KavachSetup` first (or erase
+ * through the slot, which does); this touches nothing it did not
  * open and nothing of another account, and never the platform's synced recovery item. The
  * account's roots go first and the storage key last, so an erasure interrupted halfway leaves a
  * database that refuses to open (`RECOVERY_REQUIRED`) rather than secrets that would re-enroll
@@ -244,14 +255,14 @@ export async function openKavach(options: KavachSetupOptions): Promise<KavachSet
 export async function eraseKavach(options: KavachEraseOptions): Promise<void> {
   const namespace = options.namespace ?? "kavach";
   const fileName = databaseFileName(options.accountName, namespace);
-  const secretStore =
-    "secureStore" in options.secrets
-      ? new ExpoSecretStore(options.secrets.secureStore, { thisDeviceOnly: options.secrets.thisDeviceOnly, namespace: `${namespace}.${options.accountName}`, ...(options.secrets.keychainService ? { keychainService: options.secrets.keychainService } : {}) })
-      : options.secrets;
+  const secretStore = accountSecretStore(options.secrets, options.accountName, namespace);
   // The capability first, before anything is deleted: an erasure that cannot finish must not start.
   const database = options.database;
   const remove = typeof database === "function" ? options.deleteDatabase : database.deleteDatabaseSync ? (name: string) => database.deleteDatabaseSync?.(name) : undefined;
   if (!remove) throw new KavachError("MALFORMED", "eraseKavach", "no way to delete the database: pass expo-sqlite, or deleteDatabase with a driver factory");
+  // The marker before anything is deleted: a runtime that has this account open (the foreground
+  // while a background task erases, or the other way round) sees it at its next use and lets go.
+  await markErased(secretStore);
   for (const name of SECRET_NAMES) await secretStore.delete(name);
   try {
     remove(fileName);

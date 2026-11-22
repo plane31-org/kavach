@@ -50,6 +50,8 @@ When the database file survives but its key is gone (the secret store was cleare
 
 **Quick syncs in the background.** Pass `fullSyncEveryMs` to `openKavach` and call `client.sync({ mode: "quick", skipMaintenance: true })` (or `syncUntilDrained({ mode: "quick" })`) from a background task: only the streams with something new are read, and the sync runs full by itself when it must. The transport needs `syncState`, and the host must be deployed first. The core README's "Using it well" says what quick syncs delay.
 
+**Two runtimes, one account: `kavachSlot` (0.9.0).** An Android app with a headless background task runs two JavaScript runtimes over one database. Give each a slot: `const slot = kavachSlot(options)`, then `slot.use(async ({ client }) => ...)` wherever you need the client. The slot opens on first use and shares one handle; `slot.close()` waits for the uses in flight and closes, and a use that arrives meanwhile opens afresh after it; `slot.releaseIdle()` at the end of a background run closes the handle if nothing uses it. `slot.erase()` (or `eraseKavach`) replaces the account's erase marker before deleting anything, and the other runtime's slot, seeing the marker change at its next use, drops its handle and opens afresh instead of writing to a deleted database. A background runtime that then finds no storage key stops with `LOCKED` until the foreground provisions one, as before.
+
 ### Advanced: the adapters one by one
 
 `openKavach` is these steps; an app with a different arrangement (a shared database, its own key management) uses the adapters directly:

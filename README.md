@@ -15,12 +15,13 @@ Status: steps 0 to 16 of the build sequence are complete: the core protocol, the
 
 ## Entry points of `@plane31/blind-relay`
 
-The package has four entry points, each an explicit list of names; nothing else is importable from outside the package.
+The package has five entry points, each an explicit list of names; nothing else is importable from outside the package.
 
 - `@plane31/blind-relay` is what an application imports: `open` and the `Client` type with its state, event, report and query types; `KavachError` and `ErrorCode`; `RetentionPolicy` and `validatePolicy`, `ResetTrustConfig` and `setCryptoBackend` for the options of `open`; the `RecoveryProvider` contract with its result types and `encodeRecoveryCode` and `decodeRecoveryCode` for the code an app shows to the user; and `toHex`, `fromHex` and `equalBytes` for identifiers.
 - `@plane31/blind-relay/adapters` is what an adapter or host author imports: the `Store`, `Tx`, `SecretStore`, `Transport`, `Directory`, `Relay` and `RecoveryProvider` contracts with the table and row types; `MemoryStore` and `MemorySecretStore` as the behavioural reference; the byte readers and writers; `ready`, `randomBytes` and the identifier derivations; the signed-document codec a host verifies with (`parseDocument`, `verifyDocument`, `expectType`, `DocumentType` and the document types); the reset-key list builder a host's signing script uses (`buildResetKeyList` with `buildResetReceipt`); and the transactions an adapter test drives against a store (`openStore`, `t1Secrets`, `t1Header`, `t1Activate`, `t3ApplyChange`).
 - `@plane31/blind-relay/testing` is the fault harness described below, plus the fixtures a test builds protocol state with: `openAccount`, `newDevice`, `deviceFromSeed`, `certify`, `accountKeypair`, `identityId`, and `testResetKeys` with `testResetKeyList` for a signed key list.
 - `@plane31/blind-relay/sodium` is the optional libsodium backend for Node.
+- `@plane31/blind-relay/http` (0.9.0) is the HTTP binding of the transport contract as the reference host serves it: `httpTransport({ baseUrl, fetch?, headers? })`, with routes relative to `baseUrl` (which carries the host's version prefix), the device and sync id sent from the client's attached context, and the transport error contract's typing.
 
 The transaction helpers, row conversions, outbox, inbox, epoch, circle and audience modules are internal: they import each other by relative path and are not part of any entry point.
 

@@ -200,7 +200,19 @@ export interface Relay {
   syncState?(): Promise<SyncState>;
 }
 
+/**
+ * What the client tells a transport about the calls it makes (0.9.0), through `Transport.attach`:
+ * the device it speaks for, once enrolled, and the correlation id of the sync running now. A
+ * transport reads them per call, so it never keeps either in a closure of its own.
+ */
+export interface TransportContext {
+  device(): { readonly accountName: string; readonly certificateHash: Uint8Array } | undefined;
+  opId(): string | undefined;
+}
+
 export interface Transport {
+  /** Optional: called once by `open()` with the context the transport reads per call. */
+  attach?(context: TransportContext): void;
   readonly directory: Directory;
   readonly relay: Relay;
 }

@@ -9,7 +9,7 @@ import { equalBytes, toHex } from "../bytes.js";
 import { KavachError } from "../errors.js";
 import { invokeSync, type Store, type Tx } from "../store.js";
 import type {
-  ResolvedAccount, AppendOutcome, Directory, EpochBundle, MutationOutcome, ReadRecordsResult, Relay, Transport } from "../transport.js";
+  ResolvedAccount, AppendOutcome, Directory, EpochBundle, MutationOutcome, ReadRecordsResult, Relay, Transport, TransportContext } from "../transport.js";
 
 // Crashes ------------------------------------------------------------------------------------------
 
@@ -174,6 +174,11 @@ export class MaliciousTransport implements Transport {
   readonly losses: MutationName[] = [];
   readonly directory: Directory;
   readonly relay: Relay;
+
+  /** The client's context goes to the transport wrapped, which is the one making the calls. */
+  attach(context: TransportContext): void {
+    this.inner.attach?.(context);
+  }
 
   constructor(private readonly inner: Transport) {
     this.directory = this.wrapDirectory();

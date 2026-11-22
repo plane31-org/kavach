@@ -49,15 +49,20 @@ async function pair(): Promise<{ host: FakeHost; clock: Clock; alice: Device; bo
 }
 
 describe("enqueue (T6)", () => {
-  it("S03: nothing is sealed without a promoted epoch", async () => {
+  it("S03: nothing is sealed without a promoted epoch; the record waits unsealed and is sealed by the sender once one exists", async () => {
     const host = new FakeHost();
     const clock = new Clock();
     const alice = await setupDevice(host, clock, "alice");
-    expect(await code(() => enqueue(alice.outbox, 0, sample(clock)))).toBe("ROTATION_REQUIRED");
+    const waiting = await enqueue(alice.outbox, 0, sample(clock));
+    expect(waiting.recordId).toBeUndefined();
+    const row = (id: Uint8Array) => alice.store.read((tx) => tx.get("outbox", toHex(id)));
+    expect(await row(waiting.localId)).toMatchObject({ status: "unsealed", wire: "", recordId: "" });
     await alice.rotate();
+    await drain(alice.outbox);
+    expect(await row(waiting.localId)).toMatchObject({ status: "accepted", epoch: 1, counter: 0 });
     const q = await enqueue(alice.outbox, 0, sample(clock));
-    expect(q.epoch).toBe(1);
-    expect(q.counter).toBe(0);
+    expect(toHex(q.recordId ?? new Uint8Array())).toBe(toHex(q.localId)); // sealed at once: the local id is the record id
+    expect(await row(q.localId)).toMatchObject({ status: "queued", epoch: 1, counter: 1 });
   });
 
   it("S05 and S17: counters never repeat across a restart, and two unsent records are both durable", async () => {
@@ -66,7 +71,7 @@ describe("enqueue (T6)", () => {
     // A restart: another handle on the same durable state.
     const reopened = { ...alice.outbox, store: alice.store.fork() };
     const b = await enqueue(reopened, 1, sample(clock));
-    expect([a.counter, b.counter]).toEqual([0, 1]);
+    expect(toHex(a.localId)).not.toBe(toHex(b.localId));
     expect(await outboxCount(alice.store)).toBe(2);
     const rows = await alice.store.read((tx) => tx.list("outbox").map(([, r]) => [r.epoch, r.counter, r.kind]).sort((a, b) => (a[1] ?? 0) - (b[1] ?? 0)));
     expect(rows).toEqual([
@@ -85,22 +90,29 @@ describe("enqueue (T6)", () => {
     expect(r.cancelled.length).toBe(2);
     expect(await outboxCount(alice.store)).toBe(0);
     expect(await alice.store.read((tx) => tx.list("history").length)).toBe(2);
-    expect(await code(() => enqueue(alice.outbox, 0, sample(clock)))).toBe("ROTATION_REQUIRED");
+    const waiting = await enqueue(alice.outbox, 0, sample(clock)); // no usable epoch: queued unsealed
+    expect(waiting.recordId).toBeUndefined();
     await alice.rotate();
-    expect((await enqueue(alice.outbox, 0, sample(clock))).epoch).toBe(2);
+    const next = await enqueue(alice.outbox, 0, sample(clock));
+    expect(await alice.store.read((tx) => tx.get("outbox", toHex(next.localId))?.epoch)).toBe(2);
   });
 
   it("hygiene, clock reversal and the queue limit", async () => {
     const { alice, clock } = await pair();
     await enqueue(alice.outbox, 0, sample(clock));
     clock.advance(-10n);
-    expect(await code(() => enqueue(alice.outbox, 0, sample(clock)))).toBe("ROTATION_REQUIRED");
+    const reversed = await enqueue(alice.outbox, 0, sample(clock)); // a clock reversal retires the epoch: the record waits
+    expect(reversed.recordId).toBeUndefined();
     clock.advance(10n);
     await alice.rotate();
     clock.advance(31n * 86_400_000n);
-    expect(await code(() => enqueue(alice.outbox, 0, sample(clock)))).toBe("ROTATION_REQUIRED");
+    const hygiene = await enqueue(alice.outbox, 0, sample(clock)); // so does a hygiene rotation that is due
+    expect(hygiene.recordId).toBeUndefined();
     await alice.rotate();
-    expect(await alice.store.read((tx) => tx.list("outbox").map(([, r]) => [r.epoch, r.counter, r.status]))).toEqual([[1, 0, "cancelled"]]);
+    const statuses = await alice.store.read((tx) => tx.list("outbox").map(([, r]) => [r.epoch, r.counter, r.status]));
+    expect(statuses).toEqual(expect.arrayContaining([[1, 0, "cancelled"], [0, 0, "unsealed"], [0, 0, "unsealed"]]));
+    await drain(alice.outbox); // both waiting records are sealed under the new epoch and go out
+    expect(await outboxCount(alice.store)).toBe(0);
     const small = { ...alice.outbox, policy: { ...alice.outbox.policy, maxOutboxRecords: 2 } };
     await enqueue(small, 0, sample(clock));
     await enqueue(small, 0, sample(clock));
@@ -155,7 +167,7 @@ describe("the sender (T6h)", () => {
     const third = await drain(alice.outbox);
     expect(third.sent).toBe(0);
     expect(host.appendCalls).toBe(calls);
-    expect(await alice.store.read((tx) => tx.list("outbox").map(([, r]) => r.status))).toEqual(["cancelled"]);
+    expect(await alice.store.read((tx) => tx.list("outbox").map(([, r]) => r.status).filter((s) => s !== "accepted"))).toEqual(["cancelled"]);
   });
 
   it("a synchronous transport failure rolls the in-flight mark back", async () => {

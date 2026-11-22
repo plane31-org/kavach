@@ -22,7 +22,7 @@ describe("review findings", () => {
     await a.client.circles.setEnabled(circleId, true);
     const [x, y] = await Promise.all([enqueueLocation(a.client, w.loc(2)), enqueueLocation(a.client, w.loc(3))]);
     expect(toHex(x.recordId)).not.toBe(toHex(y.recordId));
-    const counters = await a.store.read((tx) => tx.list("outbox").map(([, r]) => r.counter).sort());
+    const counters = await a.store.read((tx) => tx.list("outbox").filter(([, r]) => r.status !== "accepted").map(([, r]) => r.counter).sort());
     expect(counters).toEqual([0, 1]);
     const r = await w.sync(a);
     expect(r.outbox.accepted).toBe(2);
@@ -97,10 +97,14 @@ describe("review findings", () => {
     await w.sync(b);
     const paused = await b.client.getState();
     expect([paused.status, paused.paused]).toEqual(["paused", "metadata"]);
-    expect(await thrown(() => enqueueLocation(b.client, w.loc(5)))).toBe("METADATA_REQUIRED");
+    // Paused for metadata: the record waits unsealed instead of failing, and goes out once the pause lifts.
+    const waiting = await enqueueLocation(b.client, w.loc(5));
+    expect(waiting.recordId).toBeUndefined();
+    expect(await b.client.delivery(waiting.localId)).toEqual({ status: "queued", sealed: false, recordId: undefined });
     b.t.knobs.withhold.delete("certificates");
     const r = await w.sync(b);
     expect(r.epoch).toBe("prepared");
+    expect((await b.client.delivery(waiting.localId))?.status).toBe("accepted");
     expect((await b.client.getState()).status).toBe("ready");
     expect(await thrown(() => enqueueLocation(b.client, w.loc(6)))).toBe("OK");
   });

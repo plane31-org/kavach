@@ -215,11 +215,16 @@ describe("revision 12: the AUDIENCE_STALE fence", () => {
     expect(b.events.slice(n).filter((e) => e.kind === "cancelled")).toEqual([]);
     expect(b.events.slice(n).find((e) => e.kind === "audienceStale")).toEqual({ kind: "audienceStale", held: 3 });
     expect((await b.client.inspect()).outbox.held).toBe(3);
-    expect(await thrown(() => b.client.enqueue(0, Uint8Array.of(12)))).toBe("ROTATION_REQUIRED"); // the refused epoch takes nothing more
+    // The refused epoch takes nothing more: a new record waits unsealed for the next epoch.
+    const during = await b.client.enqueue(0, Uint8Array.of(12));
+    expect(during.recordId).toBeUndefined();
+    expect(await b.client.delivery(during.localId)).toEqual({ status: "queued", sealed: false, recordId: undefined });
     // The next sync runs full, learns the removal, rotates without Carol and reseals the three.
     const second = await quick(b);
     expect([second.mode, second.promotedBecause]).toEqual(["full", "audienceStale"]);
-    expect([second.outbox.resealed, second.outbox.accepted, second.outbox.held, second.outbox.cancelled]).toEqual([3, 3, 0, 0]);
+    expect([second.outbox.resealed, second.outbox.accepted, second.outbox.held, second.outbox.cancelled]).toEqual([3, 4, 0, 0]); // the three resealed and the one sealed late
+    expect((await b.client.delivery(during.localId))?.status).toBe("accepted");
+    for (const s of sent) expect((await b.client.delivery(s.localId))?.status).toBe("accepted"); // each under its unchanged local id
     const resealed = b.events.slice(n).filter((e) => e.kind === "resealed");
     expect(resealed.map((e) => (e.kind === "resealed" ? toHex(e.recordId) : ""))).toEqual(sent.map((s) => toHex(s.recordId)));
     // Alice reads all three, under the new ids; Carol, removed, reads none of them.
@@ -263,12 +268,13 @@ describe("revision 12: the AUDIENCE_STALE fence", () => {
     expect(bad.errors.map((e) => `${e.operation}:${e.code}`)).toContain("circleSnapshot:BAD_SIGNATURE");
     expect([bad.outbox.resealed, bad.outbox.cancelled, bad.outbox.accepted]).toEqual([0, 0, 0]);
     expect((await b.client.inspect()).outbox.held).toBe(2);
-    expect(await thrown(() => b.client.enqueue(0, Uint8Array.of(12)))).toBe("ROTATION_REQUIRED");
+    const during = await b.client.enqueue(0, Uint8Array.of(12));
+    expect(during.recordId).toBeUndefined(); // nothing is sealed to the unresolved audience
     const still = await quick(b);
     expect(still.promotedBecause).toBe("audienceStale"); // the fence is still owed a full sync
     b.t.knobs.tamper.delete("snapshot");
     const good = await quick(b);
-    expect([good.promotedBecause, good.outbox.resealed, good.outbox.accepted, good.outbox.cancelled]).toEqual(["audienceStale", 2, 2, 0]);
+    expect([good.promotedBecause, good.outbox.resealed, good.outbox.accepted, good.outbox.cancelled]).toEqual(["audienceStale", 2, 3, 0]);
     expect((await quick(b)).mode).toBe("quick");
   });
 

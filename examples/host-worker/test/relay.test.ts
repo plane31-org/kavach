@@ -93,7 +93,7 @@ describe("relay: deletion, expiry, cursors", () => {
     const sid = await streamOf(b);
     const q = await enqueueLocation(a.client, loc());
     await a.client.sync();
-    const wire = (await a.store.read((tx) => tx.list("history").find(([k]) => k === toHex(q.recordId))))?.[1];
+    const wire = (await a.store.read((tx) => tx.list("history").find(([k]) => k === toHex(q.recordId ?? q.localId))))?.[1];
     void wire;
     const retained = (await debug(sid)).retained[0];
     if (!retained) throw new Error("retained");

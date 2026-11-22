@@ -1,10 +1,10 @@
 /** The reference HTTP transport types its failures: no answer or a server error is NETWORK, a client error is not. */
 import { describe, expect, it } from "vitest";
 import { isKavachError } from "@plane31/blind-relay";
-import { httpTransport } from "../client/httpTransport.js";
+import { httpTransport } from "@plane31/blind-relay/http";
 
 function transportWith(fetch: (input: string, init?: RequestInit) => Promise<Response>) {
-  return httpTransport({ baseUrl: "http://host.test", fetch, caller: () => undefined });
+  return httpTransport({ baseUrl: "http://host.test", fetch });
 }
 
 async function failure(fn: () => Promise<unknown>): Promise<{ network: boolean; retryable: boolean | undefined }> {
@@ -60,7 +60,25 @@ describe("httpTransport failures", () => {
     expect(sent).toEqual(["12", null]);
   });
 
-  it("a body that fails while streaming is NETWORK; a body that is not JSON is a plain error", async () => {
+  it("the client's device and sync id ride on every call, the app's headers too; an error names the host's request id", async () => {
+    const seen: Headers[] = [];
+    const t = httpTransport({
+      baseUrl: "http://host.test/v1/kavach",
+      fetch: async (url, init) => {
+        seen.push(new Headers(init?.headers));
+        expect(url.startsWith("http://host.test/v1/kavach/")).toBe(true);
+        return new Response(JSON.stringify([]), { headers: { "content-type": "application/json" } });
+      },
+      headers: () => ({ authorization: "Bearer token" })
+    });
+    t.attach?.({ device: () => ({ accountName: "alice", certificateHash: new Uint8Array(32).fill(0xab) }), opId: () => "op-1" });
+    await t.directory.resolveAccounts(["alice"]);
+    expect([seen[0]?.get("authorization"), seen[0]?.get("x-kavach-device"), seen[0]?.get("x-kavach-op")]).toEqual(["Bearer token", "ab".repeat(32), "op-1"]);
+    const refused = transportWith(async () => new Response(JSON.stringify({ error: "nope" }), { status: 403, headers: { "content-type": "application/json", "x-request-id": "req-42" } }));
+    await expect(refused.directory.resolveAccounts(["alice"])).rejects.toThrow(/request req-42.*nope/);
+  });
+
+  it("a body that fails while streaming is NETWORK; a success that is not JSON (a captive portal) is NETWORK; a refusal that is not JSON is a plain error", async () => {
     const broken = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(new TextEncoder().encode("[{"));
@@ -69,7 +87,9 @@ describe("httpTransport failures", () => {
     });
     const dropped = transportWith(async () => new Response(broken, { status: 200, headers: { "content-type": "application/json" } }));
     expect(await failure(() => dropped.directory.resolveAccounts(["alice"]))).toEqual({ network: true, retryable: true });
-    const garbage = transportWith(async () => new Response("<html>", { status: 200, headers: { "content-type": "application/json" } }));
+    const portal = transportWith(async () => new Response("<html>", { status: 200, headers: { "content-type": "text/html" } }));
+    expect(await failure(() => portal.directory.resolveAccounts(["alice"]))).toEqual({ network: true, retryable: true });
+    const garbage = transportWith(async () => new Response("<html>", { status: 400, headers: { "content-type": "text/html" } }));
     expect(await failure(() => garbage.directory.resolveAccounts(["alice"]))).toEqual({ network: false, retryable: undefined });
   });
 });

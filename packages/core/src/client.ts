@@ -13,14 +13,38 @@ import { KavachError, isKavachError, type ErrorCode } from "./errors.js";
 import { acceptCertificate, certify, deviceFromSeed, newAccountSeed, newDevice, openAccount, pinFromCertificate, type AccountPin, type DeviceKeys, type OwnAccount } from "./identity.js";
 import { ensureHistoryIndex } from "./historyIndex.js";
 import { ensureSlots, forgetAuthor, forgetAuthorIn, history, historyPage, newest, newestSlot, purgeHistory, receive as receiveRecord, streamNeedsRead, syncStream, type HistoryEntry, type HistoryPage, type HistoryQuery, type Newest, type ReadBudget, type ReceiveResult } from "./inbox.js";
-import { drain, enqueue, outboxCountIn, outboxCounts, purgeOutbox, type EnqueueOptions, type OutboxCounts } from "./outbox.js";
+import { drain, enqueue, outboxCountIn, outboxCounts, purgeOutbox, sealWaiting, type EnqueueOptions, type OutboxCounts, type RecordRef } from "./outbox.js";
 export type { EnqueueOptions } from "./outbox.js";
 
-/** The durable record a hand-over produced; `duplicate` when an idempotency key matched an earlier one. */
+/**
+ * The durable record a hand-over produced; `duplicate` when an idempotency key matched an earlier
+ * one. `localId` names the record for its whole life, on every lifecycle event and in
+ * `delivery(localId)`, however often it is sealed: keep that, not the record id. `recordId` is
+ * present when the record was sealed at once; a record enqueued while no epoch was usable is sealed
+ * at the next sync, and its record id arrives with `accepted`.
+ */
 export interface EnqueueResult {
-  readonly recordId: Uint8Array;
+  readonly localId: Uint8Array;
+  readonly recordId?: Uint8Array;
   readonly duplicate: boolean;
 }
+
+/**
+ * Where an enqueued record stands, read from the store, so any runtime sharing it can ask.
+ * `queued`: waiting to go out (`sealed: false` while no epoch was usable); `held`: refused as
+ * AUDIENCE_STALE, waiting for the next epoch; `accepted`: the relay took it; `cancelled`: given
+ * up, with the reason (`superseded` by a newer record of a latestWins kind, `rotation` when the
+ * audience changed before it went out, `expired`, `AUDIENCE_STALE`, `EPOCH_FENCED`,
+ * `SUPERSEDED_DEVICE`, `UNAUTHORIZED`, `EQUIVOCATION`, `undeclared`); `unknown`: the relay could
+ * not say whether it took it (`STALE_APPEND`). Finished records are answered for the delivery window,
+ * then forgotten: `undefined` is never enqueued here, or forgotten.
+ */
+export type DeliveryStatus =
+  | { readonly status: "queued"; readonly sealed: boolean; readonly recordId: Uint8Array | undefined }
+  | { readonly status: "held"; readonly recordId: Uint8Array }
+  | { readonly status: "accepted"; readonly recordId: Uint8Array }
+  | { readonly status: "cancelled"; readonly reason: string; readonly recordId: Uint8Array | undefined }
+  | { readonly status: "unknown"; readonly reason: string; readonly recordId: Uint8Array };
 import { acceptsSuccession, allowsContinuity, kindOf, validatePolicy, type ReplacementModel, type RetentionPolicy } from "./policy.js";
 import { ResetTrust, type ResetTrustConfig } from "./reset.js";
 import { big, circleToRow, pinToRow, rowToCircle, rowToPin, rowToPrepared, unbig } from "./rows.js";
@@ -111,18 +135,22 @@ export interface CircleSummary {
   readonly status: CircleState["status"];
   readonly snapshotAgeMs: bigint;
   readonly owned: boolean;
+  /** For a circle this device owns: the account names with a pending join request, as the last full sync read them. Empty otherwise. */
+  readonly joinRequests: readonly string[];
 }
 
 export type ClientEvent =
   | { kind: "deviceChanged"; identityId: Uint8Array; generation: bigint }
   /** After a rotation, or when a sent record's acceptance is in doubt: the app may resend its current state of each kind with a slot. */
   | { kind: "refresh"; reason: string }
-  | { kind: "cancelled"; recordId: Uint8Array; reason: string }
-  | { kind: "queued"; recordId: Uint8Array; recordKind: RecordKind }
-  | { kind: "accepted"; recordId: Uint8Array }
+  /** Lifecycle events name the record by `localId`, which never changes, with its record id when it has one and its idempotency key when it was given. */
+  | { kind: "cancelled"; localId: Uint8Array; recordId: Uint8Array | undefined; idempotencyKey: string | undefined; reason: string }
+  | { kind: "queued"; localId: Uint8Array; recordId: Uint8Array | undefined; idempotencyKey: string | undefined; recordKind: RecordKind }
+  | { kind: "accepted"; localId: Uint8Array; recordId: Uint8Array; idempotencyKey: string | undefined }
   /** A record was stored, received or the device's own; `tookSlot` when it became the author's newest of its kind. */
   | { kind: "recordStored"; recordKind: RecordKind; authorIdentityId: Uint8Array; recordId: Uint8Array; tookSlot: boolean }
   | { kind: "waiting"; identityId: Uint8Array }
+  /** The pending join requests of a circle this device owns, whenever a full sync finds them changed, including to none. */
   | { kind: "joinRequests"; circleId: Uint8Array; accountNames: readonly string[] }
   | { kind: "circleChanged"; circleId: Uint8Array; revision: bigint; status: CircleState["status"] }
   | { kind: "accountKeyChanged"; accountName: string; quarantined: boolean }
@@ -131,8 +159,8 @@ export type ClientEvent =
   | { kind: "unknownKind"; recordKind: RecordKind; authorIdentityId: Uint8Array }
   /** Revision 12: the host refused records as AUDIENCE_STALE. They are held, not cancelled; the next sync runs full, rotates and reseals them. */
   | { kind: "audienceStale"; held: number }
-  /** Revision 12: a held record was sealed again under a new epoch, with a new record id. An app that kept the old id follows it here. */
-  | { kind: "resealed"; recordId: Uint8Array; newRecordId: Uint8Array }
+  /** Revision 12: a held record was sealed again under a new epoch, with a new record id; its `localId` is unchanged. */
+  | { kind: "resealed"; localId: Uint8Array; recordId: Uint8Array; newRecordId: Uint8Array; idempotencyKey: string | undefined }
   | { kind: "stateChanged"; state: ClientState };
 
 export interface OpenOptions {
@@ -194,6 +222,8 @@ export interface Client {
    * time; the result says why it stopped and what remains.
    */
   syncUntilDrained(options?: DrainOptions): Promise<DrainReport>;
+  /** Where the record `enqueue` named by this local id stands, from the store; see `DeliveryStatus`. */
+  delivery(localId: Uint8Array): Promise<DeliveryStatus | undefined>;
   /** A durable outbound record of a declared kind; the payload is the product's bytes, never read by the SDK. */
   enqueue(kind: RecordKind, payload: Uint8Array, options?: EnqueueOptions): Promise<EnqueueResult>;
   /** One synchronisation; `options.catchUp` bounds how much of a backlog this call reads (`SyncReport.inbox.hasMore` says when to call again). */
@@ -339,6 +369,8 @@ export const DEFAULT_CATCH_UP = { maxRecords: 500, maxMs: 5_000 } as const;
 export interface SyncReport {
   /** Which sync ran. A quick request that ran full says `full`, with `promotedBecause`. */
   mode: SyncMode;
+  /** A correlation id for this run, handed to the transport (`TransportContext.opId`) for every call it makes; a drain keeps one across its rounds. */
+  opId: string;
   promotedBecause?: SyncPromotion;
   metadata: { certificates: number; snapshots: number; rotations: number; quarantined: number; resets: number; successions: number };
   epoch: "unchanged" | "prepared" | "paused" | "pending";
@@ -457,6 +489,12 @@ class ClientImpl implements Client {
   private selfPin: AccountPin | undefined;
   private trust: ResetTrust;
   private syncing: Promise<SyncReport> | undefined;
+  private draining: Promise<DrainReport> | undefined;
+  private drainingMode: SyncMode = "full";
+  private fullDrainAfter: Promise<DrainReport> | undefined;
+  /** The correlation id of the drain running now, shared by its rounds, and of the sync running now. */
+  private drainOpId: string | undefined;
+  private activeOpId: string | undefined;
   /** The mode of the running sync, once known: a quick request that ran full counts as full. */
   private syncingMode: SyncMode = "full";
   /** A full sync requested while a quick one ran: it starts when that one ends; later full requests share it. */
@@ -482,6 +520,12 @@ class ClientImpl implements Client {
     this.provider = options.recoveryProvider;
     this.now = options.now ?? ((): bigint => BigInt(Date.now()));
     this.trust = new ResetTrust(options.resetTrust);
+    // The transport learns the device it speaks for and the running sync from the client, instead
+    // of the app keeping either in a closure of its own.
+    this.transport.attach?.({
+      device: () => (this.selfPin ? { accountName: this.accountName, certificateHash: this.selfPin.certificateHash } : undefined),
+      opId: () => this.activeOpId
+    });
     this.circles = {
       create: () => this.track("createCircle", () => this.createCircle()),
       requestJoin: (c, o, opts) => this.track("requestJoin", () => this.requestJoin(c, o, opts?.shareOnApproval ?? true)),
@@ -530,7 +574,48 @@ class ClientImpl implements Client {
   }
 
   syncUntilDrained(options: DrainOptions = {}): Promise<DrainReport> {
-    return this.track("syncUntilDrained", () => this.drainNow(options));
+    // One drain at a time, shared as `sync()` shares: a quick request shares any running drain, a
+    // full one shares a full drain; a full request during a quick drain gets its own full drain
+    // after it, which later full requests share.
+    if (this.draining) {
+      if ((options.mode ?? "full") === "quick" || this.drainingMode === "full") return this.draining;
+      this.fullDrainAfter ??= this.draining
+        .catch(() => undefined)
+        .then(() => {
+          this.fullDrainAfter = undefined;
+          return this.syncUntilDrained(options);
+        });
+      return this.fullDrainAfter;
+    }
+    this.drainingMode = options.mode ?? "full";
+    const run = this.track("syncUntilDrained", () => this.drainNow(options)).finally(() => {
+      if (this.draining === run) this.draining = undefined;
+    });
+    this.draining = run;
+    return run;
+  }
+
+  delivery(localId: Uint8Array): Promise<DeliveryStatus | undefined> {
+    return this.store.read((tx) => {
+      const row = tx.get("outbox", toHex(localId));
+      if (!row) return undefined;
+      const recordId = row.recordId ? fromHex(row.recordId) : undefined;
+      switch (row.status) {
+        case "unsealed":
+          return { status: "queued", sealed: false, recordId: undefined };
+        case "queued":
+        case "inflight":
+          return { status: "queued", sealed: true, recordId };
+        case "held":
+          return { status: "held", recordId: recordId ?? new Uint8Array() };
+        case "accepted":
+          return { status: "accepted", recordId: recordId ?? new Uint8Array() };
+        case "cancelled":
+          return { status: "cancelled", reason: row.reason ?? "cancelled", recordId };
+        case "unknown":
+          return { status: "unknown", reason: row.reason ?? "unknown", recordId: recordId ?? new Uint8Array() };
+      }
+    });
   }
 
   // Loading ---------------------------------------------------------------------------------------
@@ -615,13 +700,17 @@ class ClientImpl implements Client {
       now: this.now,
       author: () => ({ streamId: pin.streamId, signingSecretKey: device.signing.secretKey, generation: pin.generation, identityId: pin.accountId }),
       events: {
-        queued: (recordId: Uint8Array, recordKind: RecordKind) => this.emit({ kind: "queued", recordId, recordKind }),
-        accepted: (recordId: Uint8Array) => this.emit({ kind: "accepted", recordId }),
-        cancelled: (recordId: Uint8Array, reason: string) => this.emit({ kind: "cancelled", recordId, reason }),
+        queued: (r: RecordRef, recordKind: RecordKind) => this.emit({ kind: "queued", localId: r.localId, recordId: r.recordId, idempotencyKey: r.idempotencyKey, recordKind }),
+        sealed: (r: RecordRef, recordKind: RecordKind, tookSlot: boolean) => {
+          // The device's own record is stored like any author's, so one subscription covers self and others.
+          if (r.recordId && this.selfPin) this.emit({ kind: "recordStored", recordKind, authorIdentityId: this.selfPin.accountId, recordId: r.recordId, tookSlot });
+        },
+        accepted: (r: RecordRef) => this.emit({ kind: "accepted", localId: r.localId, recordId: r.recordId ?? new Uint8Array(), idempotencyKey: r.idempotencyKey }),
+        cancelled: (r: RecordRef, reason: string) => this.emit({ kind: "cancelled", localId: r.localId, recordId: r.recordId, idempotencyKey: r.idempotencyKey, reason }),
         refresh: (reason: string) => this.emit({ kind: "refresh", reason }),
         securityError: (code: string, detail: string) => this.emit({ kind: "securityError", code, detail }),
         audienceStale: (held: number) => this.emit({ kind: "audienceStale", held }),
-        resealed: (recordId: Uint8Array, newRecordId: Uint8Array) => this.emit({ kind: "resealed", recordId, newRecordId })
+        resealed: (r: RecordRef, oldRecordId: Uint8Array) => this.emit({ kind: "resealed", localId: r.localId, recordId: oldRecordId, newRecordId: r.recordId ?? new Uint8Array(), idempotencyKey: r.idempotencyKey })
       }
     };
   }
@@ -657,7 +746,7 @@ class ClientImpl implements Client {
       const meta = tx.get("meta", META);
       if (!meta || (!this.account && meta.state !== "RETIRED")) return { opened: false, proposal: tx.get("replacement", "pending") };
       const rows = tx.list("circles").map(([, r]) => r);
-      return { opened: true, meta, circles: this.circleSummaries(rows), outbox: outboxCountIn(tx), waitingFor: this.waitingForIn(tx, rows), revision: tx.get("revision", REVISION), quarantined: tx.count("quarantine") > 0 };
+      return { opened: true, meta, circles: this.circleSummaries(tx, rows), outbox: outboxCountIn(tx), waitingFor: this.waitingForIn(tx, rows), revision: tx.get("revision", REVISION), quarantined: tx.count("quarantine") > 0 };
     });
     if (!snap.opened) return { status: snap.proposal && !snap.proposal.stale ? "replacementPrepared" : "fresh", paused: undefined, ...base };
     const { meta, circles, outbox, waitingFor, revision, quarantined } = snap;
@@ -953,26 +1042,29 @@ class ClientImpl implements Client {
     // again inside its transaction for calls that race.
     if (options.idempotencyKey !== undefined) {
       const seen = await this.store.read((tx) => tx.get("enqueueKeys", options.idempotencyKey ?? ""));
-      if (seen) return { recordId: fromHex(seen.recordId), duplicate: true };
+      if (seen) return seen.recordId ? { localId: fromHex(seen.localId ?? seen.recordId), recordId: fromHex(seen.recordId), duplicate: true } : { localId: fromHex(seen.localId ?? ""), duplicate: true };
     }
-    await this.ensureEpoch();
+    // An epoch is prepared when one is due and the host can be reached; when it cannot (offline,
+    // metadata missing, an AUDIENCE_STALE fence), the record is queued unsealed and sealed by the
+    // next sync, so a hand-over never fails for a rotation the device cannot do right now.
     try {
-      return this.enqueued(kind, await enqueue(deps, kind, payload, options));
+      await this.ensureEpoch();
     } catch (e) {
-      if (isKavachError(e, "ROTATION_REQUIRED") || isKavachError(e, "COUNTER_EXHAUSTED")) {
-        await this.ensureEpoch();
-        const r = await enqueue(deps, kind, payload, options);
-        this.emit({ kind: "refresh", reason: "rotation" });
-        return this.enqueued(kind, r);
-      }
-      throw e;
+      if (!(e instanceof KavachError) || !e.retryable) throw e;
     }
-  }
-
-  /** After commit: the device's own record is stored like any author's, so one subscription covers self and others. */
-  private enqueued(kind: RecordKind, r: { recordId: Uint8Array; duplicate: boolean; own: boolean }): EnqueueResult {
-    if (!r.duplicate && this.selfPin) this.emit({ kind: "recordStored", recordKind: kind, authorIdentityId: this.selfPin.accountId, recordId: r.recordId, tookSlot: r.own });
-    return { recordId: r.recordId, duplicate: r.duplicate };
+    const r = await enqueue(deps, kind, payload, options);
+    if (r.rotated) this.emit({ kind: "refresh", reason: "rotation" });
+    if (r.recordId || r.duplicate) return r.recordId ? { localId: r.localId, recordId: r.recordId, duplicate: r.duplicate } : { localId: r.localId, duplicate: r.duplicate };
+    // Queued unsealed: if the device can rotate now (a hygiene rotation was due, say), it does, and
+    // the record is sealed before this call returns; offline or fenced, it waits for the next sync.
+    try {
+      await this.ensureEpoch();
+      await sealWaiting(deps);
+    } catch (e) {
+      if (!(e instanceof KavachError) || !e.retryable) throw e;
+    }
+    const now = await this.store.read((tx) => tx.get("outbox", toHex(r.localId))?.recordId);
+    return now ? { localId: r.localId, recordId: fromHex(now), duplicate: false } : { localId: r.localId, duplicate: false };
   }
 
   // Epochs ----------------------------------------------------------------------------------------
@@ -1094,11 +1186,21 @@ class ClientImpl implements Client {
   }
 
   private async drainNow(options: DrainOptions): Promise<DrainReport> {
+    this.drainOpId = toHex(randomBytes(8));
+    try {
+      return await this.drainRounds(options, this.drainOpId);
+    } finally {
+      this.drainOpId = undefined;
+    }
+  }
+
+  private async drainRounds(options: DrainOptions, opId: string): Promise<DrainReport> {
     const maxRounds = Math.max(1, Math.floor(options.maxRounds ?? 10));
     const maxMs = Math.max(0, Math.floor(options.maxMs ?? 30_000));
     const deadline = this.now() + BigInt(maxMs);
     const merged: SyncReport = {
       mode: "quick",
+      opId,
       metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 },
       epoch: "unchanged",
       outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0 },
@@ -1208,6 +1310,7 @@ class ClientImpl implements Client {
     const started = wall();
     const report: SyncReport = {
       mode: options.mode ?? "full",
+      opId: "",
       metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 },
       epoch: "unchanged",
       outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0 },
@@ -1218,6 +1321,8 @@ class ClientImpl implements Client {
       errors: []
     };
     const maintain = !options.skipMaintenance;
+    report.opId = this.drainOpId ?? toHex(randomBytes(8));
+    this.activeOpId = report.opId;
     let mark = started;
     const phase = (name: keyof Omit<SyncTimings, "total" | "bytesSent" | "bytesReceived">): void => {
       const now = wall();
@@ -1231,6 +1336,7 @@ class ClientImpl implements Client {
     try {
       return await this.runSyncPhases(options, report, maintain, phase);
     } finally {
+      this.activeOpId = undefined;
       finish();
     }
   }
@@ -1569,8 +1675,17 @@ class ClientImpl implements Client {
       } else for (const m of c.members) memberIds.set(toHex(m), m);
       if (equalBytes(c.ownerIdentityId, pin.accountId) && c.status === "member") {
         const requests = await this.transport.directory.readRequests(c.circleId);
-        const joins = requests.filter((r) => r.action === "join").map((r) => r.accountName);
-        if (joins.length) this.emit({ kind: "joinRequests", circleId: c.circleId, accountNames: joins });
+        const joins = [...new Set(requests.filter((r) => r.action === "join").map((r) => r.accountName))].sort();
+        // The authoritative list: stored, and emitted whenever it changes, including to none, so a
+        // badge drawn from it never sticks.
+        const changed = await this.store.transaction((tx) => {
+          const before = tx.get("joinRequests", toHex(c.circleId))?.accountNames ?? [];
+          if (before.length === joins.length && before.every((n, i) => n === joins[i])) return false;
+          if (joins.length) tx.put("joinRequests", toHex(c.circleId), { circleId: toHex(c.circleId), accountNames: joins });
+          else tx.delete("joinRequests", toHex(c.circleId));
+          return true;
+        });
+        if (changed) this.emit({ kind: "joinRequests", circleId: c.circleId, accountNames: joins });
         for (const r of requests.filter((r) => r.action === "leave")) {
           const [acct] = await this.transport.directory.resolveAccounts([r.accountName]);
           if (!acct) continue;
@@ -2066,15 +2181,16 @@ class ClientImpl implements Client {
   // Circles ---------------------------------------------------------------------------------------
 
   private async listCircles(): Promise<CircleSummary[]> {
-    return this.store.read((tx) => this.circleSummaries(tx.list("circles").map(([, r]) => r)));
+    return this.store.read((tx) => this.circleSummaries(tx, tx.list("circles").map(([, r]) => r)));
   }
 
-  private circleSummaries(rows: readonly CircleRow[]): CircleSummary[] {
+  private circleSummaries(tx: Pick<Tx, "get">, rows: readonly CircleRow[]): CircleSummary[] {
     const self = this.selfPin?.accountId;
     const now = this.now();
     return rows.map((r) => {
       const c = rowToCircle(r);
-      return { circleId: c.circleId, ownerIdentityId: c.ownerIdentityId, revision: c.revision, members: c.members, enabled: c.enabled, status: c.status, snapshotAgeMs: c.verifiedAt ? now - c.verifiedAt : 0n, owned: !!self && equalBytes(c.ownerIdentityId, self) };
+      const owned = !!self && equalBytes(c.ownerIdentityId, self);
+      return { circleId: c.circleId, ownerIdentityId: c.ownerIdentityId, revision: c.revision, members: c.members, enabled: c.enabled, status: c.status, snapshotAgeMs: c.verifiedAt ? now - c.verifiedAt : 0n, owned, joinRequests: owned ? (tx.get("joinRequests", r.circleId)?.accountNames ?? []) : [] };
     });
   }
 
@@ -2217,7 +2333,7 @@ class ClientImpl implements Client {
   private async approve(circleId: Uint8Array, accountName: string): Promise<{ revision: bigint }> {
     const [resolved] = await this.transport.directory.resolveAccounts([accountName]);
     if (!resolved) throw new KavachError("METADATA_REQUIRED", "approve", "unknown account");
-    const report: SyncReport = { mode: "full", metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, skipped: 0, acked: 0, hasMore: false }, purged: 0, maintenance: "done", timings: emptyTimings(), errors: [] };
+    const report: SyncReport = { mode: "full", opId: "", metadata: { certificates: 0, snapshots: 0, rotations: 0, quarantined: 0, resets: 0, successions: 0 }, epoch: "unchanged", outbox: { sent: 0, accepted: 0, cancelled: 0, unknown: 0, retry: 0, held: 0, resealed: 0 }, inbox: { streams: 0, stored: 0, keyPending: 0, invalid: 0, unknownKind: 0, skipped: 0, acked: 0, hasMore: false }, purged: 0, maintenance: "done", timings: emptyTimings(), errors: [] };
     await this.acceptMemberCertificate(resolved, report);
     const requester = resolvedAccountId(resolved);
     const pinned = await this.pinFor(requester);
