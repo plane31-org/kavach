@@ -110,6 +110,9 @@ export function kavachSlot(options: KavachSetupOptions): KavachSlot {
     close: () => shut(),
     releaseIdle: () => (leases === 0 && opening && !closing ? shut() : Promise.resolve()),
     async erase(deleteDatabase) {
+      // One erasure at a time: a second call shares the one running rather than starting its own,
+      // whose end would lift the guard while the first is still deleting.
+      if (erasing) return erasing;
       // Set at once, before any await: from here no use in this runtime opens anything until the
       // erasure has finished, so none can reopen the old database between the close and the delete.
       const run = (async () => {

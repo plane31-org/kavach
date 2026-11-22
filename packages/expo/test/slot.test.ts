@@ -193,5 +193,30 @@ describe("kavachSlot", () => {
     expect(opens()).toBe(2);
     await slot.close();
   });
+
+  it("two overlapping erasures are one: a use waiting on them opens a store that stays", async () => {
+    const { options, dir, secrets } = runtimes();
+    const slot = kavachSlot(options("foreground"));
+    await slot.use((s) => s.client.initializeAccount());
+    let deletions = 0;
+    const counted = (fileName: string): void => {
+      deletions++;
+      deleteFiles(dir)(fileName);
+    };
+    let release: () => void = () => undefined;
+    secrets.deleteGate = new Promise<void>((r) => (release = r));
+    const first = slot.erase(counted);
+    const second = slot.erase(counted);
+    const during = slot.use(async (s) => (await s.client.getState()).status);
+    await new Promise((r) => setTimeout(r, 10));
+    secrets.deleteGate = undefined;
+    release();
+    await Promise.all([first, second]);
+    expect(deletions).toBe(1); // one erasure ran
+    expect(await during).toBe("fresh");
+    expect(existsSync(join(dir, databaseFileName("alice")))).toBe(true); // the store the use opened was not deleted after it
+    expect(await slot.use(async (s) => (await s.client.getState()).status)).toBe("fresh");
+    await slot.close();
+  });
 });
 
